@@ -1,0 +1,136 @@
+#!/bin/bash
+# Ralph - Autonomous Claude Code Loop
+# Runs Claude Code repeatedly until all PRD tasks complete
+#
+# Usage: ralph [max_iterations]
+# Default: 10 iterations
+#
+# Requires:
+#   - .claude/prd.json in current directory
+#
+# Optional:
+#   - .claude/ralph-config.md for project-specific quality checks/context
+
+set -e
+
+# Find the ralph installation directory (resolve symlinks)
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+RALPH_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+
+MAX_ITERATIONS=${1:-10}
+PROJECT_DIR="$PWD"
+CLAUDE_DIR="$PROJECT_DIR/.claude"
+PRD_FILE="$CLAUDE_DIR/prd.json"
+PROGRESS_FILE="$CLAUDE_DIR/progress.txt"
+LAST_BRANCH_FILE="$CLAUDE_DIR/.last-branch"
+ARCHIVE_DIR="$CLAUDE_DIR/archive"
+PROMPT_FILE="$RALPH_DIR/templates/ralph-prompt.md"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+echo -e "${GREEN}Ralph starting...${NC}"
+echo "Project: $PROJECT_DIR"
+echo "Max iterations: $MAX_ITERATIONS"
+
+# Check required files exist
+if [ ! -d "$CLAUDE_DIR" ]; then
+    echo -e "${RED}Error: .claude/ directory not found in current directory.${NC}"
+    echo "Create .claude/prd.json first (use /ralph skill to convert a PRD)."
+    exit 1
+fi
+
+if [ ! -f "$PRD_FILE" ]; then
+    echo -e "${RED}Error: $PRD_FILE not found.${NC}"
+    echo "Create a PRD first (use /prd skill), then convert it (use /ralph skill)."
+    exit 1
+fi
+
+if [ ! -f "$PROMPT_FILE" ]; then
+    echo -e "${RED}Error: Prompt template not found at $PROMPT_FILE${NC}"
+    echo "Ralph installation may be broken. Re-run install.sh"
+    exit 1
+fi
+
+# Show config status
+if [ -f "$CLAUDE_DIR/ralph-config.md" ]; then
+    echo "Project config: .claude/ralph-config.md"
+else
+    echo -e "${YELLOW}No project config (.claude/ralph-config.md) - using defaults${NC}"
+fi
+
+# Branch change detection & archiving
+if [ -f "$LAST_BRANCH_FILE" ]; then
+    LAST_BRANCH=$(cat "$LAST_BRANCH_FILE")
+    CURRENT_BRANCH=$(jq -r '.branchName' "$PRD_FILE")
+
+    if [ "$LAST_BRANCH" != "$CURRENT_BRANCH" ] && [ -n "$LAST_BRANCH" ]; then
+        echo -e "${YELLOW}Branch changed from $LAST_BRANCH to $CURRENT_BRANCH${NC}"
+        echo "Archiving previous run..."
+
+        ARCHIVE_NAME=$(date +%Y-%m-%d)-$(echo "$LAST_BRANCH" | sed 's/ralph\///')
+        mkdir -p "$ARCHIVE_DIR/$ARCHIVE_NAME"
+
+        # Archive previous files if they exist
+        [ -f "$PROGRESS_FILE" ] && cp "$PROGRESS_FILE" "$ARCHIVE_DIR/$ARCHIVE_NAME/"
+
+        # Reset progress for new feature
+        rm -f "$PROGRESS_FILE"
+        echo -e "${GREEN}Previous run archived to $ARCHIVE_DIR/$ARCHIVE_NAME${NC}"
+    fi
+fi
+
+# Update branch tracking
+CURRENT_BRANCH=$(jq -r '.branchName' "$PRD_FILE")
+echo "$CURRENT_BRANCH" > "$LAST_BRANCH_FILE"
+
+# Initialize progress file if missing
+if [ ! -f "$PROGRESS_FILE" ]; then
+    echo "# Ralph Progress Log" > "$PROGRESS_FILE"
+    echo "Started: $(date)" >> "$PROGRESS_FILE"
+    echo "---" >> "$PROGRESS_FILE"
+    echo "" >> "$PROGRESS_FILE"
+    echo "## Codebase Patterns" >> "$PROGRESS_FILE"
+    echo "(Patterns discovered during implementation)" >> "$PROGRESS_FILE"
+    echo "---" >> "$PROGRESS_FILE"
+    echo "" >> "$PROGRESS_FILE"
+fi
+
+# Main loop
+for i in $(seq 1 $MAX_ITERATIONS); do
+    echo ""
+    echo -e "${GREEN}=======================================================${NC}"
+    echo -e "${GREEN}  Ralph iteration $i of $MAX_ITERATIONS${NC}"
+    echo -e "${GREEN}=======================================================${NC}"
+    echo ""
+
+    # Check if all stories are complete before running
+    INCOMPLETE=$(jq '[.userStories[] | select(.passes == false)] | length' "$PRD_FILE")
+    if [ "$INCOMPLETE" -eq 0 ]; then
+        echo -e "${GREEN}All stories complete! Ralph is done.${NC}"
+        exit 0
+    fi
+
+    echo "Incomplete stories: $INCOMPLETE"
+    echo "Running Claude Code..."
+
+    # Run Claude Code with the prompt
+    OUTPUT=$(cat "$PROMPT_FILE" | claude --dangerously-skip-permissions 2>&1) || true
+
+    # Check for completion signal
+    if echo "$OUTPUT" | grep -q "<promise>COMPLETE</promise>"; then
+        echo -e "${GREEN}All stories complete! Ralph is done.${NC}"
+        exit 0
+    fi
+
+    # Brief pause between iterations
+    echo "Iteration $i complete. Pausing 2 seconds..."
+    sleep 2
+done
+
+echo -e "${RED}Max iterations ($MAX_ITERATIONS) reached without completion.${NC}"
+echo "Check progress.txt and prd.json for status."
+exit 1
