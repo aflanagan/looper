@@ -10,6 +10,7 @@
 #
 # Optional:
 #   - .claude/ralph-config.md for project-specific quality checks/context
+#   - .claude/ralph-prompt.md for project-specific prompt addendum (appended to base template)
 
 set -e
 
@@ -25,6 +26,7 @@ PROGRESS_FILE="$CLAUDE_DIR/progress.txt"
 LAST_BRANCH_FILE="$CLAUDE_DIR/.last-branch"
 ARCHIVE_DIR="$CLAUDE_DIR/archive"
 PROMPT_FILE="$RALPH_DIR/templates/ralph-prompt.md"
+LOCAL_PROMPT_FILE="$CLAUDE_DIR/ralph-prompt.md"
 
 # Colors for output
 RED='\033[0;31m'
@@ -55,11 +57,28 @@ if [ ! -f "$PROMPT_FILE" ]; then
     exit 1
 fi
 
+build_prompt_input() {
+    cat "$PROMPT_FILE"
+    if [ -f "$LOCAL_PROMPT_FILE" ]; then
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Project Local Addendum (.claude/ralph-prompt.md)"
+        echo "Apply the following additional project-specific instructions in addition to the base Ralph template:"
+        echo ""
+        cat "$LOCAL_PROMPT_FILE"
+    fi
+}
+
 # Show config status
 if [ -f "$CLAUDE_DIR/ralph-config.md" ]; then
     echo "Project config: .claude/ralph-config.md"
 else
     echo -e "${YELLOW}No project config (.claude/ralph-config.md) - using defaults${NC}"
+fi
+
+if [ -f "$LOCAL_PROMPT_FILE" ]; then
+    echo "Project prompt addendum: .claude/ralph-prompt.md"
 fi
 
 # Branch change detection & archiving
@@ -118,7 +137,7 @@ for i in $(seq 1 $MAX_ITERATIONS); do
     echo "Running Claude Code..."
 
     # Run Claude Code with the prompt
-    OUTPUT=$(cat "$PROMPT_FILE" | claude --dangerously-skip-permissions 2>&1) || true
+    OUTPUT=$(build_prompt_input | claude --dangerously-skip-permissions 2>&1) || true
 
     # Check for completion signal
     if echo "$OUTPUT" | grep -q "<promise>COMPLETE</promise>"; then

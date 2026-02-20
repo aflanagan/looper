@@ -78,6 +78,12 @@ Ralph will:
 - Update `prd.json` and `progress.txt`
 - Repeat until done
 
+### 5. (Optional) Add Project Prompt Addendum
+
+Create `.claude/ralph-prompt.md` when you need per-repo prompt behavior (for example a custom review loop).
+
+Ralph always loads the global template at `templates/ralph-prompt.md` first, then appends `.claude/ralph-prompt.md` if it exists.
+
 ## Project Structure
 
 Each project using Ralph needs:
@@ -86,6 +92,7 @@ Each project using Ralph needs:
 .claude/
   ├── prd.json           # Required: task state
   ├── ralph-config.md    # Optional: project-specific config
+  ├── ralph-prompt.md    # Optional: project-specific prompt addendum (appended to global template)
   └── progress.txt       # Auto-created: iteration learnings
 ```
 
