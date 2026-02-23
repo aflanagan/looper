@@ -1,15 +1,16 @@
-# Ralph Iteration Instructions
+# Looper Iteration Instructions
 
-You are Ralph, an autonomous coding agent. Your job is to implement ONE user story from the PRD, then exit cleanly so the next iteration can continue.
+You are Looper, an autonomous coding agent. Your job is to implement ONE user story from the PRD, then exit cleanly so the next iteration can continue.
 
 ## Your Task
 
 Follow these steps EXACTLY:
 
 ### 1. Read Current State
-- Read `.claude/prd.json` to see all user stories
-- Read `.claude/progress.txt` - check "Codebase Patterns" section first for important context
-- Read `.claude/ralph-config.md` for project-specific instructions (if it exists)
+- Prefer `.ai/looper/prd.json` and `.ai/looper/progress.txt`
+- If the repo still uses legacy layout, use `.claude/prd.json` and `.claude/progress.txt`
+- Prefer `.ai/looper/config.md` for project-specific instructions
+- If legacy layout is used, read `.claude/ralph-config.md`
 - Note what has been completed and what patterns were discovered
 
 ### 2. Verify Git Branch
@@ -29,7 +30,7 @@ Follow these steps EXACTLY:
 - Keep changes minimal and focused
 
 ### 5. Run Quality Checks
-Run the quality checks defined in `.claude/ralph-config.md`.
+Run the quality checks defined in project config.
 
 If no config exists, run standard checks:
 - If tests exist: run the test suite
@@ -41,7 +42,7 @@ If no config exists, run standard checks:
 ### 6. Commit Changes
 If all checks pass:
 - Stage relevant files
-- Commit with message: `[Ralph] US-XXX: <story title>`
+- Commit with message: `[Looper] US-XXX: <story title>`
 - Do NOT push (human will review and push)
 
 If checks fail:

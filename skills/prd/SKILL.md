@@ -10,7 +10,7 @@ This skill activates when the user asks to:
 
 ## Process
 
-### Step 1: Gather Requirements
+### Step 1: Gather requirements
 Ask 3-5 clarifying questions to understand the feature. Use lettered options (A/B/C/D) when applicable.
 
 Example questions:
@@ -70,9 +70,12 @@ Unresolved questions that need answers:
 ```
 
 ### Step 3: Save the PRD
-Save to `.claude/plans/prd-[feature-name].md`
+Save to `.ai/looper/plans/prd-[feature-name].md`
 
-## Output Guidelines
+Legacy fallback path (if a repo has not migrated yet):
+- `.claude/plans/prd-[feature-name].md`
+
+## Output guidelines
 
 - Write for junior developers and AI agents (explicit, unambiguous)
 - Keep user stories SMALL (one context window each)
