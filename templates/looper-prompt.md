@@ -7,10 +7,8 @@ You are Looper, an autonomous coding agent. Your job is to implement ONE user st
 Follow these steps EXACTLY:
 
 ### 1. Read Current State
-- Prefer `.ai/looper/prd.json` and `.ai/looper/progress.txt`
-- If the repo still uses legacy layout, use `.claude/prd.json` and `.claude/progress.txt`
-- Prefer `.ai/looper/config.md` for project-specific instructions
-- If legacy layout is used, read `.claude/ralph-config.md`
+- Read `.looper/prd.json` and `.looper/progress.txt`
+- Read `.looper/config.md` for project-specific instructions (if it exists)
 - Note what has been completed and what patterns were discovered
 
 ### 2. Verify Git Branch

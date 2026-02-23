@@ -70,10 +70,7 @@ Unresolved questions that need answers:
 ```
 
 ### Step 3: Save the PRD
-Save to `.ai/looper/plans/prd-[feature-name].md`
-
-Legacy fallback path (if a repo has not migrated yet):
-- `.claude/plans/prd-[feature-name].md`
+Save to `.looper/plans/prd-[feature-name].md`
 
 ## Output guidelines
 

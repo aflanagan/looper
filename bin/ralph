@@ -1,7 +1,0 @@
-#!/bin/bash
-# Legacy compatibility wrapper. Prefer `looper`.
-
-SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
-SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-
-exec "$SCRIPT_DIR/looper" "$@"

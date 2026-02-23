@@ -20,7 +20,6 @@ cd looper
 
 The installer:
 - Installs the `looper` CLI
-- Adds compatibility alias `ralph -> looper`
 - Installs Claude skills for `/looper` and `/prd`
 
 Ensure your shell `PATH` includes the install destination (`$HOME/bin` by default):
@@ -39,7 +38,7 @@ In Claude Code, use the `/prd` skill:
 /prd add dark mode to the dashboard
 ```
 
-This generates a structured PRD in `.ai/looper/plans/`.
+This generates a structured PRD in `.looper/plans/`.
 
 ### 2. Convert to Looper format
 
@@ -49,11 +48,11 @@ Use the `/looper` skill:
 /looper convert this prd
 ```
 
-This creates `.ai/looper/prd.json` with the task structure Looper needs.
+This creates `.looper/prd.json` with the task structure Looper needs.
 
 ### 3. (Optional) Add project config
 
-Create `.ai/looper/config.md` with project-specific instructions:
+Create `.looper/config.md` with project-specific instructions:
 
 ```markdown
 # Looper Project Config
@@ -84,23 +83,21 @@ Looper will:
 
 ### 5. (Optional) Add local prompt addendum
 
-Create `.ai/looper/prompt.local.md` when you need per-repo prompt behavior (for example a custom review loop).
+Create `.looper/prompt.local.md` when you need per-repo prompt behavior (for example a custom review loop).
 
-Looper always loads the global template at `templates/looper-prompt.md` first, then appends `.ai/looper/prompt.local.md` if it exists.
+Looper always loads the global template at `templates/looper-prompt.md` first, then appends `.looper/prompt.local.md` if it exists.
 
 ## Project Structure
 
 Use this layout:
 
 ```
-.ai/looper/
+.looper/
   ├── prd.json          # Required: task state
   ├── config.md         # Optional: project-specific config
   ├── prompt.local.md   # Optional: project-specific prompt addendum
   └── progress.txt      # Auto-created: iteration learnings
 ```
-
-Legacy `.claude/*` files are still auto-detected for backward compatibility, but new projects should use `.ai/looper/*`.
 
 ## Files
 
@@ -124,7 +121,7 @@ Future iterations read this file first, so Looper learns from its own work.
 ## Branch Management
 
 - Looper works on the branch specified in `prd.json` (`branchName` field)
-- When you start a new feature (different branch), previous progress is archived to `.ai/looper/archive/`
+- When you start a new feature (different branch), previous progress is archived to `.looper/archive/`
 - Looper never pushes - you review commits and push manually
 
 ## Requirements

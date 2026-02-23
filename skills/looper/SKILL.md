@@ -8,8 +8,6 @@ This skill activates when the user asks to:
 - "looper json"
 - "convert to looper"
 
-Legacy trigger phrases like "convert to ralph" should map to this skill.
-
 ## Process
 
 ### Step 1: Validate the PRD
@@ -23,7 +21,7 @@ If issues are found, suggest fixes before converting.
 
 ### Step 2: Convert to JSON format
 
-Create `.ai/looper/prd.json` with this structure:
+Create `.looper/prd.json` with this structure:
 
 ```json
 {
@@ -65,9 +63,7 @@ If there is an existing PRD with a different `branchName`:
 - overwrite the file
 
 ### Step 5: Save the file
-Write to `.ai/looper/prd.json`.
-
-Legacy fallback is accepted at `.claude/prd.json` when a repo has not migrated yet.
+Write to `.looper/prd.json`.
 
 ## JSON field requirements
 
@@ -115,4 +111,4 @@ Must be verifiable. Good vs bad examples:
 4. **Include quality checks**: add "Tests pass" or "Type checks pass" where applicable
 
 ## Output
-Save the JSON to `.ai/looper/prd.json` and confirm to the user.
+Save the JSON to `.looper/prd.json` and confirm to the user.
