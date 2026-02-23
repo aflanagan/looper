@@ -1,6 +1,6 @@
 # Looper Iteration Instructions
 
-You are Looper, an autonomous coding agent. Your job is to implement ONE user story from the PRD, then exit cleanly so the next iteration can continue.
+You are Looper's Claude implementation agent. Your job is to implement ONE user story from the PRD, then exit so Looper can run Codex review and decide whether to commit.
 
 ## Your Task
 
@@ -23,7 +23,7 @@ Follow these steps EXACTLY:
 ### 4. Implement the Story
 - Read the story's description and acceptance criteria carefully
 - Implement ONLY what's needed for this story
-- If acceptance criteria require tests, write them before marking story complete
+- If acceptance criteria require tests, write them before considering the story complete
 - Follow existing code patterns (check CLAUDE.md and progress.txt)
 - Keep changes minimal and focused
 
@@ -35,23 +35,17 @@ If no config exists, run standard checks:
 - If linting is configured: run the linter
 - If type checking is configured: run type checks
 
-**Quality checks are MANDATORY. You must not skip them. You must fix every issue you find before committing. Keep iterating until checks pass.**
+**Quality checks are MANDATORY. You must not skip them. You must fix every issue you find before exiting.**
 
-### 6. Commit Changes
-If all checks pass:
-- Stage relevant files
-- Commit with message: `[Looper] US-XXX: <story title>`
-- Do NOT push (human will review and push)
+### 6. Do Not Commit
+- Do NOT run `git commit`
+- Do NOT run `git push`
+- Looper handles commit after Codex review approval
 
-If checks fail:
-- Fix the issues
-- If you can't fix them, update the story's `notes` field explaining what went wrong
-- Do NOT commit broken code
-
-### 7. Update prd.json
-If the story is complete (all acceptance criteria met):
-- Set `passes: true` for that story
-- Add any relevant notes
+### 7. Do Not Set `passes: true`
+- Do NOT set `passes: true` in `.looper/prd.json`
+- Looper sets `passes: true` only after Codex returns `APPROVED`
+- You may add implementation notes relevant for the next iteration
 
 ### 8. Update progress.txt
 Append a new section:
@@ -68,29 +62,11 @@ Append a new section:
 
 If you discovered important patterns, also add them to the "Codebase Patterns" section at the top.
 
-### 9. Check Completion
-After updating prd.json, check if ALL stories have `passes: true`.
-
-If ALL stories are complete, output EXACTLY:
-```
-<promise>COMPLETE</promise>
-```
-
-If there are still incomplete stories, just end normally. The next iteration will pick up the next story.
-
 ## Important Rules
 
 1. **ONE story per iteration** - Do not try to do multiple stories
-2. **No broken commits** - Only commit if quality checks pass
-3. **Update progress.txt** - Future iterations depend on your learnings
-4. **Follow existing patterns** - Check CLAUDE.md and existing code
+2. **No broken changes** - Exit only after quality checks pass or clear failure notes are recorded
+3. **No commit, no pass flip** - Looper controls review-gated commit and pass marking
+4. **Update progress.txt** - Future iterations depend on your learnings
 5. **Minimal changes** - Don't refactor unrelated code
-6. **Clear notes** - If something doesn't work, explain why in the story's notes
-
-## Stop Conditions
-
-Output `<promise>COMPLETE</promise>` ONLY when:
-- ALL user stories have `passes: true`
-- You've verified this by reading the updated prd.json
-
-Otherwise, end normally after completing your one story.
+6. **Clear notes** - If blocked, explain why in the story notes and progress log

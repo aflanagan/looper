@@ -1,13 +1,17 @@
 # Looper
 
-An autonomous coding-agent loop for Claude Code. Looper implements user stories from a PRD one at a time, committing after each, until all stories are complete.
+An autonomous coding-agent loop for Claude Code and Codex. Looper implements one story at a time, runs Codex review convergence, and commits only after review approval.
 
 ## How It Works
 
-1. Create a PRD (product requirements document) with user stories
-2. Convert it to `prd.json` format using the `/looper` skill
-3. Run `looper` - it loops through stories autonomously
-4. Each iteration: picks one story, implements it, runs quality checks, commits
+1. Create a PRD with dependency-ordered stories
+2. Convert it to `.looper/prd.json` using `/looper`
+3. Run `looper`
+4. Each iteration:
+   - Claude implements one story and runs quality checks
+   - Codex reviews uncommitted changes
+   - If review requests changes, Claude remediates and Codex re-reviews (up to max rounds)
+   - On approval, Looper marks the story passed and commits
 5. Stops when all stories pass or max iterations is reached
 
 ## Installation
@@ -18,114 +22,84 @@ cd looper
 ./install.sh
 ```
 
-The installer:
-- Installs the `looper` CLI
-- Installs Claude skills for `/looper` and `/prd`
-
 Ensure your shell `PATH` includes the install destination (`$HOME/bin` by default):
 
 ```bash
 export PATH="$HOME/bin:$PATH"
 ```
 
+## Requirements
+
+- [Claude Code CLI](https://claude.ai/code)
+- [Codex CLI](https://github.com/openai/codex)
+- `jq`
+- Git
+
 ## Usage
 
 ### 1. Create a PRD
 
-In Claude Code, use the `/prd` skill:
+In Claude Code, use `/prd`:
 
 ```
 /prd add dark mode to the dashboard
 ```
 
-This generates a structured PRD in `.looper/plans/`.
-
 ### 2. Convert to Looper format
 
-Use the `/looper` skill:
+Use `/looper`:
 
 ```
 /looper convert this prd
 ```
 
-This creates `.looper/prd.json` with the task structure Looper needs.
+This creates `.looper/prd.json`.
 
 ### 3. (Optional) Add project config
 
-Create `.looper/config.md` with project-specific instructions:
-
-```markdown
-# Looper Project Config
-
-## Quality Checks
-- Run tests: `npm test`
-- Run linter: `npm run lint`
-
-## Project Context
-- This is a React app using Tailwind CSS
-- See CLAUDE.md for coding standards
-```
+Create `.looper/config.md` with project-specific quality checks and context.
 
 ### 4. Run Looper
 
 ```bash
-looper      # Default: 10 iterations
-looper 20   # Custom iteration limit
+looper      # default: 10 iterations
+looper 20   # custom iteration limit
 ```
-
-Looper will:
-- Pick the highest-priority incomplete story
-- Implement it following your project's patterns
-- Run quality checks
-- Commit with `[Looper] US-XXX: <title>`
-- Update `prd.json` and `progress.txt`
-- Repeat until done
-
-### 5. (Optional) Add local prompt addendum
-
-Create `.looper/prompt.local.md` when you need per-repo prompt behavior (for example a custom review loop).
-
-Looper always loads the global template at `templates/looper-prompt.md` first, then appends `.looper/prompt.local.md` if it exists.
 
 ## Project Structure
 
-Use this layout:
-
 ```
 .looper/
-  ├── prd.json          # Required: task state
-  ├── config.md         # Optional: project-specific config
-  ├── prompt.local.md   # Optional: project-specific prompt addendum
-  └── progress.txt      # Auto-created: iteration learnings
+  ├── prd.json                 # Required: task state
+  ├── config.md                # Optional: project-specific config
+  ├── prompt.local.md          # Optional: project-specific prompt addendum
+  ├── codex-review-prompt.md   # Optional: override Codex review prompt
+  ├── progress.txt             # Auto-created: iteration learnings
+  └── reviews/                 # Auto-created: review artifacts
 ```
+
+## Runtime Behavior
+
+- Looper does not commit until Codex returns `APPROVED`.
+- Looper sets story `passes: true` only after approval.
+- Looper archives progress when `branchName` changes.
+- Review artifacts are written under `.looper/reviews/<branch>/<story>/`.
+
+## Configuration
+
+Environment variables:
+- `LOOPER_STATE_DIR`: override `.looper` path
+- `LOOPER_REVIEW_MAX_ROUNDS`: default `3`
+- `LOOPER_REVIEW_PROMPT_FILE`: override review prompt path
+- `LOOPER_REVIEW_SCHEMA_FILE`: override review schema path
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `bin/looper` | The main CLI script |
-| `templates/looper-prompt.md` | Instructions sent to Claude each iteration |
-| `skills/looper/SKILL.md` | Skill for converting PRDs to JSON |
-| `skills/prd/SKILL.md` | Skill for generating PRDs |
-
-## How Looper Learns
-
-Looper maintains `progress.txt` across iterations. Each iteration appends:
-- What was implemented
-- Files changed
-- Patterns discovered
-- Gotchas encountered
-
-Future iterations read this file first, so Looper learns from its own work.
-
-## Branch Management
-
-- Looper works on the branch specified in `prd.json` (`branchName` field)
-- When you start a new feature (different branch), previous progress is archived to `.looper/archive/`
-- Looper never pushes - you review commits and push manually
-
-## Requirements
-
-- [Claude Code CLI](https://claude.ai/code)
-- `jq` (for JSON parsing)
-- Git
+| `bin/looper` | Main CLI orchestrator |
+| `templates/looper-prompt.md` | Base Claude implementation prompt |
+| `templates/codex-review-prompt.md` | Base Codex review prompt |
+| `templates/codex-review-schema.json` | Structured output schema for Codex review |
+| `skills/looper/SKILL.md` | PRD-to-JSON conversion skill |
+| `skills/prd/SKILL.md` | PRD generation skill |
