@@ -1,12 +1,14 @@
-# Ralph PRD-to-JSON Converter Skill
+# Looper PRD-to-JSON Converter Skill
 
 ## Trigger
 This skill activates when the user asks to:
 - "convert this prd"
-- "turn this into ralph format"
+- "turn this into looper format"
 - "create prd.json from this"
-- "ralph json"
-- "convert to ralph"
+- "looper json"
+- "convert to looper"
+
+Legacy trigger phrases like "convert to ralph" should map to this skill.
 
 ## Process
 
@@ -17,16 +19,16 @@ Check the input PRD for:
 - [ ] Acceptance criteria are verifiable (not vague)
 - [ ] Each story has clear, testable outcomes
 
-If issues found, suggest fixes before converting.
+If issues are found, suggest fixes before converting.
 
-### Step 2: Convert to JSON Format
+### Step 2: Convert to JSON format
 
-Create `.claude/prd.json` with this structure:
+Create `.ai/looper/prd.json` with this structure:
 
 ```json
 {
   "project": "ProjectName",
-  "branchName": "ralph/feature-name",
+  "branchName": "looper/feature-name",
   "description": "Brief feature description",
   "userStories": [
     {
@@ -47,7 +49,7 @@ Create `.claude/prd.json` with this structure:
 }
 ```
 
-### Step 3: Set Priorities
+### Step 3: Set priorities
 Assign priority numbers based on dependency order:
 - Priority 1: Foundation work (schema, models, core functions)
 - Priority 2: Business logic (services, utilities)
@@ -57,27 +59,29 @@ Assign priority numbers based on dependency order:
 
 Lower priority number = do first.
 
-### Step 4: Archive Previous PRD (if exists)
-If there's an existing prd.json with a different branchName:
-- The ralph script will handle archiving automatically
-- Just overwrite the file
+### Step 4: Archive previous PRD (if exists)
+If there is an existing PRD with a different `branchName`:
+- the looper script handles archiving automatically
+- overwrite the file
 
-### Step 5: Save the File
-Write to `.claude/prd.json`
+### Step 5: Save the file
+Write to `.ai/looper/prd.json`.
 
-## JSON Field Requirements
+Legacy fallback is accepted at `.claude/prd.json` when a repo has not migrated yet.
 
-### branchName
-- Format: `ralph/feature-name-kebab-case`
+## JSON field requirements
+
+### `branchName`
+- Format: `looper/feature-name-kebab-case`
 - Must be a valid git branch name
-- Prefix with `ralph/` for easy identification
+- Prefix with `looper/` for easy identification
 
-### userStories[].id
+### `userStories[].id`
 - Format: `US-001`, `US-002`, etc.
 - Sequential numbering
 - Unique within the PRD
 
-### userStories[].acceptanceCriteria
+### `userStories[].acceptanceCriteria`
 Must be verifiable. Good vs bad examples:
 
 **Bad (vague):**
@@ -90,25 +94,25 @@ Must be verifiable. Good vs bad examples:
 - "Clicking button shows confirmation dialog with 'Cancel' and 'Confirm' options"
 - "API returns 200 status with JSON body containing 'success': true"
 
-### userStories[].priority
+### `userStories[].priority`
 - Integer starting at 1
 - 1 = highest priority (do first)
 - Reflects dependency order
 
-### userStories[].passes
+### `userStories[].passes`
 - Always start as `false`
-- Ralph updates to `true` when story completes
+- Looper updates to `true` when a story completes
 
-### userStories[].notes
+### `userStories[].notes`
 - Start empty
-- Ralph adds implementation notes and learnings
+- Looper adds implementation notes and learnings
 
-## Critical Rules
+## Critical rules
 
-1. **One context window per story**: If a story seems too big, split it
-2. **No circular dependencies**: Story N cannot depend on Story N+1
-3. **Verifiable criteria only**: Every criterion must be testable
-4. **Include quality checks**: Add "Tests pass" or "Type checks pass" where applicable
+1. **One context window per story**: if a story seems too big, split it
+2. **No circular dependencies**: story N cannot depend on story N+1
+3. **Verifiable criteria only**: every criterion must be testable
+4. **Include quality checks**: add "Tests pass" or "Type checks pass" where applicable
 
 ## Output
-Save the JSON to `.claude/prd.json` and confirm to the user.
+Save the JSON to `.ai/looper/prd.json` and confirm to the user.

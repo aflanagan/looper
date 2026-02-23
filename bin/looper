@@ -1,0 +1,180 @@
+#!/bin/bash
+# Looper - Autonomous Claude Code Loop
+# Runs Claude Code repeatedly until all PRD tasks complete
+#
+# Usage: looper [max_iterations]
+# Default: 10 iterations
+#
+# Requires:
+#   - .ai/looper/prd.json in current directory (preferred)
+#     or legacy .claude/prd.json
+#
+# Optional:
+#   - .ai/looper/config.md (preferred) or legacy .claude/ralph-config.md
+#   - .ai/looper/prompt.local.md (preferred) or legacy .claude/ralph-prompt.md
+
+set -e
+
+# Find the looper installation directory (resolve symlinks)
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+LOOPER_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+
+MAX_ITERATIONS=${1:-10}
+PROJECT_DIR="$PWD"
+
+# Resolve state directory and local file naming convention.
+if [ -n "${LOOPER_STATE_DIR:-}" ]; then
+    case "$LOOPER_STATE_DIR" in
+        /*) STATE_DIR="$LOOPER_STATE_DIR" ;;
+        *) STATE_DIR="$PROJECT_DIR/$LOOPER_STATE_DIR" ;;
+    esac
+elif [ -d "$PROJECT_DIR/.ai/looper" ]; then
+    STATE_DIR="$PROJECT_DIR/.ai/looper"
+elif [ -d "$PROJECT_DIR/.claude" ]; then
+    STATE_DIR="$PROJECT_DIR/.claude"
+else
+    STATE_DIR="$PROJECT_DIR/.ai/looper"
+fi
+
+if [ "$STATE_DIR" = "$PROJECT_DIR/.claude" ]; then
+    CONFIG_FILE="$STATE_DIR/ralph-config.md"
+    LOCAL_PROMPT_FILE="$STATE_DIR/ralph-prompt.md"
+else
+    CONFIG_FILE="$STATE_DIR/config.md"
+    LOCAL_PROMPT_FILE="$STATE_DIR/prompt.local.md"
+fi
+
+PRD_FILE="$STATE_DIR/prd.json"
+PROGRESS_FILE="$STATE_DIR/progress.txt"
+LAST_BRANCH_FILE="$STATE_DIR/.last-branch"
+ARCHIVE_DIR="$STATE_DIR/archive"
+PROMPT_FILE="$LOOPER_DIR/templates/looper-prompt.md"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+echo -e "${GREEN}Looper starting...${NC}"
+echo "Project: $PROJECT_DIR"
+echo "State dir: $STATE_DIR"
+echo "Max iterations: $MAX_ITERATIONS"
+
+# Check required files exist
+if [ ! -d "$STATE_DIR" ]; then
+    echo -e "${RED}Error: state directory not found: $STATE_DIR${NC}"
+    echo "Create $PROJECT_DIR/.ai/looper/prd.json first (use /looper skill to convert a PRD)."
+    echo "Legacy fallback is also supported at $PROJECT_DIR/.claude/prd.json."
+    exit 1
+fi
+
+if [ ! -f "$PRD_FILE" ]; then
+    echo -e "${RED}Error: $PRD_FILE not found.${NC}"
+    echo "Create a PRD first (use /prd skill), then convert it (use /looper skill)."
+    exit 1
+fi
+
+if [ ! -f "$PROMPT_FILE" ]; then
+    echo -e "${RED}Error: Prompt template not found at $PROMPT_FILE${NC}"
+    echo "Looper installation may be broken. Re-run install.sh"
+    exit 1
+fi
+
+build_prompt_input() {
+    cat "$PROMPT_FILE"
+    if [ -f "$LOCAL_PROMPT_FILE" ]; then
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Project Local Addendum ($LOCAL_PROMPT_FILE)"
+        echo "Apply the following additional project-specific instructions in addition to the base Looper template:"
+        echo ""
+        cat "$LOCAL_PROMPT_FILE"
+    fi
+}
+
+# Show config status
+if [ -f "$CONFIG_FILE" ]; then
+    echo "Project config: $CONFIG_FILE"
+else
+    echo -e "${YELLOW}No project config ($CONFIG_FILE) - using defaults${NC}"
+fi
+
+if [ -f "$LOCAL_PROMPT_FILE" ]; then
+    echo "Project prompt addendum: $LOCAL_PROMPT_FILE"
+fi
+
+# Branch change detection & archiving
+if [ -f "$LAST_BRANCH_FILE" ]; then
+    LAST_BRANCH=$(cat "$LAST_BRANCH_FILE")
+    CURRENT_BRANCH=$(jq -r '.branchName' "$PRD_FILE")
+
+    if [ "$LAST_BRANCH" != "$CURRENT_BRANCH" ] && [ -n "$LAST_BRANCH" ]; then
+        echo -e "${YELLOW}Branch changed from $LAST_BRANCH to $CURRENT_BRANCH${NC}"
+        echo "Archiving previous run..."
+
+        BRANCH_SLUG=$(echo "$LAST_BRANCH" | sed -e 's#^ralph/##' -e 's#^looper/##')
+        ARCHIVE_NAME=$(date +%Y-%m-%d)-$BRANCH_SLUG
+        mkdir -p "$ARCHIVE_DIR/$ARCHIVE_NAME"
+
+        # Archive previous files if they exist
+        [ -f "$PROGRESS_FILE" ] && cp "$PROGRESS_FILE" "$ARCHIVE_DIR/$ARCHIVE_NAME/"
+
+        # Reset progress for new feature
+        rm -f "$PROGRESS_FILE"
+        echo -e "${GREEN}Previous run archived to $ARCHIVE_DIR/$ARCHIVE_NAME${NC}"
+    fi
+fi
+
+# Update branch tracking
+CURRENT_BRANCH=$(jq -r '.branchName' "$PRD_FILE")
+echo "$CURRENT_BRANCH" > "$LAST_BRANCH_FILE"
+
+# Initialize progress file if missing
+if [ ! -f "$PROGRESS_FILE" ]; then
+    echo "# Looper Progress Log" > "$PROGRESS_FILE"
+    echo "Started: $(date)" >> "$PROGRESS_FILE"
+    echo "---" >> "$PROGRESS_FILE"
+    echo "" >> "$PROGRESS_FILE"
+    echo "## Codebase Patterns" >> "$PROGRESS_FILE"
+    echo "(Patterns discovered during implementation)" >> "$PROGRESS_FILE"
+    echo "---" >> "$PROGRESS_FILE"
+    echo "" >> "$PROGRESS_FILE"
+fi
+
+# Main loop
+for i in $(seq 1 $MAX_ITERATIONS); do
+    echo ""
+    echo -e "${GREEN}=======================================================${NC}"
+    echo -e "${GREEN}  Looper iteration $i of $MAX_ITERATIONS${NC}"
+    echo -e "${GREEN}=======================================================${NC}"
+    echo ""
+
+    # Check if all stories are complete before running
+    INCOMPLETE=$(jq '[.userStories[] | select(.passes == false)] | length' "$PRD_FILE")
+    if [ "$INCOMPLETE" -eq 0 ]; then
+        echo -e "${GREEN}All stories complete! Looper is done.${NC}"
+        exit 0
+    fi
+
+    echo "Incomplete stories: $INCOMPLETE"
+    echo "Running Claude Code..."
+
+    # Run Claude Code with the prompt
+    OUTPUT=$(build_prompt_input | claude --dangerously-skip-permissions 2>&1) || true
+
+    # Check for completion signal
+    if echo "$OUTPUT" | grep -q "<promise>COMPLETE</promise>"; then
+        echo -e "${GREEN}All stories complete! Looper is done.${NC}"
+        exit 0
+    fi
+
+    # Brief pause between iterations
+    echo "Iteration $i complete. Pausing 2 seconds..."
+    sleep 2
+done
+
+echo -e "${RED}Max iterations ($MAX_ITERATIONS) reached without completion.${NC}"
+echo "Check progress.txt and prd.json for status."
+exit 1
