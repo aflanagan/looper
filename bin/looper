@@ -12,7 +12,7 @@
 # Optional:
 #   - .looper/config.md for project-specific quality checks/context
 #   - .looper/prompt.local.md for project-specific prompt addendum
-#   - .looper/codex-review-prompt.md to override the default review prompt template
+#   - .looper/review-prompt.md to override the default review prompt template
 #   - LOOPER_STATE_DIR to override .looper location
 #   - LOOPER_REVIEW_MAX_ROUNDS (default 3)
 #   - LOOPER_REVIEW_PROMPT_FILE / LOOPER_REVIEW_SCHEMA_FILE to override review artifacts
@@ -38,17 +38,17 @@ fi
 CONFIG_FILE="$STATE_DIR/config.md"
 LOCAL_PROMPT_FILE="$STATE_DIR/prompt.local.md"
 PRD_FILE="$STATE_DIR/prd.json"
-PROGRESS_FILE="$STATE_DIR/progress.txt"
-LAST_BRANCH_FILE="$STATE_DIR/.last-branch"
-ARCHIVE_DIR="$STATE_DIR/archive"
+PROGRESS_DIR="$STATE_DIR/progress"
+LEGACY_PROGRESS_FILE="$STATE_DIR/progress.txt"
+PROGRESS_FILE=""
 REVIEWS_ROOT="$STATE_DIR/reviews"
 PROMPT_FILE="$LOOPER_DIR/templates/looper-prompt.md"
-REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$STATE_DIR/codex-review-prompt.md}"
+REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$STATE_DIR/review-prompt.md}"
 REVIEW_SCHEMA_FILE="${LOOPER_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-review-schema.json}"
 REVIEW_MAX_ROUNDS="${LOOPER_REVIEW_MAX_ROUNDS:-3}"
 
 if [ ! -f "$REVIEW_PROMPT_FILE" ]; then
-    REVIEW_PROMPT_FILE="$LOOPER_DIR/templates/codex-review-prompt.md"
+    REVIEW_PROMPT_FILE="$LOOPER_DIR/templates/review-prompt.md"
 fi
 
 # Colors for output
@@ -74,7 +74,25 @@ get_story_title() {
     jq -r --arg id "$story_id" '.userStories[] | select(.id == $id) | .title // empty' "$PRD_FILE"
 }
 
+get_branch_slug() {
+    jq -r '.branchName // "unknown-branch"' "$PRD_FILE" | sed 's#[^A-Za-z0-9._-]#-#g'
+}
+
 has_uncommitted_changes() {
+    local rel_state_dir
+    if [[ "$STATE_DIR" == "$PROJECT_DIR/"* ]]; then
+        rel_state_dir="${STATE_DIR#$PROJECT_DIR/}"
+        if [ -n "$rel_state_dir" ]; then
+            [ -n "$(git -C "$PROJECT_DIR" status --porcelain -- . \
+                ":(exclude)$rel_state_dir/reviews/**" \
+                ":(exclude)$rel_state_dir/progress/**" \
+                ":(exclude)$rel_state_dir/progress.txt" \
+                ":(exclude)$rel_state_dir/.last-branch" \
+                ":(exclude)$rel_state_dir/archive/**")" ]
+            return
+        fi
+    fi
+
     if ! git -C "$PROJECT_DIR" diff --quiet; then
         return 0
     fi
@@ -101,8 +119,13 @@ stage_and_commit_story() {
 
     if [[ "$STATE_DIR" == "$PROJECT_DIR/"* ]]; then
         rel_state_dir="${STATE_DIR#$PROJECT_DIR/}"
-        # Review artifacts are runtime data and should not be committed.
-        git -C "$PROJECT_DIR" reset -q -- "$rel_state_dir/reviews" 2>/dev/null || true
+        # Runtime state artifacts should not be committed automatically.
+        git -C "$PROJECT_DIR" reset -q -- \
+            "$rel_state_dir/reviews" \
+            "$rel_state_dir/progress" \
+            "$rel_state_dir/progress.txt" \
+            "$rel_state_dir/.last-branch" \
+            "$rel_state_dir/archive" 2>/dev/null || true
     fi
 
     if git -C "$PROJECT_DIR" diff --cached --quiet; then
@@ -116,10 +139,86 @@ stage_and_commit_story() {
     git -C "$PROJECT_DIR" commit -m "[Looper] $story_id: $story_title"
 }
 
+normalize_single_line() {
+    # Collapse newlines/extra spaces so notes stay compact and machine-parseable.
+    local text="$1"
+    printf "%s" "$text" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+truncate_text() {
+    local text="$1"
+    local max_len="$2"
+    local text_len
+    text_len=${#text}
+    if [ "$text_len" -le "$max_len" ]; then
+        printf "%s" "$text"
+    else
+        printf "%s..." "${text:0:$((max_len - 3))}"
+    fi
+}
+
+record_approval_summary() {
+    local story_id="$1"
+    local story_title="$2"
+    local review_file="$3"
+    local approved_round="$4"
+
+    local rel_review_file summary findings_snapshot ac_failures test_gaps
+    local note_line timestamp progress_timestamp
+    local tmp
+
+    rel_review_file="$review_file"
+    if [[ "$rel_review_file" == "$PROJECT_DIR/"* ]]; then
+        rel_review_file="${rel_review_file#$PROJECT_DIR/}"
+    fi
+
+    summary="$(jq -r '.summary // "none"' "$review_file")"
+    findings_snapshot="$(jq -r '[.findings[]? | "\(.priority) \(.title)"] | if length == 0 then "none" else join("; ") end' "$review_file")"
+    ac_failures="$(jq -r '[.acCoverage[]? | select(.status == "fail") | .criterion] | if length == 0 then "none" else join("; ") end' "$review_file")"
+    test_gaps="$(jq -r 'if (.testGaps | length) == 0 then "none" else (.testGaps | join("; ")) end' "$review_file")"
+
+    summary="$(normalize_single_line "$summary")"
+    findings_snapshot="$(normalize_single_line "$findings_snapshot")"
+    ac_failures="$(normalize_single_line "$ac_failures")"
+    test_gaps="$(normalize_single_line "$test_gaps")"
+
+    summary="$(truncate_text "$summary" 240)"
+    findings_snapshot="$(truncate_text "$findings_snapshot" 320)"
+    ac_failures="$(truncate_text "$ac_failures" 240)"
+    test_gaps="$(truncate_text "$test_gaps" 240)"
+
+    timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    progress_timestamp="$(date +"%Y-%m-%d %H:%M:%S")"
+
+    {
+        echo "## $progress_timestamp - $story_id: Review closure summary"
+        echo "- Story title: $story_title"
+        echo "- Final verdict: APPROVED (round $approved_round of $REVIEW_MAX_ROUNDS)"
+        echo "- Review artifact: $rel_review_file"
+        echo "- Review summary: $summary"
+        echo "- Findings snapshot: $findings_snapshot"
+        echo "- AC failures at approval: $ac_failures"
+        echo "- Test gaps: $test_gaps"
+        echo "---"
+        echo ""
+    } >> "$PROGRESS_FILE"
+
+    note_line="Codex review: APPROVED in $approved_round round(s) at $timestamp; summary: $summary; review artifact: $rel_review_file"
+    note_line="$(truncate_text "$(normalize_single_line "$note_line")" 500)"
+
+    tmp="$(mktemp "$STATE_DIR/prd-notes.XXXXXX")"
+    jq --arg id "$story_id" --arg line "$note_line" '
+        (.userStories[] | select(.id == $id) | .notes) |=
+            (if . == null or . == "" then $line else . + "\n" + $line end)
+    ' "$PRD_FILE" > "$tmp"
+    mv "$tmp" "$PRD_FILE"
+}
+
 build_claude_input() {
     local phase="$1"
     local story_id="$2"
     local review_file="${3:-}"
+    local progress_display
 
     cat "$PROMPT_FILE"
 
@@ -130,6 +229,11 @@ build_claude_input() {
     echo "- Active story id: $story_id"
     echo "- Commit changes: NO (Looper commits after Codex review approval)."
     echo "- Set \`passes\` to true: NO (Looper updates \`prd.json\` after Codex approval)."
+    progress_display="$PROGRESS_FILE"
+    if [[ "$progress_display" == "$PROJECT_DIR/"* ]]; then
+        progress_display="${progress_display#$PROJECT_DIR/}"
+    fi
+    echo "- Progress log file: $progress_display"
 
     if [ "$phase" = "remediation" ]; then
         echo "- Phase: remediation"
@@ -165,8 +269,8 @@ run_codex_review_round() {
     local round="$3"
     local previous_review_file="${4:-}"
 
-    local branch_slug review_dir review_file events_file prompt_input_file
-    branch_slug="$(jq -r '.branchName // "unknown-branch"' "$PRD_FILE" | sed 's#[^A-Za-z0-9._-]#-#g')"
+    local branch_slug review_dir review_file events_file prompt_input_file progress_display
+    branch_slug="$(get_branch_slug)"
     review_dir="$REVIEWS_ROOT/$branch_slug/$story_id"
     review_file="$review_dir/round-$round.json"
     events_file="$review_dir/round-$round-events.jsonl"
@@ -181,6 +285,11 @@ run_codex_review_round() {
         echo "- Active story ID: $story_id"
         echo "- Active story title: $story_title"
         echo "- Review round: $round"
+        progress_display="$PROGRESS_FILE"
+        if [[ "$progress_display" == "$PROJECT_DIR/"* ]]; then
+            progress_display="${progress_display#$PROJECT_DIR/}"
+        fi
+        echo "- Progress log file: $progress_display"
         if [ -n "$previous_review_file" ]; then
             echo "- Previous review artifact: $previous_review_file"
         fi
@@ -234,7 +343,7 @@ if [ ! -f "$PROMPT_FILE" ]; then
 fi
 
 if [ ! -f "$REVIEW_PROMPT_FILE" ]; then
-    echo -e "${RED}Error: Codex review prompt template not found at $REVIEW_PROMPT_FILE${NC}"
+    echo -e "${RED}Error: Review prompt template not found at $REVIEW_PROMPT_FILE${NC}"
     exit 1
 fi
 
@@ -254,31 +363,23 @@ if [ -f "$LOCAL_PROMPT_FILE" ]; then
     echo "Project prompt addendum: $LOCAL_PROMPT_FILE"
 fi
 
-# Branch change detection & archiving
-if [ -f "$LAST_BRANCH_FILE" ]; then
-    LAST_BRANCH="$(cat "$LAST_BRANCH_FILE")"
-    CURRENT_BRANCH="$(jq -r '.branchName' "$PRD_FILE")"
+CURRENT_BRANCH="$(jq -r '.branchName // "unknown-branch"' "$PRD_FILE")"
+BRANCH_SLUG="$(get_branch_slug)"
+PROGRESS_FILE="$PROGRESS_DIR/$BRANCH_SLUG.txt"
+mkdir -p "$PROGRESS_DIR"
 
-    if [ "$LAST_BRANCH" != "$CURRENT_BRANCH" ] && [ -n "$LAST_BRANCH" ]; then
-        echo -e "${YELLOW}Branch changed from $LAST_BRANCH to $CURRENT_BRANCH${NC}"
-        echo "Archiving previous run..."
-
-        BRANCH_SLUG="$(echo "$LAST_BRANCH" | sed -e 's#^looper/##')"
-        ARCHIVE_NAME="$(date +%Y-%m-%d)-$BRANCH_SLUG"
-        mkdir -p "$ARCHIVE_DIR/$ARCHIVE_NAME"
-
-        [ -f "$PROGRESS_FILE" ] && cp "$PROGRESS_FILE" "$ARCHIVE_DIR/$ARCHIVE_NAME/"
-        rm -f "$PROGRESS_FILE"
-        echo -e "${GREEN}Previous run archived to $ARCHIVE_DIR/$ARCHIVE_NAME${NC}"
-    fi
+# One-time migration for older state dirs that used .looper/progress.txt.
+if [ -f "$LEGACY_PROGRESS_FILE" ] && [ ! -f "$PROGRESS_FILE" ]; then
+    cp "$LEGACY_PROGRESS_FILE" "$PROGRESS_FILE"
 fi
 
-CURRENT_BRANCH="$(jq -r '.branchName' "$PRD_FILE")"
-echo "$CURRENT_BRANCH" > "$LAST_BRANCH_FILE"
+echo "Branch: $CURRENT_BRANCH"
+echo "Progress file: $PROGRESS_FILE"
 
 # Initialize progress file if missing
 if [ ! -f "$PROGRESS_FILE" ]; then
     echo "# Looper Progress Log" > "$PROGRESS_FILE"
+    echo "Branch: $CURRENT_BRANCH" >> "$PROGRESS_FILE"
     echo "Started: $(date)" >> "$PROGRESS_FILE"
     echo "---" >> "$PROGRESS_FILE"
     echo "" >> "$PROGRESS_FILE"
@@ -320,6 +421,7 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
     fi
 
     APPROVED=false
+    APPROVED_ROUND=0
     PREVIOUS_REVIEW_FILE=""
 
     for round in $(seq 1 "$REVIEW_MAX_ROUNDS"); do
@@ -329,6 +431,7 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
         if [ "$VERDICT" = "APPROVED" ]; then
             echo -e "${GREEN}Codex review APPROVED ($ACTIVE_STORY_ID, round $round).${NC}"
             APPROVED=true
+            APPROVED_ROUND="$round"
             break
         fi
 
@@ -351,6 +454,7 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
         continue
     fi
 
+    record_approval_summary "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$REVIEW_FILE" "$APPROVED_ROUND"
     mark_story_passed "$ACTIVE_STORY_ID"
     stage_and_commit_story "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" || true
 
@@ -359,5 +463,5 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
 done
 
 echo -e "${RED}Max iterations ($MAX_ITERATIONS) reached without completion.${NC}"
-echo "Check .looper/progress.txt and .looper/prd.json for status."
+echo "Check .looper/progress/<branch-slug>.txt and .looper/prd.json for status."
 exit 1

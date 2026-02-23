@@ -22,6 +22,11 @@ cd looper
 ./install.sh
 ```
 
+`install.sh` sets up:
+- `~/bin/looper`
+- `~/.claude/skills/{looper,prd}`
+- `~/.codex/skills/{looper,prd}`
+
 Ensure your shell `PATH` includes the install destination (`$HOME/bin` by default):
 
 ```bash
@@ -73,8 +78,9 @@ looper 20   # custom iteration limit
   ├── prd.json                 # Required: task state
   ├── config.md                # Optional: project-specific config
   ├── prompt.local.md          # Optional: project-specific prompt addendum
-  ├── codex-review-prompt.md   # Optional: override Codex review prompt
-  ├── progress.txt             # Auto-created: iteration learnings
+  ├── review-prompt.md         # Optional: override review prompt
+  ├── progress/                # Auto-created: branch-scoped iteration logs
+  │   └── <branch-slug>.txt
   └── reviews/                 # Auto-created: review artifacts
 ```
 
@@ -82,7 +88,9 @@ looper 20   # custom iteration limit
 
 - Looper does not commit until Codex returns `APPROVED`.
 - Looper sets story `passes: true` only after approval.
-- Looper archives progress when `branchName` changes.
+- After approval, Looper appends a review-closure summary to `.looper/progress/<branch-slug>.txt` and a short review outcome line to that story's `.looper/prd.json` notes.
+- Looper writes progress to branch-scoped files under `.looper/progress/<branch-slug>.txt`.
+- Looper excludes `.looper/reviews` and `.looper/progress` runtime artifacts from auto-commits.
 - Review artifacts are written under `.looper/reviews/<branch>/<story>/`.
 
 ## Configuration
@@ -99,7 +107,7 @@ Environment variables:
 |------|---------|
 | `bin/looper` | Main CLI orchestrator |
 | `templates/looper-prompt.md` | Base Claude implementation prompt |
-| `templates/codex-review-prompt.md` | Base Codex review prompt |
+| `templates/review-prompt.md` | Base review prompt |
 | `templates/codex-review-schema.json` | Structured output schema for Codex review |
 | `skills/looper/SKILL.md` | PRD-to-JSON conversion skill |
 | `skills/prd/SKILL.md` | PRD generation skill |

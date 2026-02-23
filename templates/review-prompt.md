@@ -1,4 +1,4 @@
-# Looper Codex Review Instructions
+# Looper Review Instructions
 
 You are an independent code reviewer for a single Looper story.
 
@@ -6,9 +6,9 @@ Review ONLY uncommitted changes in the current repository for the active story f
 
 ## Context to read
 - `.looper/prd.json`
-- `.looper/progress.txt` (latest relevant section)
+- Progress file path provided in runtime context (latest relevant section, typically `.looper/progress/<branch-slug>.txt`)
 - Active story acceptance criteria and notes
-- Runtime context appended below (story id, title, round, prior review artifact)
+- Runtime context appended below (story id, title, round, progress file, prior review artifact)
 
 ## Review scope
 Focus on:

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Looper installer
-# Creates symlinks for the looper CLI and Claude Code skills.
+# Creates symlinks for the looper CLI and both Claude/Codex skills.
 
 set -e
 
@@ -14,27 +14,42 @@ NC='\033[0m'
 echo -e "${GREEN}Installing Looper...${NC}"
 
 # Create directories if needed
-mkdir -p ~/bin
-mkdir -p ~/.claude/skills
+mkdir -p "$HOME/bin"
+mkdir -p "$HOME/.claude/skills"
+mkdir -p "$HOME/.codex/skills"
 
 # Symlink the CLI (primary command)
-if [ -L ~/bin/looper ] || [ -f ~/bin/looper ]; then
-    rm -f ~/bin/looper
+if [ -L "$HOME/bin/looper" ] || [ -f "$HOME/bin/looper" ]; then
+    rm -f "$HOME/bin/looper"
 fi
-ln -s "$SCRIPT_DIR/bin/looper" ~/bin/looper
+ln -s "$SCRIPT_DIR/bin/looper" "$HOME/bin/looper"
 chmod +x "$SCRIPT_DIR/bin/looper"
-echo "Linked: ~/bin/looper -> $SCRIPT_DIR/bin/looper"
+echo "Linked: $HOME/bin/looper -> $SCRIPT_DIR/bin/looper"
 
-# Symlink skills
-for skill in looper prd; do
-    if [ -L ~/.claude/skills/$skill ]; then
-        rm ~/.claude/skills/$skill
-    elif [ -d ~/.claude/skills/$skill ]; then
-        echo -e "${YELLOW}Warning: ~/.claude/skills/$skill exists and is not a symlink. Skipping.${NC}"
-        continue
+link_skill() {
+    local skills_root="$1"
+    local skill_name="$2"
+    local target_path="$skills_root/$skill_name"
+
+    if [ -L "$target_path" ]; then
+        rm "$target_path"
+    elif [ -d "$target_path" ]; then
+        echo -e "${YELLOW}Warning: $target_path exists and is not a symlink. Skipping.${NC}"
+        return 0
+    elif [ -f "$target_path" ]; then
+        echo -e "${YELLOW}Warning: $target_path exists and is a file. Skipping.${NC}"
+        return 0
     fi
-    ln -s "$SCRIPT_DIR/skills/$skill" ~/.claude/skills/$skill
-    echo "Linked: ~/.claude/skills/$skill -> $SCRIPT_DIR/skills/$skill"
+
+    ln -s "$SCRIPT_DIR/skills/$skill_name" "$target_path"
+    echo "Linked: $target_path -> $SCRIPT_DIR/skills/$skill_name"
+}
+
+# Symlink skills for both Claude and Codex.
+for skills_root in "$HOME/.claude/skills" "$HOME/.codex/skills"; do
+    for skill in looper prd; do
+        link_skill "$skills_root" "$skill"
+    done
 done
 
 echo ""
