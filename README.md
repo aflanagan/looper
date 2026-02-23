@@ -13,19 +13,17 @@ An autonomous coding-agent loop for Claude Code. Looper implements user stories 
 ## Installation
 
 ```bash
-git clone https://github.com/aflanagan/ralph.git ~/work/looper
-cd ~/work/looper
+git clone https://github.com/aflanagan/looper.git
+cd looper
 ./install.sh
 ```
 
-Note: the GitHub repo is still `ralph` today; the intent is to rename it to `looper`.
-
 The installer:
-- Symlinks `looper` to `~/bin/`
+- Installs the `looper` CLI
 - Adds compatibility alias `ralph -> looper`
-- Symlinks skills to `~/.claude/skills/`
+- Installs Claude skills for `/looper` and `/prd`
 
-Make sure `~/bin` is in your PATH:
+Ensure your shell `PATH` includes the install destination (`$HOME/bin` by default):
 
 ```bash
 export PATH="$HOME/bin:$PATH"
@@ -92,7 +90,7 @@ Looper always loads the global template at `templates/looper-prompt.md` first, t
 
 ## Project Structure
 
-Preferred layout:
+Use this layout:
 
 ```
 .ai/looper/
@@ -102,15 +100,7 @@ Preferred layout:
   └── progress.txt      # Auto-created: iteration learnings
 ```
 
-Legacy layout is still supported:
-
-```
-.claude/
-  ├── prd.json
-  ├── ralph-config.md
-  ├── ralph-prompt.md
-  └── progress.txt
-```
+Legacy `.claude/*` files are still auto-detected for backward compatibility, but new projects should use `.ai/looper/*`.
 
 ## Files
 
@@ -134,7 +124,7 @@ Future iterations read this file first, so Looper learns from its own work.
 ## Branch Management
 
 - Looper works on the branch specified in `prd.json` (`branchName` field)
-- When you start a new feature (different branch), previous progress is archived to `.ai/looper/archive/` (or `.claude/archive/` in legacy repos)
+- When you start a new feature (different branch), previous progress is archived to `.ai/looper/archive/`
 - Looper never pushes - you review commits and push manually
 
 ## Requirements
