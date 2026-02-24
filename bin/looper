@@ -15,6 +15,7 @@
 #   - .looper/review-prompt.md to override the default review prompt template
 #   - LOOPER_STATE_DIR to override .looper location
 #   - LOOPER_REVIEW_MAX_ROUNDS (default 5)
+#   - LOOPER_REVIEW_SAVE_EVENTS (default 0; set to 1 to persist Codex jsonl event logs)
 #   - LOOPER_REVIEW_PROMPT_FILE / LOOPER_REVIEW_SCHEMA_FILE to override review artifacts
 
 set -euo pipefail
@@ -46,6 +47,7 @@ PROMPT_FILE="$LOOPER_DIR/templates/looper-prompt.md"
 REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$STATE_DIR/review-prompt.md}"
 REVIEW_SCHEMA_FILE="${LOOPER_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-review-schema.json}"
 REVIEW_MAX_ROUNDS="${LOOPER_REVIEW_MAX_ROUNDS:-5}"
+REVIEW_SAVE_EVENTS="${LOOPER_REVIEW_SAVE_EVENTS:-0}"
 
 if [ ! -f "$REVIEW_PROMPT_FILE" ]; then
     REVIEW_PROMPT_FILE="$LOOPER_DIR/templates/review-prompt.md"
@@ -157,25 +159,73 @@ truncate_text() {
     fi
 }
 
+render_review_markdown() {
+    local review_json_file="$1"
+    local review_md_file="$2"
+    local story_id="$3"
+    local story_title="$4"
+    local round="$5"
+
+    jq -r \
+        --arg story_id "$story_id" \
+        --arg story_title "$story_title" \
+        --arg round "$round" '
+        "# Codex Review\n\n" +
+        "- Story ID: " + $story_id + "\n" +
+        "- Story title: " + $story_title + "\n" +
+        "- Round: " + $round + "\n" +
+        "- Verdict: " + (.verdict // "unknown") + "\n\n" +
+        "## Summary\n\n" +
+        (.summary // "none") + "\n\n" +
+        "## Findings\n\n" +
+        (if (.findings | length) == 0 then
+            "- None\n"
+        else
+            (.findings | map(
+                "- [" + .priority + "] " + .title + "\n" +
+                "  - ID: " + .id + "\n" +
+                "  - Location: " + .location + "\n" +
+                "  - Details: " + .details
+            ) | join("\n")) + "\n"
+        end) +
+        "\n## Acceptance Criteria Coverage\n\n" +
+        (if (.acCoverage | length) == 0 then
+            "- None\n"
+        else
+            (.acCoverage | map(
+                "- [" + .status + "] " + .criterion + "\n" +
+                "  - " + .details
+            ) | join("\n")) + "\n"
+        end) +
+        "\n## Test Gaps\n\n" +
+        (if (.testGaps | length) == 0 then
+            "- None\n"
+        else
+            (.testGaps | map("- " + .) | join("\n")) + "\n"
+        end)
+        ' "$review_json_file" > "$review_md_file"
+}
+
 record_approval_summary() {
     local story_id="$1"
     local story_title="$2"
-    local review_file="$3"
-    local approved_round="$4"
+    local review_json_file="$3"
+    local review_artifact_file="$4"
+    local approved_round="$5"
 
     local rel_review_file summary findings_snapshot ac_failures test_gaps
     local note_line timestamp progress_timestamp
     local tmp
 
-    rel_review_file="$review_file"
+    rel_review_file="$review_artifact_file"
     if [[ "$rel_review_file" == "$PROJECT_DIR/"* ]]; then
         rel_review_file="${rel_review_file#$PROJECT_DIR/}"
     fi
 
-    summary="$(jq -r '.summary // "none"' "$review_file")"
-    findings_snapshot="$(jq -r '[.findings[]? | "\(.priority) \(.title)"] | if length == 0 then "none" else join("; ") end' "$review_file")"
-    ac_failures="$(jq -r '[.acCoverage[]? | select(.status == "fail") | .criterion] | if length == 0 then "none" else join("; ") end' "$review_file")"
-    test_gaps="$(jq -r 'if (.testGaps | length) == 0 then "none" else (.testGaps | join("; ")) end' "$review_file")"
+    summary="$(jq -r '.summary // "none"' "$review_json_file")"
+    findings_snapshot="$(jq -r '[.findings[]? | "\(.priority) \(.title)"] | if length == 0 then "none" else join("; ") end' "$review_json_file")"
+    ac_failures="$(jq -r '[.acCoverage[]? | select(.status == "fail") | .criterion] | if length == 0 then "none" else join("; ") end' "$review_json_file")"
+    test_gaps="$(jq -r 'if (.testGaps | length) == 0 then "none" else (.testGaps | join("; ")) end' "$review_json_file")"
 
     summary="$(normalize_single_line "$summary")"
     findings_snapshot="$(normalize_single_line "$findings_snapshot")"
@@ -269,15 +319,22 @@ run_codex_review_round() {
     local round="$3"
     local previous_review_file="${4:-}"
 
-    local branch_slug review_dir review_file events_file prompt_input_file progress_display
+    local branch_slug review_dir review_md_file review_json_tmp events_file
+    local progress_display codex_stdout_target
     branch_slug="$(get_branch_slug)"
     review_dir="$REVIEWS_ROOT/$branch_slug/$story_id"
-    review_file="$review_dir/round-$round.json"
-    events_file="$review_dir/round-$round-events.jsonl"
+    review_md_file="$review_dir/round-$round.md"
+    review_json_tmp="$(mktemp "${TMPDIR:-/tmp}/looper-review-round-${story_id}-${round}.XXXXXX.json")"
 
     mkdir -p "$review_dir"
-    prompt_input_file="$(mktemp "$STATE_DIR/codex-review-input.XXXXXX.md")"
 
+    codex_stdout_target="/dev/null"
+    if [ "$REVIEW_SAVE_EVENTS" = "1" ]; then
+        events_file="$review_dir/round-$round-events.jsonl"
+        codex_stdout_target="$events_file"
+    fi
+
+    echo "Running Codex review round $round for $story_id..." >&2
     {
         cat "$REVIEW_PROMPT_FILE"
         echo ""
@@ -293,13 +350,10 @@ run_codex_review_round() {
         if [ -n "$previous_review_file" ]; then
             echo "- Previous review artifact: $previous_review_file"
         fi
-    } > "$prompt_input_file"
+    } | codex -a never -s workspace-write exec --ephemeral --json --output-schema "$REVIEW_SCHEMA_FILE" -o "$review_json_tmp" - > "$codex_stdout_target"
 
-    echo "Running Codex review round $round for $story_id..."
-    codex -a never -s workspace-write exec --ephemeral --json --output-schema "$REVIEW_SCHEMA_FILE" -o "$review_file" - < "$prompt_input_file" > "$events_file"
-
-    rm -f "$prompt_input_file"
-    echo "$review_file"
+    render_review_markdown "$review_json_tmp" "$review_md_file" "$story_id" "$story_title" "$round"
+    printf "%s\t%s\n" "$review_json_tmp" "$review_md_file"
 }
 
 echo -e "${GREEN}Looper starting...${NC}"
@@ -311,6 +365,10 @@ echo "Codex review rounds per story: $REVIEW_MAX_ROUNDS"
 # Validate prerequisites.
 if ! [[ "$REVIEW_MAX_ROUNDS" =~ ^[0-9]+$ ]] || [ "$REVIEW_MAX_ROUNDS" -lt 1 ]; then
     echo -e "${RED}Error: LOOPER_REVIEW_MAX_ROUNDS must be a positive integer.${NC}"
+    exit 1
+fi
+if ! [[ "$REVIEW_SAVE_EVENTS" =~ ^[01]$ ]]; then
+    echo -e "${RED}Error: LOOPER_REVIEW_SAVE_EVENTS must be 0 or 1.${NC}"
     exit 1
 fi
 
@@ -423,29 +481,36 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
     APPROVED=false
     APPROVED_ROUND=0
     PREVIOUS_REVIEW_FILE=""
+    APPROVED_REVIEW_JSON=""
+    APPROVED_REVIEW_ARTIFACT=""
 
     for round in $(seq 1 "$REVIEW_MAX_ROUNDS"); do
-        REVIEW_FILE="$(run_codex_review_round "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$round" "$PREVIOUS_REVIEW_FILE")"
-        VERDICT="$(jq -r '.verdict // empty' "$REVIEW_FILE")"
+        REVIEW_RESULT="$(run_codex_review_round "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$round" "$PREVIOUS_REVIEW_FILE")"
+        IFS=$'\t' read -r REVIEW_JSON_FILE REVIEW_ARTIFACT_FILE <<< "$REVIEW_RESULT"
+        VERDICT="$(jq -r '.verdict // empty' "$REVIEW_JSON_FILE")"
 
         if [ "$VERDICT" = "APPROVED" ]; then
             echo -e "${GREEN}Codex review APPROVED ($ACTIVE_STORY_ID, round $round).${NC}"
             APPROVED=true
             APPROVED_ROUND="$round"
+            APPROVED_REVIEW_JSON="$REVIEW_JSON_FILE"
+            APPROVED_REVIEW_ARTIFACT="$REVIEW_ARTIFACT_FILE"
             break
         fi
 
         if [ "$VERDICT" != "CHANGES_REQUESTED" ]; then
-            echo -e "${RED}Error: invalid Codex verdict '$VERDICT' in $REVIEW_FILE${NC}"
+            echo -e "${RED}Error: invalid Codex verdict '$VERDICT' in $REVIEW_JSON_FILE${NC}"
             exit 1
         fi
 
         echo -e "${YELLOW}Codex requested changes ($ACTIVE_STORY_ID, round $round).${NC}"
-        PREVIOUS_REVIEW_FILE="$REVIEW_FILE"
+        PREVIOUS_REVIEW_FILE="$REVIEW_ARTIFACT_FILE"
 
         if [ "$round" -lt "$REVIEW_MAX_ROUNDS" ]; then
-            run_claude_phase "remediation" "$ACTIVE_STORY_ID" "$REVIEW_FILE"
+            run_claude_phase "remediation" "$ACTIVE_STORY_ID" "$REVIEW_ARTIFACT_FILE"
         fi
+
+        rm -f "$REVIEW_JSON_FILE"
     done
 
     if [ "$APPROVED" != "true" ]; then
@@ -454,7 +519,8 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
         continue
     fi
 
-    record_approval_summary "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$REVIEW_FILE" "$APPROVED_ROUND"
+    record_approval_summary "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$APPROVED_REVIEW_JSON" "$APPROVED_REVIEW_ARTIFACT" "$APPROVED_ROUND"
+    rm -f "$APPROVED_REVIEW_JSON"
     mark_story_passed "$ACTIVE_STORY_ID"
     stage_and_commit_story "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" || true
 

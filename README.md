@@ -20,7 +20,7 @@ PRD → Stories → [ Claude implements → Codex reviews → remediate? ] → c
 4. For each story:
    - Claude implements the story and runs quality checks
    - Codex reviews uncommitted changes
-   - If Codex requests changes, Claude remediates and Codex re-reviews (up to `LOOPER_REVIEW_MAX_ROUNDS`, default 3)
+   - If Codex requests changes, Claude remediates and Codex re-reviews (up to `LOOPER_REVIEW_MAX_ROUNDS`, default 5)
    - On approval, Looper commits and marks the story passed
 5. Stops when all stories pass or max iterations is reached
 
