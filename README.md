@@ -1,18 +1,30 @@
-# Looper
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="banner-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="banner-light.svg">
+  <img alt="Looper" src="banner-dark.svg" width="480">
+</picture>
 
-A long running loop harness for Claude Code and Codex. Looper takes a PRD, breaks it down to stories, and then runs a [Ralph Loop](https://ghuntley.com/loop/) to implement one story at a time with Claude Code. Codex then reviews the code and requests changes. Claude will either rebut the requests or implement them. This process continues until both agree on the implementation.
+Automate multi-story implementation by pairing Claude Code (implementer) with Codex (reviewer) in a loop until both agree on the code. Based on the [Ralph Loop](https://ghuntley.com/loop/) pattern (implement → review → remediate).
+
+Give Looper a PRD, and it breaks it into dependency-ordered stories, then runs Claude Code against each one while Codex reviews. If Codex requests changes, Claude remediates. This continues until Codex approves or max review rounds are hit. Then it commits and moves to the next story.
+
+```
+PRD → Stories → [ Claude implements → Codex reviews → remediate? ] → commit → next story
+```
 
 ## How It Works
 
 1. Create a PRD with dependency-ordered stories
-2. Convert it to `.looper/prd.json` using `/looper`
+2. Convert it to `.looper/prd.json` using the `/looper` slash command
 3. Run `looper`
-4. Each iteration:
-   - Claude implements one story and runs quality checks
+4. For each story:
+   - Claude implements the story and runs quality checks
    - Codex reviews uncommitted changes
-   - If review requests changes, Claude remediates and Codex re-reviews (up to max rounds)
-   - On approval, Looper marks the story passed and commits
+   - If Codex requests changes, Claude remediates and Codex re-reviews (up to `LOOPER_REVIEW_MAX_ROUNDS`, default 3)
+   - On approval, Looper commits and marks the story passed
 5. Stops when all stories pass or max iterations is reached
+
+> **What happens if they can't agree?** After exhausting review rounds, Looper moves on to the next story without committing. Check `.looper/progress/` for details on what went wrong.
 
 ## Installation
 
@@ -23,11 +35,11 @@ cd looper
 ```
 
 `install.sh` sets up:
-- `~/bin/looper`
-- `~/.claude/skills/{looper,prd}`
-- `~/.codex/skills/{looper,prd}`
+- `~/bin/looper` — the CLI orchestrator
+- `~/.claude/skills/{looper,prd}` — custom slash commands for Claude Code (`/looper`, `/prd`)
+- `~/.codex/skills/{looper,prd}` — skills for Codex
 
-Ensure your shell `PATH` includes the install destination (`$HOME/bin` by default):
+Make sure `~/bin` is in your `PATH`:
 
 ```bash
 export PATH="$HOME/bin:$PATH"
@@ -40,11 +52,13 @@ export PATH="$HOME/bin:$PATH"
 - `jq`
 - Git
 
+> **Cost note:** Looper runs Claude Code and Codex in a loop — each story may consume multiple implementation + review cycles. Monitor your API usage, and use `LOOPER_REVIEW_MAX_ROUNDS` and iteration limits to constrain spend.
+
 ## Usage
 
 ### 1. Create a PRD
 
-In Claude Code, use `/prd`:
+In Claude Code, use the `/prd` slash command:
 
 ```
 /prd add dark mode to the dashboard
@@ -52,17 +66,49 @@ In Claude Code, use `/prd`:
 
 ### 2. Convert to Looper format
 
-Use `/looper`:
+Still in Claude Code, convert the PRD to the structured JSON format Looper expects:
 
 ```
 /looper convert this prd
 ```
 
-This creates `.looper/prd.json`.
+This creates `.looper/prd.json`. Example structure:
+
+```json
+{
+  "stories": [
+    {
+      "id": "1",
+      "title": "Add theme toggle component",
+      "description": "Create a toggle switch in the header...",
+      "dependencies": [],
+      "passes": false,
+      "notes": []
+    },
+    {
+      "id": "2",
+      "title": "Implement CSS custom properties for theming",
+      "dependencies": ["1"],
+      "passes": false,
+      "notes": []
+    }
+  ]
+}
+```
 
 ### 3. (Optional) Add project config
 
-Create `.looper/config.md` with project-specific quality checks and context.
+Create `.looper/config.md` with project-specific quality checks and context. For example:
+
+```markdown
+## Quality Checks
+- Always run `npm test` and `npm run lint` before marking a story complete
+- Ensure all new components have unit tests
+
+## Context
+- This project uses React 18 with TypeScript
+- Styles use Tailwind CSS
+```
 
 ### 4. Run Looper
 
@@ -75,31 +121,26 @@ looper 20   # custom iteration limit
 
 ```
 .looper/
-  ├── prd.json                 # Required: task state
-  ├── config.md                # Optional: project-specific config
+  ├── prd.json                 # Required: stories and task state
+  ├── config.md                # Optional: project-specific quality checks and context
   ├── prompt.local.md          # Optional: project-specific prompt addendum
-  ├── review-prompt.md         # Optional: override review prompt
+  ├── review-prompt.md         # Optional: override the default review prompt
   ├── progress/                # Auto-created: branch-scoped iteration logs
-  │   └── <branch-slug>.txt
-  └── reviews/                 # Auto-created: review artifacts
+  │   └── <branch-slug>.txt   #   (excluded from auto-commits)
+  └── reviews/                 # Auto-created: review artifacts per story
+      └── <branch>/<story>/    #   (excluded from auto-commits)
 ```
 
-## Runtime Behavior
-
-- Looper does not commit until Codex returns `APPROVED`.
-- Looper sets story `passes: true` only after approval.
-- After approval, Looper appends a review-closure summary to `.looper/progress/<branch-slug>.txt` and a short review outcome line to that story's `.looper/prd.json` notes.
-- Looper writes progress to branch-scoped files under `.looper/progress/<branch-slug>.txt`.
-- Looper excludes `.looper/reviews` and `.looper/progress` runtime artifacts from auto-commits.
-- Review artifacts are written under `.looper/reviews/<branch>/<story>/`.
+Looper only commits after Codex returns `APPROVED`. On approval, it appends a review-closure summary to the progress log and a short outcome note to the story's entry in `prd.json`.
 
 ## Configuration
 
-Environment variables:
-- `LOOPER_STATE_DIR`: override `.looper` path
-- `LOOPER_REVIEW_MAX_ROUNDS`: default `5`
-- `LOOPER_REVIEW_PROMPT_FILE`: override review prompt path
-- `LOOPER_REVIEW_SCHEMA_FILE`: override review schema path
+| Environment Variable | Default | Description |
+|---|---|---|
+| `LOOPER_STATE_DIR` | `.looper` | Override the state directory path |
+| `LOOPER_REVIEW_MAX_ROUNDS` | `3` | Max review/remediation cycles per story |
+| `LOOPER_REVIEW_PROMPT_FILE` | `templates/review-prompt.md` | Override review prompt path |
+| `LOOPER_REVIEW_SCHEMA_FILE` | `templates/codex-review-schema.json` | Override review schema path |
 
 ## Files
 
@@ -109,8 +150,13 @@ Environment variables:
 | `templates/looper-prompt.md` | Base Claude implementation prompt |
 | `templates/review-prompt.md` | Base review prompt |
 | `templates/codex-review-schema.json` | Structured output schema for Codex review |
+| `skills/looper/SKILL.md` | `/looper` slash command (PRD-to-JSON conversion) |
+| `skills/prd/SKILL.md` | `/prd` slash command (PRD generation) |
 
 ## Based On
-Ryan Carson's Ralph Loop - https://github.com/snarktank/ralph
-| `skills/looper/SKILL.md` | PRD-to-JSON conversion skill |
-| `skills/prd/SKILL.md` | PRD generation skill |
+
+[Ralph Loop](https://github.com/snarktank/ralph) by Ryan Carson.
+
+## License
+
+<!-- TODO: Add license -->
