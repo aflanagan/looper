@@ -70,7 +70,13 @@ Unresolved questions that need answers:
 ```
 
 ### Step 3: Save the PRD
-Save to `.looper/plans/prd-[feature-name].md`
+Save to `.looper/<branch-name>/prd.md`
+
+Determine `<branch-name>` from the current git branch:
+- Start with `git rev-parse --abbrev-ref HEAD`
+- If it starts with `codex/` or `looper/`, drop that prefix
+- Replace non `[A-Za-z0-9._-]` characters with `-`
+- If empty, use `unknown-branch`
 
 ## Output guidelines
 

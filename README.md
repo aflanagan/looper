@@ -15,7 +15,7 @@ PRD → Stories → [ Claude implements → Codex reviews → remediate? ] → c
 ## How It Works
 
 1. Create a PRD with dependency-ordered stories
-2. Convert it to `.looper/prd.json` using the `/looper` slash command
+2. Convert it to `.looper/<branch-name>/prd.json` using the `/looper` slash command (or create `.looper/<branch-name>/` manually and add your own `prd.md`/`prd.json`)
 3. Run `looper`
 4. For each story:
    - Claude implements the story and runs quality checks
@@ -24,7 +24,7 @@ PRD → Stories → [ Claude implements → Codex reviews → remediate? ] → c
    - On approval, Looper commits and marks the story passed
 5. Stops when all stories pass or max iterations is reached
 
-> **What happens if they can't agree?** After exhausting review rounds, Looper moves on to the next story without committing. Check `.looper/progress/` for details on what went wrong.
+> **What happens if they can't agree?** After exhausting review rounds, Looper moves on to the next story without committing. Check `.looper/<branch-name>/progress.txt` for details on what went wrong.
 
 ## Installation
 
@@ -72,7 +72,7 @@ Still in Claude Code, convert the PRD to the structured JSON format Looper expec
 /looper convert this prd
 ```
 
-This creates `.looper/prd.json`. Example structure:
+This creates `.looper/<branch-name>/prd.json`. Example structure:
 
 ```json
 {
@@ -98,7 +98,7 @@ This creates `.looper/prd.json`. Example structure:
 
 ### 3. (Optional) Add project config
 
-Create `.looper/config.md` with project-specific quality checks and context. For example:
+Create `.looper/<branch-name>/config.md` with project-specific quality checks and context. For example:
 
 ```markdown
 ## Quality Checks
@@ -109,6 +109,17 @@ Create `.looper/config.md` with project-specific quality checks and context. For
 - This project uses React 18 with TypeScript
 - Styles use Tailwind CSS
 ```
+
+### Manual bootstrap (without `/prd` or `/looper`)
+
+If you prefer to start manually:
+
+1. Create `.looper/<branch-name>/` (usually from your current git branch)
+2. Add your PRD markdown as `.looper/<branch-name>/prd.md`
+3. Add `.looper/<branch-name>/prd.json` in Looper story format
+4. Run `looper`
+
+`prd.md` is optional for Looper runtime, but recommended as source context you can keep alongside `prd.json`.
 
 ### 4. Run Looper
 
@@ -121,15 +132,18 @@ looper 20   # custom iteration limit
 
 ```
 .looper/
-  ├── prd.json                 # Required: stories and task state
-  ├── config.md                # Optional: project-specific quality checks and context
-  ├── prompt.local.md          # Optional: project-specific prompt addendum
-  ├── review-prompt.md         # Optional: override the default review prompt
-  ├── progress/                # Auto-created: branch-scoped iteration logs
-  │   └── <branch-slug>.txt   #   (excluded from auto-commits)
-  └── reviews/                 # Auto-created: review artifacts per story
-      └── <branch>/<story>/    #   (excluded from auto-commits)
+  └── <branch-name>/
+      ├── prd.md               # Optional: source PRD markdown
+      ├── prd.json             # Required: stories and task state
+      ├── config.md            # Optional: project-specific quality checks and context
+      ├── prompt.local.md      # Optional: project-specific prompt addendum
+      ├── review-prompt.md     # Optional: override the default review prompt
+      ├── progress.txt         # Auto-created: iteration log (excluded from auto-commits)
+      └── reviews/             # Auto-created: review artifacts per story (excluded from auto-commits)
+          └── <story-id>/
 ```
+
+`<branch-name>` defaults to the current git branch slug (with `codex/` and `looper/` prefixes stripped). Set `LOOPER_STATE_DIR` to override the full state path.
 
 Looper only commits after Codex returns `APPROVED`. On approval, it appends a review-closure summary to the progress log and a short outcome note to the story's entry in `prd.json`.
 
@@ -137,8 +151,9 @@ Looper only commits after Codex returns `APPROVED`. On approval, it appends a re
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `LOOPER_STATE_DIR` | `.looper` | Override the state directory path |
-| `LOOPER_REVIEW_MAX_ROUNDS` | `3` | Max review/remediation cycles per story |
+| `LOOPER_STATE_DIR` | `.looper/<branch-name>` | Override the full state directory path |
+| `LOOPER_REVIEW_MAX_ROUNDS` | `5` | Max review/remediation cycles per story |
+| `LOOPER_REVIEW_SAVE_EVENTS` | `0` | Save Codex jsonl event logs under `reviews/` when set to `1` |
 | `LOOPER_REVIEW_PROMPT_FILE` | `templates/review-prompt.md` | Override review prompt path |
 | `LOOPER_REVIEW_SCHEMA_FILE` | `templates/codex-review-schema.json` | Override review schema path |
 

@@ -6,14 +6,14 @@
 # Default: 10 iterations
 #
 # Requires:
-#   - .looper/prd.json in current directory
+#   - .looper/<branch-name>/prd.json in current directory
 #   - codex, claude, jq, git
 #
 # Optional:
-#   - .looper/config.md for project-specific quality checks/context
-#   - .looper/prompt.local.md for project-specific prompt addendum
-#   - .looper/review-prompt.md to override the default review prompt template
-#   - LOOPER_STATE_DIR to override .looper location
+#   - .looper/<branch-name>/config.md for project-specific quality checks/context
+#   - .looper/<branch-name>/prompt.local.md for project-specific prompt addendum
+#   - .looper/<branch-name>/review-prompt.md to override the default review prompt template
+#   - LOOPER_STATE_DIR to override the full state dir path
 #   - LOOPER_REVIEW_MAX_ROUNDS (default 5)
 #   - LOOPER_REVIEW_SAVE_EVENTS (default 0; set to 1 to persist Codex jsonl event logs)
 #   - LOOPER_REVIEW_PROMPT_FILE / LOOPER_REVIEW_SCHEMA_FILE to override review artifacts
@@ -27,21 +27,32 @@ LOOPER_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 MAX_ITERATIONS=${1:-10}
 PROJECT_DIR="$PWD"
 
+CURRENT_GIT_BRANCH_RAW="$(git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown-branch")"
+STATE_BRANCH_NAME="$CURRENT_GIT_BRANCH_RAW"
+case "$STATE_BRANCH_NAME" in
+    codex/*|looper/*)
+        STATE_BRANCH_NAME="${STATE_BRANCH_NAME#*/}"
+        ;;
+esac
+STATE_BRANCH_SLUG="$(printf "%s" "$STATE_BRANCH_NAME" | sed 's#[^A-Za-z0-9._-]#-#g')"
+if [ -z "$STATE_BRANCH_SLUG" ]; then
+    STATE_BRANCH_SLUG="unknown-branch"
+fi
+
 if [ -n "${LOOPER_STATE_DIR:-}" ]; then
     case "$LOOPER_STATE_DIR" in
         /*) STATE_DIR="$LOOPER_STATE_DIR" ;;
         *) STATE_DIR="$PROJECT_DIR/$LOOPER_STATE_DIR" ;;
     esac
 else
-    STATE_DIR="$PROJECT_DIR/.looper"
+    STATE_DIR="$PROJECT_DIR/.looper/$STATE_BRANCH_SLUG"
 fi
 
 CONFIG_FILE="$STATE_DIR/config.md"
 LOCAL_PROMPT_FILE="$STATE_DIR/prompt.local.md"
+PRD_MARKDOWN_FILE="$STATE_DIR/prd.md"
 PRD_FILE="$STATE_DIR/prd.json"
-PROGRESS_DIR="$STATE_DIR/progress"
-LEGACY_PROGRESS_FILE="$STATE_DIR/progress.txt"
-PROGRESS_FILE=""
+PROGRESS_FILE="$STATE_DIR/progress.txt"
 REVIEWS_ROOT="$STATE_DIR/reviews"
 PROMPT_FILE="$LOOPER_DIR/templates/looper-prompt.md"
 REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$STATE_DIR/review-prompt.md}"
@@ -76,8 +87,55 @@ get_story_title() {
     jq -r --arg id "$story_id" '.userStories[] | select(.id == $id) | .title // empty' "$PRD_FILE"
 }
 
-get_branch_slug() {
-    jq -r '.branchName // "unknown-branch"' "$PRD_FILE" | sed 's#[^A-Za-z0-9._-]#-#g'
+migrate_legacy_state_layout() {
+    # Default mode migration only; explicit LOOPER_STATE_DIR is user-managed.
+    if [ -n "${LOOPER_STATE_DIR:-}" ]; then
+        return 0
+    fi
+
+    local legacy_root="$PROJECT_DIR/.looper"
+    local legacy_prd="$legacy_root/prd.json"
+    local legacy_progress_branch="$legacy_root/progress/$STATE_BRANCH_SLUG.txt"
+    local legacy_branch_slug_compat legacy_progress_branch_compat
+    local legacy_progress="$legacy_root/progress.txt"
+    local legacy_reviews_branch="$legacy_root/reviews/$STATE_BRANCH_SLUG"
+    local legacy_reviews_branch_compat
+    local state_file
+
+    legacy_branch_slug_compat="$(printf "%s" "$CURRENT_GIT_BRANCH_RAW" | sed 's#[^A-Za-z0-9._-]#-#g')"
+    legacy_progress_branch_compat="$legacy_root/progress/$legacy_branch_slug_compat.txt"
+    legacy_reviews_branch_compat="$legacy_root/reviews/$legacy_branch_slug_compat"
+
+    if [ -f "$PRD_FILE" ]; then
+        return 0
+    fi
+    if [ ! -f "$legacy_prd" ]; then
+        return 0
+    fi
+
+    mkdir -p "$STATE_DIR"
+    echo -e "${YELLOW}Migrating legacy .looper state to $STATE_DIR${NC}"
+
+    cp "$legacy_prd" "$PRD_FILE"
+    for state_file in prd.md config.md prompt.local.md review-prompt.md; do
+        if [ -f "$legacy_root/$state_file" ] && [ ! -f "$STATE_DIR/$state_file" ]; then
+            cp "$legacy_root/$state_file" "$STATE_DIR/$state_file"
+        fi
+    done
+
+    if [ -f "$legacy_progress_branch" ] && [ ! -f "$PROGRESS_FILE" ]; then
+        cp "$legacy_progress_branch" "$PROGRESS_FILE"
+    elif [ -f "$legacy_progress_branch_compat" ] && [ ! -f "$PROGRESS_FILE" ]; then
+        cp "$legacy_progress_branch_compat" "$PROGRESS_FILE"
+    elif [ -f "$legacy_progress" ] && [ ! -f "$PROGRESS_FILE" ]; then
+        cp "$legacy_progress" "$PROGRESS_FILE"
+    fi
+
+    if [ -d "$legacy_reviews_branch" ] && [ ! -d "$REVIEWS_ROOT" ]; then
+        cp -R "$legacy_reviews_branch" "$REVIEWS_ROOT"
+    elif [ -d "$legacy_reviews_branch_compat" ] && [ ! -d "$REVIEWS_ROOT" ]; then
+        cp -R "$legacy_reviews_branch_compat" "$REVIEWS_ROOT"
+    fi
 }
 
 has_uncommitted_changes() {
@@ -87,9 +145,7 @@ has_uncommitted_changes() {
         if [ -n "$rel_state_dir" ]; then
             [ -n "$(git -C "$PROJECT_DIR" status --porcelain -- . \
                 ":(exclude)$rel_state_dir/reviews/**" \
-                ":(exclude)$rel_state_dir/progress/**" \
                 ":(exclude)$rel_state_dir/progress.txt" \
-                ":(exclude)$rel_state_dir/.last-branch" \
                 ":(exclude)$rel_state_dir/archive/**")" ]
             return
         fi
@@ -124,9 +180,7 @@ stage_and_commit_story() {
         # Runtime state artifacts should not be committed automatically.
         git -C "$PROJECT_DIR" reset -q -- \
             "$rel_state_dir/reviews" \
-            "$rel_state_dir/progress" \
             "$rel_state_dir/progress.txt" \
-            "$rel_state_dir/.last-branch" \
             "$rel_state_dir/archive" 2>/dev/null || true
     fi
 
@@ -138,7 +192,7 @@ stage_and_commit_story() {
     if [ -z "$story_title" ]; then
         story_title="Story"
     fi
-    git -C "$PROJECT_DIR" commit -m "[Looper] $story_id: $story_title"
+    git -C "$PROJECT_DIR" commit -m "$story_id: $story_title"
 }
 
 normalize_single_line() {
@@ -268,7 +322,7 @@ build_claude_input() {
     local phase="$1"
     local story_id="$2"
     local review_file="${3:-}"
-    local progress_display
+    local progress_display prd_display config_display
 
     cat "$PROMPT_FILE"
 
@@ -279,6 +333,20 @@ build_claude_input() {
     echo "- Active story id: $story_id"
     echo "- Commit changes: NO (Looper commits after Codex review approval)."
     echo "- Set \`passes\` to true: NO (Looper updates \`prd.json\` after Codex approval)."
+    prd_display="$PRD_FILE"
+    if [[ "$prd_display" == "$PROJECT_DIR/"* ]]; then
+        prd_display="${prd_display#$PROJECT_DIR/}"
+    fi
+    echo "- PRD file: $prd_display"
+    if [ -f "$CONFIG_FILE" ]; then
+        config_display="$CONFIG_FILE"
+        if [[ "$config_display" == "$PROJECT_DIR/"* ]]; then
+            config_display="${config_display#$PROJECT_DIR/}"
+        fi
+        echo "- Config file: $config_display"
+    else
+        echo "- Config file: (none)"
+    fi
     progress_display="$PROGRESS_FILE"
     if [[ "$progress_display" == "$PROJECT_DIR/"* ]]; then
         progress_display="${progress_display#$PROJECT_DIR/}"
@@ -319,10 +387,9 @@ run_codex_review_round() {
     local round="$3"
     local previous_review_file="${4:-}"
 
-    local branch_slug review_dir review_md_file review_json_tmp events_file
-    local progress_display codex_stdout_target
-    branch_slug="$(get_branch_slug)"
-    review_dir="$REVIEWS_ROOT/$branch_slug/$story_id"
+    local review_dir review_md_file review_json_tmp events_file
+    local progress_display prd_display codex_stdout_target
+    review_dir="$REVIEWS_ROOT/$story_id"
     review_md_file="$review_dir/round-$round.md"
     review_json_tmp="$(mktemp "${TMPDIR:-/tmp}/looper-review-round-${story_id}-${round}.XXXXXX.json")"
 
@@ -342,6 +409,11 @@ run_codex_review_round() {
         echo "- Active story ID: $story_id"
         echo "- Active story title: $story_title"
         echo "- Review round: $round"
+        prd_display="$PRD_FILE"
+        if [[ "$prd_display" == "$PROJECT_DIR/"* ]]; then
+            prd_display="${prd_display#$PROJECT_DIR/}"
+        fi
+        echo "- PRD file: $prd_display"
         progress_display="$PROGRESS_FILE"
         if [[ "$progress_display" == "$PROJECT_DIR/"* ]]; then
             progress_display="${progress_display#$PROJECT_DIR/}"
@@ -382,9 +454,11 @@ if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     exit 1
 fi
 
+migrate_legacy_state_layout
+
 if [ ! -d "$STATE_DIR" ]; then
     echo -e "${RED}Error: state directory not found: $STATE_DIR${NC}"
-    echo "Create $PROJECT_DIR/.looper/prd.json first (use /looper skill to convert a PRD)."
+    echo "Create $STATE_DIR/prd.json first (use /looper skill to convert a PRD)."
     exit 1
 fi
 
@@ -421,15 +495,11 @@ if [ -f "$LOCAL_PROMPT_FILE" ]; then
     echo "Project prompt addendum: $LOCAL_PROMPT_FILE"
 fi
 
-CURRENT_BRANCH="$(jq -r '.branchName // "unknown-branch"' "$PRD_FILE")"
-BRANCH_SLUG="$(get_branch_slug)"
-PROGRESS_FILE="$PROGRESS_DIR/$BRANCH_SLUG.txt"
-mkdir -p "$PROGRESS_DIR"
-
-# One-time migration for older state dirs that used .looper/progress.txt.
-if [ -f "$LEGACY_PROGRESS_FILE" ] && [ ! -f "$PROGRESS_FILE" ]; then
-    cp "$LEGACY_PROGRESS_FILE" "$PROGRESS_FILE"
+CURRENT_BRANCH="$(jq -r '.branchName // empty' "$PRD_FILE")"
+if [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" = "null" ]; then
+    CURRENT_BRANCH="$CURRENT_GIT_BRANCH_RAW"
 fi
+mkdir -p "$STATE_DIR"
 
 echo "Branch: $CURRENT_BRANCH"
 echo "Progress file: $PROGRESS_FILE"
@@ -529,5 +599,5 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
 done
 
 echo -e "${RED}Max iterations ($MAX_ITERATIONS) reached without completion.${NC}"
-echo "Check .looper/progress/<branch-slug>.txt and .looper/prd.json for status."
+echo "Check $PROGRESS_FILE and $PRD_FILE for status."
 exit 1

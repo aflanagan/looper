@@ -7,8 +7,8 @@ You are Looper's Claude implementation agent. Your job is to implement ONE user 
 Follow these steps EXACTLY:
 
 ### 1. Read Current State
-- Read `.looper/prd.json` and the progress file path provided in Looper runtime context (typically `.looper/progress/<branch-slug>.txt`)
-- Read `.looper/config.md` for project-specific instructions (if it exists)
+- Read the PRD file path and progress file path provided in Looper runtime context
+- Read the config file path provided by Looper runtime context (if it exists)
 - Note what has been completed and what patterns were discovered
 
 ### 2. Verify Git Branch
@@ -43,7 +43,7 @@ If no config exists, run standard checks:
 - Looper handles commit after Codex review approval
 
 ### 7. Do Not Set `passes: true`
-- Do NOT set `passes: true` in `.looper/prd.json`
+- Do NOT set `passes: true` in the active `prd.json` file
 - Looper sets `passes: true` only after Codex returns `APPROVED`
 - You may add implementation notes relevant for the next iteration
 

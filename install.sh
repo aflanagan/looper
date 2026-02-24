@@ -67,6 +67,6 @@ if ! echo "$PATH" | tr ':' '\n' | grep -q "$HOME/bin"; then
 fi
 
 echo "Usage:"
-echo "  1. In any project, create .looper/prd.json (use /looper skill)"
-echo "  2. Optionally create .looper/config.md for project-specific config"
+echo "  1. In any project, create .looper/<branch-name>/prd.json (use /looper skill)"
+echo "  2. Optionally create .looper/<branch-name>/config.md for project-specific config"
 echo "  3. Run: looper [max_iterations]"

@@ -19,9 +19,20 @@ Check the input PRD for:
 
 If issues are found, suggest fixes before converting.
 
-### Step 2: Convert to JSON format
+### Step 2: Determine branch-scoped state directory
 
-Create `.looper/prd.json` with this structure:
+Set `<branch-name>` from the current git branch:
+- Start with `git rev-parse --abbrev-ref HEAD`
+- If it starts with `codex/` or `looper/`, drop that prefix
+- Replace non `[A-Za-z0-9._-]` characters with `-`
+- If empty, use `unknown-branch`
+
+State directory path:
+- `.looper/<branch-name>/`
+
+### Step 3: Convert to JSON format
+
+Create `.looper/<branch-name>/prd.json` with this structure:
 
 ```json
 {
@@ -47,7 +58,7 @@ Create `.looper/prd.json` with this structure:
 }
 ```
 
-### Step 3: Set priorities
+### Step 4: Set priorities
 Assign priority numbers based on dependency order:
 - Priority 1: Foundation work (schema, models, core functions)
 - Priority 2: Business logic (services, utilities)
@@ -57,13 +68,13 @@ Assign priority numbers based on dependency order:
 
 Lower priority number = do first.
 
-### Step 4: Archive previous PRD (if exists)
+### Step 5: Archive previous PRD (if exists)
 If there is an existing PRD with a different `branchName`:
 - the looper script handles archiving automatically
 - overwrite the file
 
-### Step 5: Save the file
-Write to `.looper/prd.json`.
+### Step 6: Save the file
+Write to `.looper/<branch-name>/prd.json`.
 
 ## JSON field requirements
 
@@ -111,4 +122,4 @@ Must be verifiable. Good vs bad examples:
 4. **Include quality checks**: add "Tests pass" or "Type checks pass" where applicable
 
 ## Output
-Save the JSON to `.looper/prd.json` and confirm to the user.
+Save the JSON to `.looper/<branch-name>/prd.json` and confirm to the user.
