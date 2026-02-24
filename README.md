@@ -1,6 +1,6 @@
 # Looper
 
-An autonomous coding-agent loop for Claude Code and Codex. Looper implements one story at a time, runs Codex review convergence, and commits only after review approval.
+A long running loop harness for Claude Code and Codex. Looper takes a PRD, breaks it down to stories, and then runs a [Ralph Loop](https://ghuntley.com/loop/) to implement one story at a time with Claude Code. Codex then reviews the code and requests changes. Claude will either rebut the requests or implement them. This process continues until both agree on the implementation.
 
 ## How It Works
 
@@ -109,5 +109,8 @@ Environment variables:
 | `templates/looper-prompt.md` | Base Claude implementation prompt |
 | `templates/review-prompt.md` | Base review prompt |
 | `templates/codex-review-schema.json` | Structured output schema for Codex review |
+
+## Based On
+Ryan Carson's Ralph Loop - https://github.com/snarktank/ralph
 | `skills/looper/SKILL.md` | PRD-to-JSON conversion skill |
 | `skills/prd/SKILL.md` | PRD generation skill |
