@@ -97,7 +97,7 @@ looper 20   # custom iteration limit
 
 Environment variables:
 - `LOOPER_STATE_DIR`: override `.looper` path
-- `LOOPER_REVIEW_MAX_ROUNDS`: default `3`
+- `LOOPER_REVIEW_MAX_ROUNDS`: default `5`
 - `LOOPER_REVIEW_PROMPT_FILE`: override review prompt path
 - `LOOPER_REVIEW_SCHEMA_FILE`: override review schema path
 

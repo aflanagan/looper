@@ -14,7 +14,7 @@
 #   - .looper/prompt.local.md for project-specific prompt addendum
 #   - .looper/review-prompt.md to override the default review prompt template
 #   - LOOPER_STATE_DIR to override .looper location
-#   - LOOPER_REVIEW_MAX_ROUNDS (default 3)
+#   - LOOPER_REVIEW_MAX_ROUNDS (default 5)
 #   - LOOPER_REVIEW_PROMPT_FILE / LOOPER_REVIEW_SCHEMA_FILE to override review artifacts
 
 set -euo pipefail
@@ -45,7 +45,7 @@ REVIEWS_ROOT="$STATE_DIR/reviews"
 PROMPT_FILE="$LOOPER_DIR/templates/looper-prompt.md"
 REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$STATE_DIR/review-prompt.md}"
 REVIEW_SCHEMA_FILE="${LOOPER_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-review-schema.json}"
-REVIEW_MAX_ROUNDS="${LOOPER_REVIEW_MAX_ROUNDS:-3}"
+REVIEW_MAX_ROUNDS="${LOOPER_REVIEW_MAX_ROUNDS:-5}"
 
 if [ ! -f "$REVIEW_PROMPT_FILE" ]; then
     REVIEW_PROMPT_FILE="$LOOPER_DIR/templates/review-prompt.md"
