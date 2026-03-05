@@ -4,7 +4,7 @@
   <img alt="Looper" src="banner-dark.svg" width="480">
 </picture>
 <br /><br />
-Automate multi-story implementation by pairing Claude Code (implementer) with Codex (reviewer) in a loop until both agree on the code. Based on the [Ralph Loop](https://ghuntley.com/loop/) pattern (implement → review → remediate).
+Automate multi-story implementation by pairing Claude Code (implementer) with Codex (reviewer) in a loop until both agree on the code.
 <br /><br />
 Give Looper a PRD, and it breaks it into dependency-ordered stories, then runs Claude Code against each one while Codex reviews. If Codex requests changes, Claude remediates. This continues until Codex approves or max review rounds are hit. Then it commits and moves to the next story.
 <br /><br />
