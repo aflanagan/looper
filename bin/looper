@@ -81,6 +81,8 @@ KEEP_LOGS="${LOOPER_KEEP_LOGS:-0}"
 RUN_STATE_FILE="$STATE_DIR/.active-run.json"
 RUN_DIR=""
 PHASE_HEARTBEAT_INTERVAL=10
+REVIEW_JSON_RESULT=""
+REVIEW_ARTIFACT_RESULT=""
 
 if [ ! -f "$REVIEW_PROMPT_FILE" ]; then
     REVIEW_PROMPT_FILE="$LOOPER_DIR/templates/review-prompt.md"
@@ -850,7 +852,8 @@ run_codex_review_round() {
         "$review_input_file" "$REVIEW_SCHEMA_FILE" "$review_json_tmp"
 
     render_review_markdown "$review_json_tmp" "$review_md_file" "$story_id" "$story_title" "$round"
-    printf "%s\t%s\n" "$review_json_tmp" "$review_md_file"
+    REVIEW_JSON_RESULT="$review_json_tmp"
+    REVIEW_ARTIFACT_RESULT="$review_md_file"
 }
 
 if [ "$MODE" = "help" ]; then
@@ -1007,8 +1010,11 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
     APPROVED_REVIEW_ARTIFACT=""
 
     for round in $(seq 1 "$REVIEW_MAX_ROUNDS"); do
-        REVIEW_RESULT="$(run_codex_review_round "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$round" "$PREVIOUS_REVIEW_FILE")"
-        IFS=$'\t' read -r REVIEW_JSON_FILE REVIEW_ARTIFACT_FILE <<< "$REVIEW_RESULT"
+        REVIEW_JSON_RESULT=""
+        REVIEW_ARTIFACT_RESULT=""
+        run_codex_review_round "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$round" "$PREVIOUS_REVIEW_FILE"
+        REVIEW_JSON_FILE="$REVIEW_JSON_RESULT"
+        REVIEW_ARTIFACT_FILE="$REVIEW_ARTIFACT_RESULT"
         VERDICT="$(jq -r '.verdict // empty' "$REVIEW_JSON_FILE")"
 
         if [ "$VERDICT" = "APPROVED" ]; then
