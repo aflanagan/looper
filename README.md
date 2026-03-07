@@ -111,19 +111,41 @@ This creates `.looper/<branch-name>/prd.json`. The `/looper` skill now chooses a
 }
 ```
 
-### 3. (Optional) Add a project prompt addendum
+### 3. (Optional) Add project prompt addenda
 
-Create `.looper/<branch-name>/prompt.local.md` with project-specific checks and context. For example:
+Looper always starts from its built-in implementation and review templates. You can extend them with up to three project-level addenda under `.looper/<branch-name>/`:
+
+- `prompt.shared.md` for instructions both agents should follow
+- `prompt.implementer.md` for implementation-only guidance
+- `prompt.reviewer.md` for review-only guidance
+
+Example:
 
 ```markdown
-## Project Checks
-- Always run `npm test` and `npm run lint` before marking a story complete
-- Ensure all new components have unit tests
+# prompt.shared.md
+## Required Checks
+- Always run `npm test` and `npm run lint` before finishing a story
 
 ## Project Context
 - This project uses React 18 with TypeScript
-- Styles use Tailwind CSS
+
+# prompt.implementer.md
+## Implementation Notes
+- New components must include unit tests
+
+# prompt.reviewer.md
+## Review Priorities
+- Be strict about state persistence regressions and missing tests
 ```
+
+Keep these files short. They should contain project-specific deltas, not copies of Looper's default prompts.
+
+Prompt assembly order is:
+1. base shared template: `templates/prompt.shared.md`
+2. base role template: `templates/prompt.implementer.md` or `templates/prompt.reviewer.md`
+3. project shared addendum: `.looper/<branch>/prompt.shared.md`
+4. project role addendum: `.looper/<branch>/prompt.implementer.md` or `.looper/<branch>/prompt.reviewer.md`
+5. runtime context appended by Looper
 
 ### Manual bootstrap (without `/prd` or `/looper`)
 
@@ -132,8 +154,10 @@ If you prefer to start manually:
 1. Create `.looper/<branch-name>/` (usually from your current git branch)
 2. Add your PRD markdown as `.looper/<branch-name>/prd.md`
 3. Add `.looper/<branch-name>/prd.json` in Looper story format
-4. Optionally add `.looper/<branch-name>/prompt.local.md`
-5. Run `looper`
+4. Optionally add `.looper/<branch-name>/prompt.shared.md`
+5. Optionally add `.looper/<branch-name>/prompt.implementer.md`
+6. Optionally add `.looper/<branch-name>/prompt.reviewer.md`
+7. Run `looper`
 
 `prd.md` is optional for Looper runtime, but recommended as source context you can keep alongside `prd.json`.
 
@@ -144,6 +168,14 @@ looper      # default: 10 iterations
 looper 20   # custom iteration limit
 ```
 
+To follow an active run in another terminal:
+
+```bash
+looper watch             # compact transcript
+looper watch --verbose   # transcript plus tool details
+looper watch --raw       # raw underlying log stream
+```
+
 ## Project Structure
 
 ```
@@ -151,8 +183,9 @@ looper 20   # custom iteration limit
   └── <branch-name>/
       ├── prd.md               # Optional: source PRD markdown
       ├── prd.json             # Required: stories and task state
-      ├── prompt.local.md      # Optional: project-specific prompt addendum
-      ├── review-prompt.md     # Optional: override the default review prompt
+      ├── prompt.shared.md     # Optional: prompt guidance shared by both agents
+      ├── prompt.implementer.md # Optional: implementation-only addendum
+      ├── prompt.reviewer.md   # Optional: review-only addendum
       ├── progress.txt         # Auto-created: iteration log (excluded from auto-commits)
       └── stories/             # Auto-created: one current state file per story (excluded from auto-commits)
           └── <story-id>.md
@@ -160,9 +193,11 @@ looper 20   # custom iteration limit
 
 `<branch-name>` defaults to the current git branch slug (with `codex/` and `looper/` prefixes stripped). Set `LOOPER_STATE_DIR` to override the full state path.
 
-Looper only commits after the review agent returns `APPROVED`. On approval, it appends a review-closure summary to the progress log, updates the story state file, and writes a short outcome note to the story's entry in `prd.json`.
+Older `prompt.local.md` and `review-prompt.md` files are no longer read. Move any reusable content into the new addenda files.
 
-Active run metadata and watch logs are kept under your temp directory, not under `.looper/`.
+Looper only commits after the review agent returns `APPROVED`. On approval, it appends a review-closure summary to the progress log, updates the active story file under `stories/`, and writes a short outcome note to the story's entry in `prd.json`.
+
+Active run metadata and watch logs are kept under your temp directory, not under `.looper/`. `looper watch` defaults to a compact transcript and supports `--verbose` and `--raw` (`--full-logs` alias) when you want more detail.
 
 ## Configuration
 
@@ -173,7 +208,8 @@ Active run metadata and watch logs are kept under your temp directory, not under
 | `LOOPER_REVIEW_AGENT` | `codex` | Agent for review (`claude` or `codex`) |
 | `LOOPER_REVIEW_MAX_ROUNDS` | `5` | Max review/remediation cycles per story before Looper exits non-zero |
 | `LOOPER_KEEP_LOGS` | `0` | Preserve temp run logs on failure when set to `1` |
-| `LOOPER_REVIEW_PROMPT_FILE` | `templates/review-prompt.md` | Override review prompt path |
+| `LOOPER_IMPLEMENTATION_PROMPT_FILE` | `templates/prompt.implementer.md` | Override the base implementation prompt template |
+| `LOOPER_REVIEW_PROMPT_FILE` | `templates/prompt.reviewer.md` | Override the base review prompt template |
 | `LOOPER_REVIEW_SCHEMA_FILE` | `templates/codex-review-schema.json` | Override review schema path |
 
 ## Files
@@ -181,8 +217,9 @@ Active run metadata and watch logs are kept under your temp directory, not under
 | File | Purpose |
 |------|---------|
 | `bin/looper` | Main CLI orchestrator |
-| `templates/looper-prompt.md` | Base implementation prompt |
-| `templates/review-prompt.md` | Base review prompt |
+| `templates/prompt.shared.md` | Base shared prompt context for both agents |
+| `templates/prompt.implementer.md` | Base implementation prompt |
+| `templates/prompt.reviewer.md` | Base review prompt |
 | `templates/codex-review-schema.json` | Structured output schema for Codex review |
 | `skills/looper/SKILL.md` | `/looper` slash command (PRD-to-JSON conversion) |
 | `skills/prd/SKILL.md` | `/prd` slash command (PRD generation) |

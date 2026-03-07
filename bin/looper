@@ -4,7 +4,7 @@
 #
 # Usage:
 #   looper [max_iterations]
-#   looper watch
+#   looper watch [--verbose|--raw|--full-logs]
 #
 # Default max iterations: 10
 #
@@ -13,14 +13,16 @@
 #   - claude and/or codex, plus jq and git
 #
 # Optional:
-#   - .looper/<branch-name>/prompt.local.md for project-specific prompt addendum
-#   - .looper/<branch-name>/review-prompt.md to override the default review prompt template
+#   - .looper/<branch-name>/prompt.shared.md for prompt guidance shared by both agents
+#   - .looper/<branch-name>/prompt.implementer.md for implementation-only prompt guidance
+#   - .looper/<branch-name>/prompt.reviewer.md for review-only prompt guidance
 #   - LOOPER_STATE_DIR to override the full state dir path
 #   - LOOPER_IMPLEMENTATION_AGENT (default claude)
 #   - LOOPER_REVIEW_AGENT (default codex)
 #   - LOOPER_REVIEW_MAX_ROUNDS (default 5)
 #   - LOOPER_KEEP_LOGS (default 0; set to 1 to keep temp run logs on failure)
-#   - LOOPER_REVIEW_PROMPT_FILE / LOOPER_REVIEW_SCHEMA_FILE to override review prompt/schema
+#   - LOOPER_IMPLEMENTATION_PROMPT_FILE / LOOPER_REVIEW_PROMPT_FILE to override base prompt templates
+#   - LOOPER_REVIEW_SCHEMA_FILE to override review schema
 
 set -euo pipefail
 
@@ -30,9 +32,31 @@ LOOPER_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 
 MODE="run"
 MAX_ITERATIONS=10
+WATCH_OUTPUT_MODE="compact"
+CLI_ERROR=""
+SHOW_USAGE_ON_ERROR=0
 if [ "${1:-}" = "watch" ]; then
     MODE="watch"
     shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --verbose|-v)
+                WATCH_OUTPUT_MODE="verbose"
+                ;;
+            --raw|--full-logs)
+                WATCH_OUTPUT_MODE="raw"
+                ;;
+            --help|-h)
+                MODE="help"
+                ;;
+            *)
+                CLI_ERROR="unknown watch option: $1"
+                SHOW_USAGE_ON_ERROR=1
+                break
+                ;;
+        esac
+        shift
+    done
 elif [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     MODE="help"
     shift
@@ -68,14 +92,19 @@ else
     STATE_DIR="$PROJECT_DIR/.looper/$STATE_BRANCH_SLUG"
 fi
 
-LOCAL_PROMPT_FILE="$STATE_DIR/prompt.local.md"
+PROMPT_SHARED_FILE="$STATE_DIR/prompt.shared.md"
+PROMPT_IMPLEMENTER_FILE="$STATE_DIR/prompt.implementer.md"
+PROMPT_REVIEWER_FILE="$STATE_DIR/prompt.reviewer.md"
+LEGACY_LOCAL_PROMPT_FILE="$STATE_DIR/prompt.local.md"
+LEGACY_REVIEW_PROMPT_FILE="$STATE_DIR/review-prompt.md"
 PRD_MARKDOWN_FILE="$STATE_DIR/prd.md"
 PRD_FILE="$STATE_DIR/prd.json"
 PROGRESS_FILE="$STATE_DIR/progress.txt"
 STORIES_ROOT="$STATE_DIR/stories"
 LEGACY_REVIEWS_ROOT="$STATE_DIR/reviews"
-PROMPT_FILE="$LOOPER_DIR/templates/looper-prompt.md"
-REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$STATE_DIR/review-prompt.md}"
+SHARED_PROMPT_FILE="$LOOPER_DIR/templates/prompt.shared.md"
+IMPLEMENTATION_PROMPT_FILE="${LOOPER_IMPLEMENTATION_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.implementer.md}"
+REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.reviewer.md}"
 REVIEW_SCHEMA_FILE="${LOOPER_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-review-schema.json}"
 IMPLEMENTATION_AGENT="${LOOPER_IMPLEMENTATION_AGENT:-claude}"
 REVIEW_AGENT="${LOOPER_REVIEW_AGENT:-codex}"
@@ -91,10 +120,6 @@ REVIEW_JSON_RESULT=""
 ACTIVE_STORY_FILE=""
 ACTIVE_HANDOFF_TOKEN=""
 
-if [ ! -f "$REVIEW_PROMPT_FILE" ]; then
-    REVIEW_PROMPT_FILE="$LOOPER_DIR/templates/review-prompt.md"
-fi
-
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -105,7 +130,12 @@ print_usage() {
     cat <<EOF
 Usage:
   looper [max_iterations]
-  looper watch
+  looper watch [--verbose|--raw|--full-logs]
+
+Watch output:
+  default                Compact transcript
+  --verbose, -v          Include tool details and summarized tool output
+  --raw, --full-logs     Tail the underlying log stream verbatim
 
 Environment:
   LOOPER_STATE_DIR            Override the full state dir path
@@ -113,6 +143,9 @@ Environment:
   LOOPER_REVIEW_AGENT         Agent for review (claude|codex; default: codex)
   LOOPER_REVIEW_MAX_ROUNDS    Number of review rounds per story (default: 5)
   LOOPER_KEEP_LOGS            Keep temp run logs on failure (default: 0)
+  LOOPER_IMPLEMENTATION_PROMPT_FILE
+                             Override the base implementation prompt template
+  LOOPER_REVIEW_PROMPT_FILE  Override the base review prompt template
 EOF
 }
 
@@ -135,6 +168,14 @@ validate_agent_name() {
             ;;
     esac
 }
+
+if [ -n "$CLI_ERROR" ]; then
+    echo -e "${RED}Error: $CLI_ERROR${NC}"
+    if [ "$SHOW_USAGE_ON_ERROR" -eq 1 ]; then
+        print_usage
+    fi
+    exit 1
+fi
 
 agent_display_name() {
     local agent="$1"
@@ -255,6 +296,82 @@ append_story_history_entry() {
         new_history="${existing_history}"$'\n'"- ${entry}"
     else
         new_history="- ${entry}"
+    fi
+    replace_story_section "$story_file" "history" "$new_history"
+}
+
+trim_multiline_text() {
+    local text="$1"
+    printf "%s" "$text" | awk '
+        NR == 1 { first = 1 }
+        {
+            lines[NR] = $0
+            if ($0 ~ /[^[:space:]]/) {
+                if (!start) {
+                    start = NR
+                }
+                end = NR
+            }
+        }
+        END {
+            if (!start) {
+                exit
+            }
+            for (i = start; i <= end; i++) {
+                print lines[i]
+            }
+        }
+    '
+}
+
+extract_markdown_subsection() {
+    local content="$1"
+    local heading="$2"
+
+    printf "%s\n" "$content" | awk -v start="### $heading" '
+        $0 == start { in_section = 1; next }
+        in_section && /^### / { exit }
+        in_section { print }
+    '
+}
+
+append_history_detail_block() {
+    local block="$1"
+    local label="$2"
+    local content="$3"
+    local trimmed
+
+    trimmed="$(trim_multiline_text "$content")"
+    if [ -z "$trimmed" ]; then
+        return 0
+    fi
+
+    block+=$'\n'"  - ${label}:"
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        block+=$'\n'"    ${line}"
+    done <<< "$trimmed"
+
+    printf "%s" "$block"
+}
+
+append_story_history_block() {
+    local story_file="$1"
+    local title="$2"
+    local detail_block="${3:-}"
+    local existing_history new_history block
+
+    existing_history="$(extract_story_section "$story_file" "history")"
+    title="$(truncate_text "$(normalize_single_line "$title")" 500)"
+    block="- ${title}"
+    if [ -n "$detail_block" ]; then
+        block="${block}"$'\n'"${detail_block}"
+    fi
+
+    if [ -n "$existing_history" ]; then
+        new_history="${existing_history}"$'\n'"${block}"
+    else
+        new_history="$block"
     fi
     replace_story_section "$story_file" "history" "$new_history"
 }
@@ -529,7 +646,6 @@ EOF
 
     replace_story_section "$story_file" "current-status" "$status_block"
     replace_story_section "$story_file" "implementation-handoff" "$handoff_block"
-    append_story_history_entry "$story_file" "Started $phase for $story_id."
 }
 
 validate_story_handoff_section() {
@@ -549,13 +665,49 @@ validate_story_handoff_section() {
     fi
 }
 
+record_implementation_history() {
+    local story_id="$1"
+    local phase="$2"
+    local review_round="${3:-}"
+    local story_file="$4"
+    local handoff_content files_changed checks_run findings_addressed remaining_risks detail_block title
+
+    handoff_content="$(extract_story_section "$story_file" "implementation-handoff")"
+    files_changed="$(extract_markdown_subsection "$handoff_content" "Files changed")"
+    checks_run="$(extract_markdown_subsection "$handoff_content" "Checks run")"
+    findings_addressed="$(extract_markdown_subsection "$handoff_content" "Findings addressed")"
+    remaining_risks="$(extract_markdown_subsection "$handoff_content" "Remaining risks")"
+
+    if [ "$phase" = "remediation" ] && [ -n "$review_round" ]; then
+        title="Completed remediation for $story_id after review round $review_round."
+    else
+        title="Completed implementation for $story_id."
+    fi
+
+    detail_block=""
+    if [ -n "$findings_addressed" ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Findings addressed" "$findings_addressed")"
+    fi
+    if [ -n "$files_changed" ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Files changed" "$files_changed")"
+    fi
+    if [ -n "$checks_run" ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Checks run" "$checks_run")"
+    fi
+    if [ -n "$remaining_risks" ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Remaining risks" "$remaining_risks")"
+    fi
+
+    append_story_history_block "$story_file" "$title" "$detail_block"
+}
+
 update_story_review_state() {
     local story_id="$1"
     local story_title="$2"
     local review_json_file="$3"
     local round="$4"
     local reviewer_name="$5"
-    local verdict summary findings ac_coverage test_gaps review_block status_block
+    local verdict summary findings ac_coverage test_gaps review_block status_block detail_block ac_failures
     local story_file
 
     ensure_story_state_file "$story_id" "$story_title"
@@ -596,7 +748,19 @@ EOF
     replace_story_section "$story_file" "current-status" "$status_block"
     replace_story_section "$story_file" "open-findings" "$findings"
     replace_story_section "$story_file" "latest-review" "$review_block"
-    append_story_history_entry "$story_file" "${reviewer_name} review round $round returned $verdict."
+    detail_block=""
+    detail_block="$(append_history_detail_block "$detail_block" "Summary" "- $(truncate_text "$(normalize_single_line "$summary")" 320)")"
+    if [ -n "$findings" ] && [ "$findings" != "- None." ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Findings" "$findings")"
+    fi
+    ac_failures="$(jq -r 'if ([.acCoverage[]? | select(.status == "fail")] | length) == 0 then "" else ([.acCoverage[]? | select(.status == "fail") | "- " + .criterion] | join("\n")) end' "$review_json_file")"
+    if [ -n "$ac_failures" ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Acceptance criteria still failing" "$ac_failures")"
+    fi
+    if [ -n "$test_gaps" ] && [ "$test_gaps" != "- None." ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Test gaps" "$test_gaps")"
+    fi
+    append_story_history_block "$story_file" "${reviewer_name} review round $round returned $verdict." "$detail_block"
 }
 
 story_status_value() {
@@ -857,6 +1021,104 @@ tail_plain_log() {
     tail -n 40 -f "$log_file"
 }
 
+tail_raw_log() {
+    local log_file="$1"
+    tail -n 80 -f "$log_file"
+}
+
+tail_claude_compact_events() {
+    local log_file="$1"
+    tail -n 80 -f "$log_file" | jq --unbuffered -Rr --arg project_dir "$PROJECT_DIR" '
+        def collapse:
+          tostring
+          | gsub("\\s+"; " ")
+          | sub("^ "; "")
+          | sub(" $"; "");
+        def truncate($n):
+          if length <= $n then .
+          else .[0:($n - 3)] + "..."
+          end;
+        def short($n):
+          collapse | truncate($n);
+        def display_path($path):
+          if ($path | type) != "string" or $path == "" then ""
+          elif ($path | startswith($project_dir + "/")) then
+            $path[($project_dir | length + 1):]
+          else
+            $path
+          end;
+        def normalize_command($command):
+          ($command | tostring) as $raw
+          | if ($raw | test("^(/bin/)?(zsh|bash|sh) -lc ")) then
+              ($raw
+                | sub("^(/bin/)?(zsh|bash|sh) -lc "; "")
+                | sub("^\""; "")
+                | sub("\"$"; "")
+                | sub("^\u0027"; "")
+                | sub("\u0027$"; ""))
+            else
+              $raw
+            end
+          | gsub($project_dir; ".");
+        def command_line($command):
+          (normalize_command($command)) as $normalized
+          | if $normalized == "" then empty else empty end;
+        def todo_summary($todos):
+          ($todos // []) as $items
+          | if ($items | length) == 0 then
+              "updated"
+            else
+              (([$items[]? | select((.status // "") == "completed" or (.completed // false))] | length) | tostring)
+              + "/" + (($items | length) | tostring)
+              + " complete"
+            end;
+        def tool_line($name; $input):
+          if ($name == "Edit" or $name == "MultiEdit") and (($input.file_path // "") != "") then
+            "[edit] " + display_path(($input.file_path // ""))
+          elif $name == "Write" and (($input.file_path // "") != "") then
+            "[write] " + display_path(($input.file_path // ""))
+          elif $name == "Read" or $name == "LS" or $name == "Glob" or $name == "Grep" then
+            empty
+          elif $name == "Bash" then
+            command_line(($input.command // ""))
+          elif $name == "TodoWrite" then
+            "[todo] " + todo_summary(($input.todos // []))
+          else
+            "[tool] " + ($name // "unknown")
+          end;
+        def tool_result_line($result):
+          if (($result.stderr // "") | length) > 0 then
+            "[fail] " + (($result.stderr // "") | short(240))
+          elif (($result.stdout // "") | test("^The file .+ has been (updated|written|created) successfully\\.$")) then
+            (($result.stdout // "")
+              | capture("^The file (?<path>.+) has been (?<verb>updated|written|created) successfully\\.$")) as $match
+            | "[ok] "
+              + (if $match.verb == "written" then "wrote" else $match.verb end)
+              + " "
+              + display_path($match.path)
+          else
+            empty
+          end;
+        fromjson? as $event
+        | if $event == null then empty
+          elif ($event.type // "") == "assistant" then
+            ($event.message.content // [])
+            | .[]
+            | if (.type // "") == "tool_use" then
+                tool_line((.name // "unknown"); (.input // {}))
+              elif (.type // "") == "text" then
+                ((.text // "") | short(320))
+              else
+                empty
+              end
+          elif ($event.type // "") == "user" and ($event.tool_use_result // null) != null then
+            tool_result_line(($event.tool_use_result // {}))
+          else
+            empty
+          end
+    '
+}
+
 tail_claude_events() {
     local log_file="$1"
     tail -n 80 -f "$log_file" | jq --unbuffered -Rr '
@@ -912,6 +1174,91 @@ tail_claude_events() {
               ) as $content
               | if $content == "" then empty else "[tool-output] " + $content end
             end
+          else
+            empty
+          end
+    '
+}
+
+tail_codex_compact_events() {
+    local log_file="$1"
+    tail -n 80 -f "$log_file" | jq --unbuffered -Rr --arg project_dir "$PROJECT_DIR" '
+        def collapse:
+          tostring
+          | gsub("\\s+"; " ")
+          | sub("^ "; "")
+          | sub(" $"; "");
+        def truncate($n):
+          if length <= $n then .
+          else .[0:($n - 3)] + "..."
+          end;
+        def short($n):
+          collapse | truncate($n);
+        def display_path($path):
+          if ($path | type) != "string" or $path == "" then ""
+          elif ($path | startswith($project_dir + "/")) then
+            $path[($project_dir | length + 1):]
+          else
+            $path
+          end;
+        def normalize_command($command):
+          ($command | tostring) as $raw
+          | if ($raw | test("^(/bin/)?(zsh|bash|sh) -lc ")) then
+              ($raw
+                | sub("^(/bin/)?(zsh|bash|sh) -lc "; "")
+                | sub("^\""; "")
+                | sub("\"$"; "")
+                | sub("^\u0027"; "")
+                | sub("\u0027$"; ""))
+            else
+              $raw
+            end
+          | gsub($project_dir; ".");
+        def command_line($command):
+          (normalize_command($command)) as $normalized
+          | if $normalized == "" then empty else empty end;
+        def event_message_line($message):
+          ($message | tostring) as $raw
+          | if ($raw | startswith("[run] ")) then
+              command_line(($raw | sub("^\\[run\\] "; "")))
+            else
+              ($raw | short(320))
+            end;
+        def file_change_line($change):
+          "[ok] "
+          + (if ($change.kind // "") == "create" then
+               "created"
+             elif ($change.kind // "") == "delete" then
+               "deleted"
+             elif ($change.kind // "") == "move" then
+               "moved"
+             else
+               "updated"
+             end)
+          + " "
+          + display_path(($change.path // ""));
+        fromjson? as $event
+        | if $event == null then empty
+          elif ($event.type // "") == "event_msg" then
+            event_message_line(($event.payload.message // ""))
+          elif ($event.type // "") == "response_item" and ($event.payload.type // "") == "message" then
+            (($event.payload.content // [])
+              | map(select(.type == "output_text") | .text)
+              | join("")
+              | short(320))
+          elif ($event.type // "") == "item.started" and ($event.item.type // "") == "command_execution" then
+            command_line(($event.item.command // ""))
+          elif ($event.type // "") == "item.completed" and ($event.item.type // "") == "command_execution" then
+            if ($event.item.exit_code // 0) != 0 then
+              "[fail] exit " + (($event.item.exit_code // 0) | tostring) + " :: " + (normalize_command(($event.item.command // "")) | short(220))
+            else
+              empty
+            end
+          elif ($event.type // "") == "item.completed" and ($event.item.type // "") == "file_change" then
+            ($event.item.changes // [] | .[] | file_change_line(.))
+          elif ($event.type // "") == "item.updated" and ($event.item.type // "") == "todo_list" then
+            ($event.item.items // []) as $items
+            | "[todo] " + (([$items[]? | select(.completed == true)] | length | tostring)) + "/" + (($items | length) | tostring) + " complete"
           else
             empty
           end
@@ -1002,10 +1349,16 @@ watch_active_run() {
             current_format="$log_format"
             echo ""
             echo "== $phase_banner =="
-            if [ "$current_format" = "codex-jsonl" ]; then
+            if [ "$WATCH_OUTPUT_MODE" = "raw" ]; then
+                tail_raw_log "$current_log" &
+            elif [ "$current_format" = "codex-jsonl" ] && [ "$WATCH_OUTPUT_MODE" = "verbose" ]; then
                 tail_codex_events "$current_log" &
-            elif [ "$current_format" = "claude-jsonl" ]; then
+            elif [ "$current_format" = "codex-jsonl" ]; then
+                tail_codex_compact_events "$current_log" &
+            elif [ "$current_format" = "claude-jsonl" ] && [ "$WATCH_OUTPUT_MODE" = "verbose" ]; then
                 tail_claude_events "$current_log" &
+            elif [ "$current_format" = "claude-jsonl" ]; then
+                tail_claude_compact_events "$current_log" &
             else
                 tail_plain_log "$current_log" &
             fi
@@ -1065,7 +1418,7 @@ migrate_legacy_state_layout() {
     echo -e "${YELLOW}Migrating legacy .looper state to $STATE_DIR${NC}"
 
     cp "$legacy_prd" "$PRD_FILE"
-    for state_file in prd.md prompt.local.md review-prompt.md; do
+    for state_file in prd.md; do
         if [ -f "$legacy_root/$state_file" ] && [ ! -f "$STATE_DIR/$state_file" ]; then
             cp "$legacy_root/$state_file" "$STATE_DIR/$state_file"
         fi
@@ -1226,26 +1579,56 @@ record_approval_summary() {
 build_phase_input() {
     local phase="$1"
     local story_id="$2"
-    local story_file="$3"
-    local review_round="${4:-}"
-    local progress_display prd_display story_display
+    local story_title="$3"
+    local story_file="$4"
+    local review_round="${5:-}"
+    local progress_display prd_display story_display phase_heading
 
-    cat "$PROMPT_FILE"
+    if [ "$phase" = "remediation" ] && [ -n "$review_round" ]; then
+        phase_heading="# $story_id - $story_title (Remediation after round $review_round)"
+    else
+        phase_heading="# $story_id - $story_title (Implementation)"
+    fi
+
+    echo "$phase_heading"
+    echo ""
+    cat "$SHARED_PROMPT_FILE"
+    echo ""
+    cat "$IMPLEMENTATION_PROMPT_FILE"
+
+    if [ -f "$PROMPT_SHARED_FILE" ]; then
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Project Shared Addendum ($(display_path "$PROMPT_SHARED_FILE"))"
+        echo ""
+        cat "$PROMPT_SHARED_FILE"
+    fi
+
+    if [ -f "$PROMPT_IMPLEMENTER_FILE" ]; then
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Project Implementer Addendum ($(display_path "$PROMPT_IMPLEMENTER_FILE"))"
+        echo ""
+        cat "$PROMPT_IMPLEMENTER_FILE"
+    fi
 
     echo ""
     echo "---"
     echo ""
-    echo "## Looper Runtime Context"
+    echo "## Runtime Context"
     echo "- Active story id: $story_id"
     echo "- Commit changes: NO (Looper commits after review approval)."
     echo "- Set \`passes\` to true: NO (Looper updates \`prd.json\` after review approval)."
+    echo "- State directory: $(display_path "$STATE_DIR")"
     prd_display="$PRD_FILE"
     if [[ "$prd_display" == "$PROJECT_DIR/"* ]]; then
         prd_display="${prd_display#$PROJECT_DIR/}"
     fi
     echo "- PRD file: $prd_display"
     story_display="$(display_path "$story_file")"
-    echo "- Story state file: $story_display"
+    echo "- Story file: $story_display"
     progress_display="$PROGRESS_FILE"
     if [[ "$progress_display" == "$PROJECT_DIR/"* ]]; then
         progress_display="${progress_display#$PROJECT_DIR/}"
@@ -1255,20 +1638,10 @@ build_phase_input() {
     if [ "$phase" = "remediation" ]; then
         echo "- Phase: remediation"
         echo "- Review round to address: $review_round"
-        echo "- Apply the open findings recorded in the story state file, rerun quality checks, and update both the handoff section and progress notes."
+        echo "- Apply the open findings recorded in the Story File, rerun quality checks, and update both the handoff section and progress notes."
     else
         echo "- Phase: implementation"
         echo "- Review round to address: initial implementation"
-    fi
-
-    if [ -f "$LOCAL_PROMPT_FILE" ]; then
-        echo ""
-        echo "---"
-        echo ""
-        echo "## Project Local Addendum ($LOCAL_PROMPT_FILE)"
-        echo "Apply the following additional project-specific instructions in addition to the base Looper template:"
-        echo ""
-        cat "$LOCAL_PROMPT_FILE"
     fi
 }
 
@@ -1279,12 +1652,36 @@ build_review_input() {
     local story_file="$4"
     local progress_display prd_display story_display
 
+    echo "# $story_id - $story_title (Review round $round)"
+    echo ""
+    cat "$SHARED_PROMPT_FILE"
+    echo ""
     cat "$REVIEW_PROMPT_FILE"
+
+    if [ -f "$PROMPT_SHARED_FILE" ]; then
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Project Shared Addendum ($(display_path "$PROMPT_SHARED_FILE"))"
+        echo ""
+        cat "$PROMPT_SHARED_FILE"
+    fi
+
+    if [ -f "$PROMPT_REVIEWER_FILE" ]; then
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Project Reviewer Addendum ($(display_path "$PROMPT_REVIEWER_FILE"))"
+        echo ""
+        cat "$PROMPT_REVIEWER_FILE"
+    fi
+
     echo ""
     echo "## Runtime Context"
     echo "- Active story ID: $story_id"
     echo "- Active story title: $story_title"
     echo "- Review round: $round"
+    echo "- State directory: $(display_path "$STATE_DIR")"
     prd_display="$PRD_FILE"
     if [[ "$prd_display" == "$PROJECT_DIR/"* ]]; then
         prd_display="${prd_display#$PROJECT_DIR/}"
@@ -1296,14 +1693,15 @@ build_review_input() {
     fi
     echo "- Progress log file: $progress_display"
     story_display="$(display_path "$story_file")"
-    echo "- Story state file: $story_display"
+    echo "- Story file: $story_display"
 }
 
 run_claude_phase() {
     local phase="$1"
     local story_id="$2"
-    local story_file="$3"
-    local review_round="${4:-}"
+    local story_title="$3"
+    local story_file="$4"
+    local review_round="${5:-}"
     local prompt_input_file log_file phase_label
 
     echo "Running Claude phase '$phase' for $story_id..."
@@ -1317,7 +1715,7 @@ run_claude_phase() {
     fi
 
     prompt_input_file="$RUN_DIR/iter-${i}-claude-${phase}.prompt.txt"
-    build_phase_input "$phase" "$story_id" "$story_file" "$review_round" > "$prompt_input_file"
+    build_phase_input "$phase" "$story_id" "$story_title" "$story_file" "$review_round" > "$prompt_input_file"
 
     run_with_log "$story_id" "$ACTIVE_STORY_TITLE" \
         "claude" "$phase_label" "$log_file" "claude-jsonl" \
@@ -1327,8 +1725,9 @@ run_claude_phase() {
 run_codex_phase() {
     local phase="$1"
     local story_id="$2"
-    local story_file="$3"
-    local review_round="${4:-}"
+    local story_title="$3"
+    local story_file="$4"
+    local review_round="${5:-}"
     local prompt_input_file log_file phase_label
 
     echo "Running Codex phase '$phase' for $story_id..."
@@ -1342,7 +1741,7 @@ run_codex_phase() {
     fi
 
     prompt_input_file="$RUN_DIR/iter-${i}-codex-${phase}.prompt.txt"
-    build_phase_input "$phase" "$story_id" "$story_file" "$review_round" > "$prompt_input_file"
+    build_phase_input "$phase" "$story_id" "$story_title" "$story_file" "$review_round" > "$prompt_input_file"
 
     run_with_log "$story_id" "$ACTIVE_STORY_TITLE" \
         "codex" "$phase_label" "$log_file" "plain" \
@@ -1404,11 +1803,12 @@ run_implementation_phase() {
     prepare_story_handoff_section "$story_id" "$story_title" "$phase" "$review_round"
 
     case "$IMPLEMENTATION_AGENT" in
-        claude) run_claude_phase "$phase" "$story_id" "$ACTIVE_STORY_FILE" "$review_round" ;;
-        codex) run_codex_phase "$phase" "$story_id" "$ACTIVE_STORY_FILE" "$review_round" ;;
+        claude) run_claude_phase "$phase" "$story_id" "$story_title" "$ACTIVE_STORY_FILE" "$review_round" ;;
+        codex) run_codex_phase "$phase" "$story_id" "$story_title" "$ACTIVE_STORY_FILE" "$review_round" ;;
     esac
 
     validate_story_handoff_section "$story_id" "$ACTIVE_STORY_FILE"
+    record_implementation_history "$story_id" "$phase" "$review_round" "$ACTIVE_STORY_FILE"
 }
 
 run_review_round() {
@@ -1432,7 +1832,7 @@ echo -e "${GREEN}Looper starting...${NC}"
 echo "Project: $PROJECT_DIR"
 echo "State dir: $STATE_DIR"
 if [ "$MODE" = "watch" ]; then
-    echo "Mode: watch"
+    echo "Mode: watch ($WATCH_OUTPUT_MODE)"
 else
     echo "Max iterations: $MAX_ITERATIONS"
     echo "Implementation agent: $(agent_display_name "$IMPLEMENTATION_AGENT")"
@@ -1489,8 +1889,14 @@ if [ ! -f "$PRD_FILE" ]; then
     exit 1
 fi
 
-if [ ! -f "$PROMPT_FILE" ]; then
-    echo -e "${RED}Error: Prompt template not found at $PROMPT_FILE${NC}"
+if [ ! -f "$IMPLEMENTATION_PROMPT_FILE" ]; then
+    echo -e "${RED}Error: implementation prompt template not found at $IMPLEMENTATION_PROMPT_FILE${NC}"
+    echo "Looper installation may be broken. Re-run install.sh"
+    exit 1
+fi
+
+if [ ! -f "$SHARED_PROMPT_FILE" ]; then
+    echo -e "${RED}Error: shared prompt template not found at $SHARED_PROMPT_FILE${NC}"
     echo "Looper installation may be broken. Re-run install.sh"
     exit 1
 fi
@@ -1505,8 +1911,20 @@ if [ ! -f "$REVIEW_SCHEMA_FILE" ]; then
     exit 1
 fi
 
-if [ -f "$LOCAL_PROMPT_FILE" ]; then
-    echo "Project prompt addendum: $LOCAL_PROMPT_FILE"
+if [ -f "$PROMPT_SHARED_FILE" ]; then
+    echo "Shared prompt addendum: $PROMPT_SHARED_FILE"
+fi
+if [ -f "$PROMPT_IMPLEMENTER_FILE" ]; then
+    echo "Implementer prompt addendum: $PROMPT_IMPLEMENTER_FILE"
+fi
+if [ -f "$PROMPT_REVIEWER_FILE" ]; then
+    echo "Reviewer prompt addendum: $PROMPT_REVIEWER_FILE"
+fi
+if [ -f "$LEGACY_LOCAL_PROMPT_FILE" ]; then
+    echo -e "${YELLOW}Ignoring deprecated prompt file: $LEGACY_LOCAL_PROMPT_FILE (use prompt.shared.md or prompt.implementer.md).${NC}"
+fi
+if [ -f "$LEGACY_REVIEW_PROMPT_FILE" ]; then
+    echo -e "${YELLOW}Ignoring deprecated prompt file: $LEGACY_REVIEW_PROMPT_FILE (use prompt.reviewer.md).${NC}"
 fi
 
 CURRENT_BRANCH="$(jq -r '.branchName // empty' "$PRD_FILE")"

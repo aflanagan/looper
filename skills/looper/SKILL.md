@@ -87,6 +87,21 @@ If there is an existing PRD with a different `branchName`:
 ### Step 6: Save the file
 Write to `.looper/<branch-name>/prd.json`.
 
+### Step 7: Scaffold prompt addenda
+If these files do not already exist, create them alongside `prd.json`:
+- `.looper/<branch-name>/prompt.shared.md`
+- `.looper/<branch-name>/prompt.implementer.md`
+- `.looper/<branch-name>/prompt.reviewer.md`
+
+Keep them short and project-specific:
+- `prompt.shared.md`: checks, architecture invariants, important directories
+- `prompt.implementer.md`: implementation workflow, code-change constraints, testing expectations
+- `prompt.reviewer.md`: review priorities, risky areas, standards to verify
+
+Do not copy Looper's default prompts into these files. Only add the project-specific deltas.
+
+If any of these files already exist, do not overwrite them unless the user explicitly asks.
+
 ## JSON field requirements
 
 ### `branchName`
@@ -135,4 +150,7 @@ Must be verifiable. Good vs bad examples:
 5. **No generic story ids**: do not emit `US-001` or `US-QRY-001`; use a semantic 2-3 letter prefix instead
 
 ## Output
-Save the JSON to `.looper/<branch-name>/prd.json` and confirm to the user.
+Save the JSON to `.looper/<branch-name>/prd.json`, scaffold the prompt addenda files if needed, and confirm to the user:
+- which story prefix was chosen
+- where `prd.json` was written
+- which prompt addenda files were created or left unchanged

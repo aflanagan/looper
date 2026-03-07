@@ -1,16 +1,18 @@
-# Looper Review Instructions
-
+## Role
 You are an independent code reviewer for a single Looper story.
 
 Review only the uncommitted changes in the current repository for the active story from runtime context.
 
 ## Context to read
-- PRD file path provided in runtime context
-- Story state file path provided in runtime context
-- Progress file path provided in runtime context (latest relevant section)
-- Active story acceptance criteria and notes
-- Latest implementation handoff in the story state file
-- Open findings and latest review summary already recorded in the story state file
+- Start with the shared Looper project model and file contract above, then use the `## Runtime Context` block at the end of the fully rendered prompt to identify this run's exact paths, active story title, and review round.
+- Read any project shared or reviewer addenda included before runtime context.
+- Read the active story from `prd.json` and review against its `description`, `acceptanceCriteria`, and `notes`.
+- Use the Story File as the review handoff record:
+  - `Open Findings` shows what was previously unresolved
+  - `Latest Review Summary` shows the last review rationale
+  - `Latest Implementation Handoff` is the implementation agent's claim about what changed this round
+- Use `progress.txt` for project conventions and the latest implementation summary and checks run.
+- Review the actual uncommitted diff and current code after reading those files. The diff and code win over any handoff notes if they disagree.
 
 Treat the implementation handoff as a claim, not proof. Verify it against the actual uncommitted diff and the current code.
 
