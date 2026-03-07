@@ -41,7 +41,7 @@ Create `.looper/<branch-name>/prd.json` with this structure:
   "description": "Brief feature description",
   "userStories": [
     {
-      "id": "US-001",
+      "id": "QRY-001",
       "title": "Short descriptive title",
       "description": "As a [user], I want [feature] so that [benefit].",
       "acceptanceCriteria": [
@@ -57,6 +57,17 @@ Create `.looper/<branch-name>/prd.json` with this structure:
   ]
 }
 ```
+
+Before generating stories, choose a single semantic prefix for `userStories[].id`:
+- Prefer the current branch name first.
+- If the branch name is too generic, infer the prefix from the PRD's dominant feature area.
+- Use an uppercase 2-3 letter prefix that stays readable.
+- State the chosen prefix in your response when you save the file.
+
+Examples:
+- `query-layer` -> `QRY-001`
+- `data-layer` -> `DL-001`
+- `investigation-engine` -> `INV-001`
 
 ### Step 4: Set priorities
 Assign priority numbers based on dependency order:
@@ -76,6 +87,21 @@ If there is an existing PRD with a different `branchName`:
 ### Step 6: Save the file
 Write to `.looper/<branch-name>/prd.json`.
 
+### Step 7: Scaffold prompt addenda
+If these files do not already exist, create them alongside `prd.json`:
+- `.looper/<branch-name>/prompt.shared.md`
+- `.looper/<branch-name>/prompt.implementer.md`
+- `.looper/<branch-name>/prompt.reviewer.md`
+
+Keep them short and project-specific:
+- `prompt.shared.md`: checks, architecture invariants, important directories
+- `prompt.implementer.md`: implementation workflow, code-change constraints, testing expectations
+- `prompt.reviewer.md`: review priorities, risky areas, standards to verify
+
+Do not copy Looper's default prompts into these files. Only add the project-specific deltas.
+
+If any of these files already exist, do not overwrite them unless the user explicitly asks.
+
 ## JSON field requirements
 
 ### `branchName`
@@ -84,7 +110,8 @@ Write to `.looper/<branch-name>/prd.json`.
 - Prefix with `looper/` for easy identification
 
 ### `userStories[].id`
-- Format: `US-001`, `US-002`, etc.
+- Format: `<PREFIX>-001`, `<PREFIX>-002`, etc.
+- `<PREFIX>` must be a semantic 2-3 letter uppercase code chosen from branch name or PRD intent
 - Sequential numbering
 - Unique within the PRD
 
@@ -120,6 +147,10 @@ Must be verifiable. Good vs bad examples:
 2. **No circular dependencies**: story N cannot depend on story N+1
 3. **Verifiable criteria only**: every criterion must be testable
 4. **Include quality checks**: add "Tests pass" or "Type checks pass" where applicable
+5. **No generic story ids**: do not emit `US-001` or `US-QRY-001`; use a semantic 2-3 letter prefix instead
 
 ## Output
-Save the JSON to `.looper/<branch-name>/prd.json` and confirm to the user.
+Save the JSON to `.looper/<branch-name>/prd.json`, scaffold the prompt addenda files if needed, and confirm to the user:
+- which story prefix was chosen
+- where `prd.json` was written
+- which prompt addenda files were created or left unchanged

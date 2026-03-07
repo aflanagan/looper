@@ -1,25 +1,28 @@
 #!/bin/bash
-# Looper - Autonomous Claude + Codex Loop
-# Runs Claude Code and Codex review repeatedly until all PRD tasks complete.
+# Looper - Autonomous implementation + review loop
+# Runs implementation and review agents repeatedly until all PRD tasks complete.
 #
 # Usage:
 #   looper [max_iterations]
-#   looper watch
+#   looper watch [--verbose|--raw|--full-logs]
 #
 # Default max iterations: 10
 #
 # Requires:
 #   - .looper/<branch-name>/prd.json in current directory
-#   - codex, claude, jq, git
+#   - claude and/or codex, plus jq and git
 #
 # Optional:
-#   - .looper/<branch-name>/config.md for project-specific quality checks/context
-#   - .looper/<branch-name>/prompt.local.md for project-specific prompt addendum
-#   - .looper/<branch-name>/review-prompt.md to override the default review prompt template
+#   - .looper/<branch-name>/prompt.shared.md for prompt guidance shared by both agents
+#   - .looper/<branch-name>/prompt.implementer.md for implementation-only prompt guidance
+#   - .looper/<branch-name>/prompt.reviewer.md for review-only prompt guidance
 #   - LOOPER_STATE_DIR to override the full state dir path
+#   - LOOPER_IMPLEMENTATION_AGENT (default claude)
+#   - LOOPER_REVIEW_AGENT (default codex)
 #   - LOOPER_REVIEW_MAX_ROUNDS (default 5)
 #   - LOOPER_KEEP_LOGS (default 0; set to 1 to keep temp run logs on failure)
-#   - LOOPER_REVIEW_PROMPT_FILE / LOOPER_REVIEW_SCHEMA_FILE to override review artifacts
+#   - LOOPER_IMPLEMENTATION_PROMPT_FILE / LOOPER_REVIEW_PROMPT_FILE to override base prompt templates
+#   - LOOPER_REVIEW_SCHEMA_FILE to override review schema
 
 set -euo pipefail
 
@@ -29,9 +32,31 @@ LOOPER_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 
 MODE="run"
 MAX_ITERATIONS=10
+WATCH_OUTPUT_MODE="compact"
+CLI_ERROR=""
+SHOW_USAGE_ON_ERROR=0
 if [ "${1:-}" = "watch" ]; then
     MODE="watch"
     shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --verbose|-v)
+                WATCH_OUTPUT_MODE="verbose"
+                ;;
+            --raw|--full-logs)
+                WATCH_OUTPUT_MODE="raw"
+                ;;
+            --help|-h)
+                MODE="help"
+                ;;
+            *)
+                CLI_ERROR="unknown watch option: $1"
+                SHOW_USAGE_ON_ERROR=1
+                break
+                ;;
+        esac
+        shift
+    done
 elif [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     MODE="help"
     shift
@@ -67,26 +92,33 @@ else
     STATE_DIR="$PROJECT_DIR/.looper/$STATE_BRANCH_SLUG"
 fi
 
-CONFIG_FILE="$STATE_DIR/config.md"
-LOCAL_PROMPT_FILE="$STATE_DIR/prompt.local.md"
+PROMPT_SHARED_FILE="$STATE_DIR/prompt.shared.md"
+PROMPT_IMPLEMENTER_FILE="$STATE_DIR/prompt.implementer.md"
+PROMPT_REVIEWER_FILE="$STATE_DIR/prompt.reviewer.md"
+LEGACY_LOCAL_PROMPT_FILE="$STATE_DIR/prompt.local.md"
+LEGACY_REVIEW_PROMPT_FILE="$STATE_DIR/review-prompt.md"
 PRD_MARKDOWN_FILE="$STATE_DIR/prd.md"
 PRD_FILE="$STATE_DIR/prd.json"
 PROGRESS_FILE="$STATE_DIR/progress.txt"
-REVIEWS_ROOT="$STATE_DIR/reviews"
-PROMPT_FILE="$LOOPER_DIR/templates/looper-prompt.md"
-REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$STATE_DIR/review-prompt.md}"
+STORIES_ROOT="$STATE_DIR/stories"
+LEGACY_REVIEWS_ROOT="$STATE_DIR/reviews"
+SHARED_PROMPT_FILE="$LOOPER_DIR/templates/prompt.shared.md"
+IMPLEMENTATION_PROMPT_FILE="${LOOPER_IMPLEMENTATION_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.implementer.md}"
+REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.reviewer.md}"
 REVIEW_SCHEMA_FILE="${LOOPER_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-review-schema.json}"
+IMPLEMENTATION_AGENT="${LOOPER_IMPLEMENTATION_AGENT:-claude}"
+REVIEW_AGENT="${LOOPER_REVIEW_AGENT:-codex}"
 REVIEW_MAX_ROUNDS="${LOOPER_REVIEW_MAX_ROUNDS:-5}"
 KEEP_LOGS="${LOOPER_KEEP_LOGS:-0}"
-RUN_STATE_FILE="$STATE_DIR/.active-run.json"
+TMP_ROOT="${TMPDIR:-/tmp}"
+RUN_STATE_ROOT="${TMP_ROOT%/}/looper-active"
+RUN_STATE_KEY="$(printf '%s\n%s\n' "$PROJECT_DIR" "$STATE_DIR" | cksum | awk '{print $1}')"
+RUN_STATE_FILE="$RUN_STATE_ROOT/$RUN_STATE_KEY.json"
 RUN_DIR=""
 PHASE_HEARTBEAT_INTERVAL=10
 REVIEW_JSON_RESULT=""
-REVIEW_ARTIFACT_RESULT=""
-
-if [ ! -f "$REVIEW_PROMPT_FILE" ]; then
-    REVIEW_PROMPT_FILE="$LOOPER_DIR/templates/review-prompt.md"
-fi
+ACTIVE_STORY_FILE=""
+ACTIVE_HANDOFF_TOKEN=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -98,12 +130,22 @@ print_usage() {
     cat <<EOF
 Usage:
   looper [max_iterations]
-  looper watch
+  looper watch [--verbose|--raw|--full-logs]
+
+Watch output:
+  default                Compact transcript
+  --verbose, -v          Include tool details and summarized tool output
+  --raw, --full-logs     Tail the underlying log stream verbatim
 
 Environment:
   LOOPER_STATE_DIR            Override the full state dir path
-  LOOPER_REVIEW_MAX_ROUNDS    Number of Codex review rounds per story (default: 5)
+  LOOPER_IMPLEMENTATION_AGENT Agent for implementation/remediation (claude|codex; default: claude)
+  LOOPER_REVIEW_AGENT         Agent for review (claude|codex; default: codex)
+  LOOPER_REVIEW_MAX_ROUNDS    Number of review rounds per story (default: 5)
   LOOPER_KEEP_LOGS            Keep temp run logs on failure (default: 0)
+  LOOPER_IMPLEMENTATION_PROMPT_FILE
+                             Override the base implementation prompt template
+  LOOPER_REVIEW_PROMPT_FILE  Override the base review prompt template
 EOF
 }
 
@@ -113,6 +155,35 @@ require_command() {
         echo -e "${RED}Error: required command '$cmd' not found in PATH.${NC}"
         exit 1
     fi
+}
+
+validate_agent_name() {
+    local value="$1"
+    local var_name="$2"
+    case "$value" in
+        claude|codex) ;;
+        *)
+            echo -e "${RED}Error: $var_name must be 'claude' or 'codex'.${NC}"
+            exit 1
+            ;;
+    esac
+}
+
+if [ -n "$CLI_ERROR" ]; then
+    echo -e "${RED}Error: $CLI_ERROR${NC}"
+    if [ "$SHOW_USAGE_ON_ERROR" -eq 1 ]; then
+        print_usage
+    fi
+    exit 1
+fi
+
+agent_display_name() {
+    local agent="$1"
+    case "$agent" in
+        claude) printf "Claude" ;;
+        codex) printf "Codex" ;;
+        *) printf "%s" "$agent" ;;
+    esac
 }
 
 epoch_now() {
@@ -154,6 +225,639 @@ get_file_mtime_epoch() {
     stat -c %Y "$file"
 }
 
+display_path() {
+    local path="$1"
+    if [[ "$path" == "$PROJECT_DIR/"* ]]; then
+        path="${path#$PROJECT_DIR/}"
+    fi
+    printf "%s" "$path"
+}
+
+utc_timestamp() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+story_state_file() {
+    local story_id="$1"
+    printf "%s/%s.md" "$STORIES_ROOT" "$story_id"
+}
+
+extract_story_section() {
+    local file="$1"
+    local section="$2"
+    local start_marker="<!-- looper:${section}:start -->"
+    local end_marker="<!-- looper:${section}:end -->"
+
+    awk -v start="$start_marker" -v end="$end_marker" '
+        $0 == start { in_section = 1; next }
+        $0 == end { in_section = 0; exit }
+        in_section { print }
+    ' "$file"
+}
+
+replace_story_section() {
+    local file="$1"
+    local section="$2"
+    local content="$3"
+    local start_marker="<!-- looper:${section}:start -->"
+    local end_marker="<!-- looper:${section}:end -->"
+    local replacement
+
+    replacement="${start_marker}"$'\n'"${content}"$'\n'"${end_marker}"
+
+    START_MARKER="$start_marker" \
+    END_MARKER="$end_marker" \
+    REPLACEMENT="$replacement" \
+    LC_ALL=C LANG=C perl -0i -e '
+        local $/;
+        $_ = <>;
+        my $start = $ENV{START_MARKER};
+        my $end = $ENV{END_MARKER};
+        my $replacement = $ENV{REPLACEMENT};
+        my $count = s/\Q$start\E.*?\Q$end\E/$replacement/s;
+        if (!$count) {
+            die "missing markers\n";
+        }
+        print;
+    ' "$file" || {
+        echo -e "${RED}Error: missing section markers for '$section' in $file${NC}"
+        exit 1
+    }
+}
+
+append_story_history_entry() {
+    local story_file="$1"
+    local entry="$2"
+    local existing_history new_history
+
+    existing_history="$(extract_story_section "$story_file" "history")"
+    entry="$(truncate_text "$(normalize_single_line "$entry")" 500)"
+    if [ -n "$existing_history" ]; then
+        new_history="${existing_history}"$'\n'"- ${entry}"
+    else
+        new_history="- ${entry}"
+    fi
+    replace_story_section "$story_file" "history" "$new_history"
+}
+
+trim_multiline_text() {
+    local text="$1"
+    printf "%s" "$text" | awk '
+        NR == 1 { first = 1 }
+        {
+            lines[NR] = $0
+            if ($0 ~ /[^[:space:]]/) {
+                if (!start) {
+                    start = NR
+                }
+                end = NR
+            }
+        }
+        END {
+            if (!start) {
+                exit
+            }
+            for (i = start; i <= end; i++) {
+                print lines[i]
+            }
+        }
+    '
+}
+
+extract_markdown_subsection() {
+    local content="$1"
+    local heading="$2"
+
+    printf "%s\n" "$content" | awk -v start="### $heading" '
+        $0 == start { in_section = 1; next }
+        in_section && /^### / { exit }
+        in_section { print }
+    '
+}
+
+append_history_detail_block() {
+    local block="$1"
+    local label="$2"
+    local content="$3"
+    local trimmed
+
+    trimmed="$(trim_multiline_text "$content")"
+    if [ -z "$trimmed" ]; then
+        return 0
+    fi
+
+    block+=$'\n'"  - ${label}:"
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        block+=$'\n'"    ${line}"
+    done <<< "$trimmed"
+
+    printf "%s" "$block"
+}
+
+append_story_history_block() {
+    local story_file="$1"
+    local title="$2"
+    local detail_block="${3:-}"
+    local existing_history new_history block
+
+    existing_history="$(extract_story_section "$story_file" "history")"
+    title="$(truncate_text "$(normalize_single_line "$title")" 500)"
+    block="- ${title}"
+    if [ -n "$detail_block" ]; then
+        block="${block}"$'\n'"${detail_block}"
+    fi
+
+    if [ -n "$existing_history" ]; then
+        new_history="${existing_history}"$'\n'"${block}"
+    else
+        new_history="$block"
+    fi
+    replace_story_section "$story_file" "history" "$new_history"
+}
+
+render_story_details_section() {
+    local story_id="$1"
+
+    jq -r --arg id "$story_id" '
+        first(.userStories[] | select(.id == $id)) as $story
+        | if $story == null then
+            error("story not found")
+          else
+            (
+              [
+                "- Story ID: \($story.id)",
+                "- Title: \($story.title)",
+                "- Priority: \($story.priority)",
+                "- Passes: \($story.passes)"
+              ]
+              + ["", "### Description", "", ($story.description // ""), "", "### Acceptance Criteria", ""]
+              + (($story.acceptanceCriteria // []) | map("- " + .))
+              + ["", "### Notes", ""]
+              + (
+                  if ($story.notes // "") == "" then
+                    ["- None."]
+                  else
+                    ($story.notes | split("\n") | map(select(length > 0) | "- " + .))
+                  end
+                )
+            ) | join("\n")
+          end
+    ' "$PRD_FILE"
+}
+
+latest_legacy_review_file() {
+    local story_id="$1"
+    local review_dir="$LEGACY_REVIEWS_ROOT/$story_id"
+    local file latest="" highest=0 round
+
+    if [ ! -d "$review_dir" ]; then
+        return 1
+    fi
+
+    shopt -s nullglob
+    for file in "$review_dir"/round-*.md; do
+        round="${file##*/}"
+        round="${round#round-}"
+        round="${round%.md}"
+        if [[ "$round" =~ ^[0-9]+$ ]] && [ "$round" -ge "$highest" ]; then
+            highest="$round"
+            latest="$file"
+        fi
+    done
+    shopt -u nullglob
+
+    if [ -n "$latest" ]; then
+        printf "%s" "$latest"
+        return 0
+    fi
+    return 1
+}
+
+extract_legacy_review_section() {
+    local file="$1"
+    local heading="$2"
+    local next_heading="${3:-}"
+
+    awk -v start="## $heading" -v stop="## $next_heading" '
+        $0 == start { in_section = 1; next }
+        in_section && stop != "## " && $0 == stop { exit }
+        in_section { print }
+    ' "$file"
+}
+
+seed_story_state_from_legacy_review() {
+    local story_id="$1"
+    local story_file="$2"
+    local latest_review review_round verdict summary findings ac_coverage test_gaps
+    local review_display status_block review_block
+
+    latest_review="$(latest_legacy_review_file "$story_id" || true)"
+    if [ -z "$latest_review" ]; then
+        return 0
+    fi
+
+    review_round="$(awk -F': ' '/^- Round: / { print $2; exit }' "$latest_review")"
+    verdict="$(awk -F': ' '/^- Verdict: / { print $2; exit }' "$latest_review")"
+    summary="$(extract_legacy_review_section "$latest_review" "Summary" "Findings")"
+    findings="$(extract_legacy_review_section "$latest_review" "Findings" "Acceptance Criteria Coverage")"
+    ac_coverage="$(extract_legacy_review_section "$latest_review" "Acceptance Criteria Coverage" "Test Gaps")"
+    test_gaps="$(extract_legacy_review_section "$latest_review" "Test Gaps")"
+    review_display="$(display_path "$latest_review")"
+
+    if [ -z "$review_round" ]; then
+        review_round="unknown"
+    fi
+    if [ -z "$verdict" ]; then
+        verdict="unknown"
+    fi
+    if [ -z "$findings" ] || [ "$findings" = "- None" ]; then
+        findings="- None."
+    fi
+    if [ -z "$summary" ]; then
+        summary="No legacy summary captured."
+    fi
+    if [ -z "$ac_coverage" ]; then
+        ac_coverage="- None."
+    fi
+    if [ -z "$test_gaps" ]; then
+        test_gaps="- None."
+    fi
+
+    status_block="$(cat <<EOF
+- Phase: pending implementation
+- Review round: $review_round
+- Latest review verdict: $verdict
+- Last updated: $(utc_timestamp)
+EOF
+)"
+    review_block="$(cat <<EOF
+- Summary
+
+$summary
+
+### Acceptance Criteria Coverage
+
+$ac_coverage
+
+### Test Gaps
+
+$test_gaps
+
+- Legacy review source: $review_display
+EOF
+)"
+
+    replace_story_section "$story_file" "current-status" "$status_block"
+    replace_story_section "$story_file" "open-findings" "$findings"
+    replace_story_section "$story_file" "latest-review" "$review_block"
+    append_story_history_entry "$story_file" "Seeded story state from legacy review artifact $review_display."
+}
+
+initialize_story_state_file() {
+    local story_id="$1"
+    local story_title="$2"
+    local story_file
+
+    story_file="$(story_state_file "$story_id")"
+    mkdir -p "$STORIES_ROOT"
+
+    cat > "$story_file" <<EOF
+# $story_id - $story_title
+
+## Story Details
+<!-- looper:story-details:start -->
+- Pending story metadata.
+<!-- looper:story-details:end -->
+
+## Current Status
+<!-- looper:current-status:start -->
+- Phase: pending implementation
+- Review round: 0
+- Latest review verdict: not reviewed
+- Last updated: $(utc_timestamp)
+<!-- looper:current-status:end -->
+
+## Open Findings
+<!-- looper:open-findings:start -->
+- None.
+<!-- looper:open-findings:end -->
+
+## Latest Review Summary
+<!-- looper:latest-review:start -->
+- No review recorded yet.
+<!-- looper:latest-review:end -->
+
+## Latest Implementation Handoff
+<!-- looper:implementation-handoff:start -->
+- No handoff recorded yet.
+<!-- looper:implementation-handoff:end -->
+
+## History
+<!-- looper:history:start -->
+- Initialized by Looper at $(utc_timestamp).
+<!-- looper:history:end -->
+EOF
+
+    replace_story_section "$story_file" "story-details" "$(render_story_details_section "$story_id")"
+    seed_story_state_from_legacy_review "$story_id" "$story_file"
+}
+
+ensure_story_state_file() {
+    local story_id="$1"
+    local story_title="$2"
+    local story_file
+
+    story_file="$(story_state_file "$story_id")"
+    if [ ! -f "$story_file" ]; then
+        initialize_story_state_file "$story_id" "$story_title"
+    fi
+
+    LC_ALL=C LANG=C STORY_ID="$story_id" STORY_TITLE="$story_title" perl -0pi -e '
+        my $id = $ENV{STORY_ID};
+        my $title = $ENV{STORY_TITLE};
+        s/\A# .*\n/# $id - $title\n/;
+    ' "$story_file"
+
+    replace_story_section "$story_file" "story-details" "$(render_story_details_section "$story_id")"
+    ACTIVE_STORY_FILE="$story_file"
+}
+
+prepare_story_handoff_section() {
+    local story_id="$1"
+    local story_title="$2"
+    local phase="$3"
+    local review_round="${4:-}"
+    local story_file handoff_block status_block round_label
+
+    ensure_story_state_file "$story_id" "$story_title"
+    story_file="$ACTIVE_STORY_FILE"
+    ACTIVE_HANDOFF_TOKEN="looper-pending-${story_id}-${phase}-${review_round:-0}-$(epoch_now)-$$"
+
+    if [ "$phase" = "remediation" ] && [ -n "$review_round" ]; then
+        round_label="$review_round"
+    else
+        round_label="0"
+    fi
+
+    local verdict_label="pending"
+    local addressed_round="initial implementation"
+    if [ "$phase" = "remediation" ]; then
+        verdict_label="CHANGES_REQUESTED"
+        if [ -n "$review_round" ]; then
+            addressed_round="$review_round"
+        fi
+    fi
+
+    status_block="$(cat <<EOF
+- Phase: $phase
+- Review round: $round_label
+- Latest review verdict: $verdict_label
+- Last updated: $(utc_timestamp)
+EOF
+)"
+
+    handoff_block="$(cat <<EOF
+- Phase: $phase
+- Review round addressed: $addressed_round
+- Pending token: $ACTIVE_HANDOFF_TOKEN
+
+### Required update
+
+Replace this entire section body, keep the surrounding markers intact, and remove the pending token.
+
+### Claimed changes
+- 
+
+### Files changed
+- 
+
+### Checks run
+- 
+
+### Remaining risks
+- 
+EOF
+)"
+
+    if [ "$phase" = "remediation" ]; then
+        handoff_block="${handoff_block}"$'\n\n### Findings addressed\n- '
+    fi
+
+    replace_story_section "$story_file" "current-status" "$status_block"
+    replace_story_section "$story_file" "implementation-handoff" "$handoff_block"
+}
+
+validate_story_handoff_section() {
+    local story_id="$1"
+    local story_file="$2"
+    local handoff_content
+
+    handoff_content="$(extract_story_section "$story_file" "implementation-handoff")"
+    if [ -z "$handoff_content" ]; then
+        echo -e "${RED}Error: implementation handoff section is empty in $(display_path "$story_file").${NC}"
+        exit 1
+    fi
+
+    if printf "%s" "$handoff_content" | grep -q "$ACTIVE_HANDOFF_TOKEN"; then
+        echo -e "${RED}Error: implementation agent did not update $(display_path "$story_file"). Remove the pending token and complete the handoff before review.${NC}"
+        exit 1
+    fi
+}
+
+record_implementation_history() {
+    local story_id="$1"
+    local phase="$2"
+    local review_round="${3:-}"
+    local story_file="$4"
+    local handoff_content files_changed checks_run findings_addressed remaining_risks detail_block title
+
+    handoff_content="$(extract_story_section "$story_file" "implementation-handoff")"
+    files_changed="$(extract_markdown_subsection "$handoff_content" "Files changed")"
+    checks_run="$(extract_markdown_subsection "$handoff_content" "Checks run")"
+    findings_addressed="$(extract_markdown_subsection "$handoff_content" "Findings addressed")"
+    remaining_risks="$(extract_markdown_subsection "$handoff_content" "Remaining risks")"
+
+    if [ "$phase" = "remediation" ] && [ -n "$review_round" ]; then
+        title="Completed remediation for $story_id after review round $review_round."
+    else
+        title="Completed implementation for $story_id."
+    fi
+
+    detail_block=""
+    if [ -n "$findings_addressed" ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Findings addressed" "$findings_addressed")"
+    fi
+    if [ -n "$files_changed" ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Files changed" "$files_changed")"
+    fi
+    if [ -n "$checks_run" ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Checks run" "$checks_run")"
+    fi
+    if [ -n "$remaining_risks" ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Remaining risks" "$remaining_risks")"
+    fi
+
+    append_story_history_block "$story_file" "$title" "$detail_block"
+}
+
+update_story_review_state() {
+    local story_id="$1"
+    local story_title="$2"
+    local review_json_file="$3"
+    local round="$4"
+    local reviewer_name="$5"
+    local verdict summary findings ac_coverage test_gaps review_block status_block detail_block ac_failures
+    local story_file
+
+    ensure_story_state_file "$story_id" "$story_title"
+    story_file="$ACTIVE_STORY_FILE"
+
+    verdict="$(jq -r '.verdict // "unknown"' "$review_json_file")"
+    summary="$(jq -r '.summary // "No summary provided."' "$review_json_file")"
+    findings="$(jq -r 'if (.findings | length) == 0 then "- None." else (.findings | map("- [" + .priority + "] " + .title + "\n  - ID: " + .id + "\n  - Location: " + .location + "\n  - Details: " + .details) | join("\n")) end' "$review_json_file")"
+    ac_coverage="$(jq -r 'if (.acCoverage | length) == 0 then "- None." else (.acCoverage | map("- [" + .status + "] " + .criterion + "\n  - " + .details) | join("\n")) end' "$review_json_file")"
+    test_gaps="$(jq -r 'if (.testGaps | length) == 0 then "- None." else (.testGaps | map("- " + .) | join("\n")) end' "$review_json_file")"
+
+    status_block="$(cat <<EOF
+- Phase: review complete
+- Review round: $round
+- Latest review verdict: $verdict
+- Last updated: $(utc_timestamp)
+EOF
+)"
+    review_block="$(cat <<EOF
+- Reviewer: $reviewer_name
+- Verdict: $verdict
+- Round: $round
+
+### Summary
+
+$summary
+
+### Acceptance Criteria Coverage
+
+$ac_coverage
+
+### Test Gaps
+
+$test_gaps
+EOF
+)"
+
+    replace_story_section "$story_file" "current-status" "$status_block"
+    replace_story_section "$story_file" "open-findings" "$findings"
+    replace_story_section "$story_file" "latest-review" "$review_block"
+    detail_block=""
+    detail_block="$(append_history_detail_block "$detail_block" "Summary" "- $(truncate_text "$(normalize_single_line "$summary")" 320)")"
+    if [ -n "$findings" ] && [ "$findings" != "- None." ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Findings" "$findings")"
+    fi
+    ac_failures="$(jq -r 'if ([.acCoverage[]? | select(.status == "fail")] | length) == 0 then "" else ([.acCoverage[]? | select(.status == "fail") | "- " + .criterion] | join("\n")) end' "$review_json_file")"
+    if [ -n "$ac_failures" ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Acceptance criteria still failing" "$ac_failures")"
+    fi
+    if [ -n "$test_gaps" ] && [ "$test_gaps" != "- None." ]; then
+        detail_block="$(append_history_detail_block "$detail_block" "Test gaps" "$test_gaps")"
+    fi
+    append_story_history_block "$story_file" "${reviewer_name} review round $round returned $verdict." "$detail_block"
+}
+
+story_status_value() {
+    local story_file="$1"
+    local field="$2"
+    local prefix="- ${field}: "
+
+    extract_story_section "$story_file" "current-status" | awk -v prefix="$prefix" '
+        index($0, prefix) == 1 {
+            print substr($0, length(prefix) + 1)
+            exit
+        }
+    '
+}
+
+story_should_resume_remediation() {
+    local story_file="$1"
+    local verdict
+
+    if [ ! -f "$story_file" ]; then
+        return 1
+    fi
+
+    verdict="$(story_status_value "$story_file" "Latest review verdict")"
+    [ "$verdict" = "CHANGES_REQUESTED" ]
+}
+
+story_review_round() {
+    local story_file="$1"
+    local round
+
+    round="$(story_status_value "$story_file" "Review round")"
+    if [[ "$round" =~ ^[0-9]+$ ]]; then
+        printf "%s" "$round"
+    fi
+}
+
+record_review_limit_failure() {
+    local story_id="$1"
+    local story_title="$2"
+    local review_json_file="$3"
+    local failed_round="$4"
+    local reviewer_name="$5"
+    local story_file="$6"
+    local summary findings_snapshot ac_failures test_gaps
+    local note_line timestamp progress_timestamp status_block
+    local tmp
+
+    summary="$(jq -r '.summary // "none"' "$review_json_file")"
+    findings_snapshot="$(jq -r '[.findings[]? | "\(.priority) \(.title)"] | if length == 0 then "none" else join("; ") end' "$review_json_file")"
+    ac_failures="$(jq -r '[.acCoverage[]? | select(.status == "fail") | .criterion] | if length == 0 then "none" else join("; ") end' "$review_json_file")"
+    test_gaps="$(jq -r 'if (.testGaps | length) == 0 then "none" else (.testGaps | join("; ")) end' "$review_json_file")"
+
+    summary="$(truncate_text "$(normalize_single_line "$summary")" 240)"
+    findings_snapshot="$(truncate_text "$(normalize_single_line "$findings_snapshot")" 320)"
+    ac_failures="$(truncate_text "$(normalize_single_line "$ac_failures")" 240)"
+    test_gaps="$(truncate_text "$(normalize_single_line "$test_gaps")" 240)"
+
+    status_block="$(cat <<EOF
+- Phase: review limit reached
+- Review round: $failed_round
+- Latest review verdict: CHANGES_REQUESTED
+- Last updated: $(utc_timestamp)
+EOF
+)"
+    replace_story_section "$story_file" "current-status" "$status_block"
+    append_story_history_entry "$story_file" "${reviewer_name} review limit reached at round $failed_round; manual rerun required."
+
+    timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    progress_timestamp="$(date +"%Y-%m-%d %H:%M:%S")"
+
+    {
+        echo "## $progress_timestamp - $story_id: Review limit reached"
+        echo "- Story title: $story_title"
+        echo "- Reviewer: $reviewer_name"
+        echo "- Final verdict: CHANGES_REQUESTED after $failed_round of $REVIEW_MAX_ROUNDS rounds"
+        echo "- Story state file: $(display_path "$story_file")"
+        echo "- Review summary: $summary"
+        echo "- Findings snapshot: $findings_snapshot"
+        echo "- AC failures: $ac_failures"
+        echo "- Test gaps: $test_gaps"
+        echo "- Next action: rerun Looper to resume remediation for this story."
+        echo "---"
+        echo ""
+    } >> "$PROGRESS_FILE"
+
+    note_line="$reviewer_name review: CHANGES_REQUESTED after $failed_round round(s) at $timestamp; summary: $summary; story state: $(display_path "$story_file")"
+    note_line="$(truncate_text "$(normalize_single_line "$note_line")" 500)"
+
+    tmp="$(mktemp "$STATE_DIR/prd-notes.XXXXXX")"
+    jq --arg id "$story_id" --arg line "$note_line" '
+        (.userStories[] | select(.id == $id) | .notes) |=
+            (if . == null or . == "" then $line else . + "\n" + $line end)
+    ' "$PRD_FILE" > "$tmp"
+    mv "$tmp" "$PRD_FILE"
+}
+
 write_run_state() {
     local status="$1"
     local story_id="$2"
@@ -167,8 +871,8 @@ write_run_state() {
 
     local tmp
 
-    mkdir -p "$STATE_DIR"
-    tmp="$(mktemp "$STATE_DIR/run-state.XXXXXX")"
+    mkdir -p "$RUN_STATE_ROOT"
+    tmp="$(mktemp "$RUN_STATE_ROOT/run-state.XXXXXX")"
     jq -n \
         --arg pid "$$" \
         --arg project_dir "$PROJECT_DIR" \
@@ -317,6 +1021,104 @@ tail_plain_log() {
     tail -n 40 -f "$log_file"
 }
 
+tail_raw_log() {
+    local log_file="$1"
+    tail -n 80 -f "$log_file"
+}
+
+tail_claude_compact_events() {
+    local log_file="$1"
+    tail -n 80 -f "$log_file" | jq --unbuffered -Rr --arg project_dir "$PROJECT_DIR" '
+        def collapse:
+          tostring
+          | gsub("\\s+"; " ")
+          | sub("^ "; "")
+          | sub(" $"; "");
+        def truncate($n):
+          if length <= $n then .
+          else .[0:($n - 3)] + "..."
+          end;
+        def short($n):
+          collapse | truncate($n);
+        def display_path($path):
+          if ($path | type) != "string" or $path == "" then ""
+          elif ($path | startswith($project_dir + "/")) then
+            $path[($project_dir | length + 1):]
+          else
+            $path
+          end;
+        def normalize_command($command):
+          ($command | tostring) as $raw
+          | if ($raw | test("^(/bin/)?(zsh|bash|sh) -lc ")) then
+              ($raw
+                | sub("^(/bin/)?(zsh|bash|sh) -lc "; "")
+                | sub("^\""; "")
+                | sub("\"$"; "")
+                | sub("^\u0027"; "")
+                | sub("\u0027$"; ""))
+            else
+              $raw
+            end
+          | gsub($project_dir; ".");
+        def command_line($command):
+          (normalize_command($command)) as $normalized
+          | if $normalized == "" then empty else empty end;
+        def todo_summary($todos):
+          ($todos // []) as $items
+          | if ($items | length) == 0 then
+              "updated"
+            else
+              (([$items[]? | select((.status // "") == "completed" or (.completed // false))] | length) | tostring)
+              + "/" + (($items | length) | tostring)
+              + " complete"
+            end;
+        def tool_line($name; $input):
+          if ($name == "Edit" or $name == "MultiEdit") and (($input.file_path // "") != "") then
+            "[edit] " + display_path(($input.file_path // ""))
+          elif $name == "Write" and (($input.file_path // "") != "") then
+            "[write] " + display_path(($input.file_path // ""))
+          elif $name == "Read" or $name == "LS" or $name == "Glob" or $name == "Grep" then
+            empty
+          elif $name == "Bash" then
+            command_line(($input.command // ""))
+          elif $name == "TodoWrite" then
+            "[todo] " + todo_summary(($input.todos // []))
+          else
+            "[tool] " + ($name // "unknown")
+          end;
+        def tool_result_line($result):
+          if (($result.stderr // "") | length) > 0 then
+            "[fail] " + (($result.stderr // "") | short(240))
+          elif (($result.stdout // "") | test("^The file .+ has been (updated|written|created) successfully\\.$")) then
+            (($result.stdout // "")
+              | capture("^The file (?<path>.+) has been (?<verb>updated|written|created) successfully\\.$")) as $match
+            | "[ok] "
+              + (if $match.verb == "written" then "wrote" else $match.verb end)
+              + " "
+              + display_path($match.path)
+          else
+            empty
+          end;
+        fromjson? as $event
+        | if $event == null then empty
+          elif ($event.type // "") == "assistant" then
+            ($event.message.content // [])
+            | .[]
+            | if (.type // "") == "tool_use" then
+                tool_line((.name // "unknown"); (.input // {}))
+              elif (.type // "") == "text" then
+                ((.text // "") | short(320))
+              else
+                empty
+              end
+          elif ($event.type // "") == "user" and ($event.tool_use_result // null) != null then
+            tool_result_line(($event.tool_use_result // {}))
+          else
+            empty
+          end
+    '
+}
+
 tail_claude_events() {
     local log_file="$1"
     tail -n 80 -f "$log_file" | jq --unbuffered -Rr '
@@ -372,6 +1174,91 @@ tail_claude_events() {
               ) as $content
               | if $content == "" then empty else "[tool-output] " + $content end
             end
+          else
+            empty
+          end
+    '
+}
+
+tail_codex_compact_events() {
+    local log_file="$1"
+    tail -n 80 -f "$log_file" | jq --unbuffered -Rr --arg project_dir "$PROJECT_DIR" '
+        def collapse:
+          tostring
+          | gsub("\\s+"; " ")
+          | sub("^ "; "")
+          | sub(" $"; "");
+        def truncate($n):
+          if length <= $n then .
+          else .[0:($n - 3)] + "..."
+          end;
+        def short($n):
+          collapse | truncate($n);
+        def display_path($path):
+          if ($path | type) != "string" or $path == "" then ""
+          elif ($path | startswith($project_dir + "/")) then
+            $path[($project_dir | length + 1):]
+          else
+            $path
+          end;
+        def normalize_command($command):
+          ($command | tostring) as $raw
+          | if ($raw | test("^(/bin/)?(zsh|bash|sh) -lc ")) then
+              ($raw
+                | sub("^(/bin/)?(zsh|bash|sh) -lc "; "")
+                | sub("^\""; "")
+                | sub("\"$"; "")
+                | sub("^\u0027"; "")
+                | sub("\u0027$"; ""))
+            else
+              $raw
+            end
+          | gsub($project_dir; ".");
+        def command_line($command):
+          (normalize_command($command)) as $normalized
+          | if $normalized == "" then empty else empty end;
+        def event_message_line($message):
+          ($message | tostring) as $raw
+          | if ($raw | startswith("[run] ")) then
+              command_line(($raw | sub("^\\[run\\] "; "")))
+            else
+              ($raw | short(320))
+            end;
+        def file_change_line($change):
+          "[ok] "
+          + (if ($change.kind // "") == "create" then
+               "created"
+             elif ($change.kind // "") == "delete" then
+               "deleted"
+             elif ($change.kind // "") == "move" then
+               "moved"
+             else
+               "updated"
+             end)
+          + " "
+          + display_path(($change.path // ""));
+        fromjson? as $event
+        | if $event == null then empty
+          elif ($event.type // "") == "event_msg" then
+            event_message_line(($event.payload.message // ""))
+          elif ($event.type // "") == "response_item" and ($event.payload.type // "") == "message" then
+            (($event.payload.content // [])
+              | map(select(.type == "output_text") | .text)
+              | join("")
+              | short(320))
+          elif ($event.type // "") == "item.started" and ($event.item.type // "") == "command_execution" then
+            command_line(($event.item.command // ""))
+          elif ($event.type // "") == "item.completed" and ($event.item.type // "") == "command_execution" then
+            if ($event.item.exit_code // 0) != 0 then
+              "[fail] exit " + (($event.item.exit_code // 0) | tostring) + " :: " + (normalize_command(($event.item.command // "")) | short(220))
+            else
+              empty
+            end
+          elif ($event.type // "") == "item.completed" and ($event.item.type // "") == "file_change" then
+            ($event.item.changes // [] | .[] | file_change_line(.))
+          elif ($event.type // "") == "item.updated" and ($event.item.type // "") == "todo_list" then
+            ($event.item.items // []) as $items
+            | "[todo] " + (([$items[]? | select(.completed == true)] | length | tostring)) + "/" + (($items | length) | tostring) + " complete"
           else
             empty
           end
@@ -462,10 +1349,16 @@ watch_active_run() {
             current_format="$log_format"
             echo ""
             echo "== $phase_banner =="
-            if [ "$current_format" = "codex-jsonl" ]; then
+            if [ "$WATCH_OUTPUT_MODE" = "raw" ]; then
+                tail_raw_log "$current_log" &
+            elif [ "$current_format" = "codex-jsonl" ] && [ "$WATCH_OUTPUT_MODE" = "verbose" ]; then
                 tail_codex_events "$current_log" &
-            elif [ "$current_format" = "claude-jsonl" ]; then
+            elif [ "$current_format" = "codex-jsonl" ]; then
+                tail_codex_compact_events "$current_log" &
+            elif [ "$current_format" = "claude-jsonl" ] && [ "$WATCH_OUTPUT_MODE" = "verbose" ]; then
                 tail_claude_events "$current_log" &
+            elif [ "$current_format" = "claude-jsonl" ]; then
+                tail_claude_compact_events "$current_log" &
             else
                 tail_plain_log "$current_log" &
             fi
@@ -525,7 +1418,7 @@ migrate_legacy_state_layout() {
     echo -e "${YELLOW}Migrating legacy .looper state to $STATE_DIR${NC}"
 
     cp "$legacy_prd" "$PRD_FILE"
-    for state_file in prd.md config.md prompt.local.md review-prompt.md; do
+    for state_file in prd.md; do
         if [ -f "$legacy_root/$state_file" ] && [ ! -f "$STATE_DIR/$state_file" ]; then
             cp "$legacy_root/$state_file" "$STATE_DIR/$state_file"
         fi
@@ -539,10 +1432,10 @@ migrate_legacy_state_layout() {
         cp "$legacy_progress" "$PROGRESS_FILE"
     fi
 
-    if [ -d "$legacy_reviews_branch" ] && [ ! -d "$REVIEWS_ROOT" ]; then
-        cp -R "$legacy_reviews_branch" "$REVIEWS_ROOT"
-    elif [ -d "$legacy_reviews_branch_compat" ] && [ ! -d "$REVIEWS_ROOT" ]; then
-        cp -R "$legacy_reviews_branch_compat" "$REVIEWS_ROOT"
+    if [ -d "$legacy_reviews_branch" ] && [ ! -d "$LEGACY_REVIEWS_ROOT" ]; then
+        cp -R "$legacy_reviews_branch" "$LEGACY_REVIEWS_ROOT"
+    elif [ -d "$legacy_reviews_branch_compat" ] && [ ! -d "$LEGACY_REVIEWS_ROOT" ]; then
+        cp -R "$legacy_reviews_branch_compat" "$LEGACY_REVIEWS_ROOT"
     fi
 }
 
@@ -553,8 +1446,8 @@ has_uncommitted_changes() {
         if [ -n "$rel_state_dir" ]; then
             [ -n "$(git -C "$PROJECT_DIR" status --porcelain -- . \
                 ":(exclude)$rel_state_dir/reviews/**" \
+                ":(exclude)$rel_state_dir/stories/**" \
                 ":(exclude)$rel_state_dir/progress.txt" \
-                ":(exclude)$rel_state_dir/.active-run.json" \
                 ":(exclude)$rel_state_dir/archive/**")" ]
             return
         fi
@@ -589,8 +1482,8 @@ stage_and_commit_story() {
         # Runtime state artifacts should not be committed automatically.
         git -C "$PROJECT_DIR" reset -q -- \
             "$rel_state_dir/reviews" \
+            "$rel_state_dir/stories" \
             "$rel_state_dir/progress.txt" \
-            "$rel_state_dir/.active-run.json" \
             "$rel_state_dir/archive" 2>/dev/null || true
     fi
 
@@ -623,65 +1516,19 @@ truncate_text() {
     fi
 }
 
-render_review_markdown() {
-    local review_json_file="$1"
-    local review_md_file="$2"
-    local story_id="$3"
-    local story_title="$4"
-    local round="$5"
-
-    jq -r \
-        --arg story_id "$story_id" \
-        --arg story_title "$story_title" \
-        --arg round "$round" '
-        "# Codex Review\n\n" +
-        "- Story ID: " + $story_id + "\n" +
-        "- Story title: " + $story_title + "\n" +
-        "- Round: " + $round + "\n" +
-        "- Verdict: " + (.verdict // "unknown") + "\n\n" +
-        "## Summary\n\n" +
-        (.summary // "none") + "\n\n" +
-        "## Findings\n\n" +
-        (if (.findings | length) == 0 then
-            "- None\n"
-        else
-            (.findings | map(
-                "- [" + .priority + "] " + .title + "\n" +
-                "  - ID: " + .id + "\n" +
-                "  - Location: " + .location + "\n" +
-                "  - Details: " + .details
-            ) | join("\n")) + "\n"
-        end) +
-        "\n## Acceptance Criteria Coverage\n\n" +
-        (if (.acCoverage | length) == 0 then
-            "- None\n"
-        else
-            (.acCoverage | map(
-                "- [" + .status + "] " + .criterion + "\n" +
-                "  - " + .details
-            ) | join("\n")) + "\n"
-        end) +
-        "\n## Test Gaps\n\n" +
-        (if (.testGaps | length) == 0 then
-            "- None\n"
-        else
-            (.testGaps | map("- " + .) | join("\n")) + "\n"
-        end)
-        ' "$review_json_file" > "$review_md_file"
-}
-
 record_approval_summary() {
     local story_id="$1"
     local story_title="$2"
     local review_json_file="$3"
-    local review_artifact_file="$4"
+    local story_state_file="$4"
     local approved_round="$5"
+    local reviewer_name="$6"
 
     local rel_review_file summary findings_snapshot ac_failures test_gaps
     local note_line timestamp progress_timestamp
     local tmp
 
-    rel_review_file="$review_artifact_file"
+    rel_review_file="$story_state_file"
     if [[ "$rel_review_file" == "$PROJECT_DIR/"* ]]; then
         rel_review_file="${rel_review_file#$PROJECT_DIR/}"
     fi
@@ -707,8 +1554,9 @@ record_approval_summary() {
     {
         echo "## $progress_timestamp - $story_id: Review closure summary"
         echo "- Story title: $story_title"
+        echo "- Reviewer: $reviewer_name"
         echo "- Final verdict: APPROVED (round $approved_round of $REVIEW_MAX_ROUNDS)"
-        echo "- Review artifact: $rel_review_file"
+        echo "- Story state file: $rel_review_file"
         echo "- Review summary: $summary"
         echo "- Findings snapshot: $findings_snapshot"
         echo "- AC failures at approval: $ac_failures"
@@ -717,7 +1565,7 @@ record_approval_summary() {
         echo ""
     } >> "$PROGRESS_FILE"
 
-    note_line="Codex review: APPROVED in $approved_round round(s) at $timestamp; summary: $summary; review artifact: $rel_review_file"
+    note_line="$reviewer_name review: APPROVED in $approved_round round(s) at $timestamp; summary: $summary; story state: $rel_review_file"
     note_line="$(truncate_text "$(normalize_single_line "$note_line")" 500)"
 
     tmp="$(mktemp "$STATE_DIR/prd-notes.XXXXXX")"
@@ -728,35 +1576,59 @@ record_approval_summary() {
     mv "$tmp" "$PRD_FILE"
 }
 
-build_claude_input() {
+build_phase_input() {
     local phase="$1"
     local story_id="$2"
-    local review_file="${3:-}"
-    local progress_display prd_display config_display
+    local story_title="$3"
+    local story_file="$4"
+    local review_round="${5:-}"
+    local progress_display prd_display story_display phase_heading
 
-    cat "$PROMPT_FILE"
+    if [ "$phase" = "remediation" ] && [ -n "$review_round" ]; then
+        phase_heading="# $story_id - $story_title (Remediation after round $review_round)"
+    else
+        phase_heading="# $story_id - $story_title (Implementation)"
+    fi
+
+    echo "$phase_heading"
+    echo ""
+    cat "$SHARED_PROMPT_FILE"
+    echo ""
+    cat "$IMPLEMENTATION_PROMPT_FILE"
+
+    if [ -f "$PROMPT_SHARED_FILE" ]; then
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Project Shared Addendum ($(display_path "$PROMPT_SHARED_FILE"))"
+        echo ""
+        cat "$PROMPT_SHARED_FILE"
+    fi
+
+    if [ -f "$PROMPT_IMPLEMENTER_FILE" ]; then
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Project Implementer Addendum ($(display_path "$PROMPT_IMPLEMENTER_FILE"))"
+        echo ""
+        cat "$PROMPT_IMPLEMENTER_FILE"
+    fi
 
     echo ""
     echo "---"
     echo ""
-    echo "## Looper Runtime Context"
+    echo "## Runtime Context"
     echo "- Active story id: $story_id"
-    echo "- Commit changes: NO (Looper commits after Codex review approval)."
-    echo "- Set \`passes\` to true: NO (Looper updates \`prd.json\` after Codex approval)."
+    echo "- Commit changes: NO (Looper commits after review approval)."
+    echo "- Set \`passes\` to true: NO (Looper updates \`prd.json\` after review approval)."
+    echo "- State directory: $(display_path "$STATE_DIR")"
     prd_display="$PRD_FILE"
     if [[ "$prd_display" == "$PROJECT_DIR/"* ]]; then
         prd_display="${prd_display#$PROJECT_DIR/}"
     fi
     echo "- PRD file: $prd_display"
-    if [ -f "$CONFIG_FILE" ]; then
-        config_display="$CONFIG_FILE"
-        if [[ "$config_display" == "$PROJECT_DIR/"* ]]; then
-            config_display="${config_display#$PROJECT_DIR/}"
-        fi
-        echo "- Config file: $config_display"
-    else
-        echo "- Config file: (none)"
-    fi
+    story_display="$(display_path "$story_file")"
+    echo "- Story file: $story_display"
     progress_display="$PROGRESS_FILE"
     if [[ "$progress_display" == "$PROJECT_DIR/"* ]]; then
         progress_display="${progress_display#$PROJECT_DIR/}"
@@ -765,34 +1637,77 @@ build_claude_input() {
 
     if [ "$phase" = "remediation" ]; then
         echo "- Phase: remediation"
-        echo "- Review findings artifact to address: $review_file"
-        echo "- Apply accepted fixes, rerun quality checks, and update progress notes."
+        echo "- Review round to address: $review_round"
+        echo "- Apply the open findings recorded in the Story File, rerun quality checks, and update both the handoff section and progress notes."
     else
         echo "- Phase: implementation"
+        echo "- Review round to address: initial implementation"
     fi
+}
 
-    if [ -f "$LOCAL_PROMPT_FILE" ]; then
+build_review_input() {
+    local story_id="$1"
+    local story_title="$2"
+    local round="$3"
+    local story_file="$4"
+    local progress_display prd_display story_display
+
+    echo "# $story_id - $story_title (Review round $round)"
+    echo ""
+    cat "$SHARED_PROMPT_FILE"
+    echo ""
+    cat "$REVIEW_PROMPT_FILE"
+
+    if [ -f "$PROMPT_SHARED_FILE" ]; then
         echo ""
         echo "---"
         echo ""
-        echo "## Project Local Addendum ($LOCAL_PROMPT_FILE)"
-        echo "Apply the following additional project-specific instructions in addition to the base Looper template:"
+        echo "## Project Shared Addendum ($(display_path "$PROMPT_SHARED_FILE"))"
         echo ""
-        cat "$LOCAL_PROMPT_FILE"
+        cat "$PROMPT_SHARED_FILE"
     fi
+
+    if [ -f "$PROMPT_REVIEWER_FILE" ]; then
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Project Reviewer Addendum ($(display_path "$PROMPT_REVIEWER_FILE"))"
+        echo ""
+        cat "$PROMPT_REVIEWER_FILE"
+    fi
+
+    echo ""
+    echo "## Runtime Context"
+    echo "- Active story ID: $story_id"
+    echo "- Active story title: $story_title"
+    echo "- Review round: $round"
+    echo "- State directory: $(display_path "$STATE_DIR")"
+    prd_display="$PRD_FILE"
+    if [[ "$prd_display" == "$PROJECT_DIR/"* ]]; then
+        prd_display="${prd_display#$PROJECT_DIR/}"
+    fi
+    echo "- PRD file: $prd_display"
+    progress_display="$PROGRESS_FILE"
+    if [[ "$progress_display" == "$PROJECT_DIR/"* ]]; then
+        progress_display="${progress_display#$PROJECT_DIR/}"
+    fi
+    echo "- Progress log file: $progress_display"
+    story_display="$(display_path "$story_file")"
+    echo "- Story file: $story_display"
 }
 
 run_claude_phase() {
     local phase="$1"
     local story_id="$2"
-    local review_file="${3:-}"
-    local prompt_input_file log_file phase_label review_round
+    local story_title="$3"
+    local story_file="$4"
+    local review_round="${5:-}"
+    local prompt_input_file log_file phase_label
 
     echo "Running Claude phase '$phase' for $story_id..."
 
     phase_label="Claude $phase"
-    if [ "$phase" = "remediation" ] && [[ "$review_file" =~ round-([0-9]+)\.md$ ]]; then
-        review_round="${BASH_REMATCH[1]}"
+    if [ "$phase" = "remediation" ] && [ -n "$review_round" ]; then
         phase_label="$phase_label (after round $review_round)"
         log_file="$RUN_DIR/iter-${i}-claude-${phase}-round-${review_round}.jsonl"
     else
@@ -800,60 +1715,112 @@ run_claude_phase() {
     fi
 
     prompt_input_file="$RUN_DIR/iter-${i}-claude-${phase}.prompt.txt"
-    build_claude_input "$phase" "$story_id" "$review_file" > "$prompt_input_file"
+    build_phase_input "$phase" "$story_id" "$story_title" "$story_file" "$review_round" > "$prompt_input_file"
 
     run_with_log "$story_id" "$ACTIVE_STORY_TITLE" \
         "claude" "$phase_label" "$log_file" "claude-jsonl" \
         bash -lc 'cat "$1" | claude -p --verbose --output-format stream-json --dangerously-skip-permissions' -- "$prompt_input_file"
 }
 
+run_codex_phase() {
+    local phase="$1"
+    local story_id="$2"
+    local story_title="$3"
+    local story_file="$4"
+    local review_round="${5:-}"
+    local prompt_input_file log_file phase_label
+
+    echo "Running Codex phase '$phase' for $story_id..."
+
+    phase_label="Codex $phase"
+    if [ "$phase" = "remediation" ] && [ -n "$review_round" ]; then
+        phase_label="$phase_label (after round $review_round)"
+        log_file="$RUN_DIR/iter-${i}-codex-${phase}-round-${review_round}.log"
+    else
+        log_file="$RUN_DIR/iter-${i}-codex-${phase}.log"
+    fi
+
+    prompt_input_file="$RUN_DIR/iter-${i}-codex-${phase}.prompt.txt"
+    build_phase_input "$phase" "$story_id" "$story_title" "$story_file" "$review_round" > "$prompt_input_file"
+
+    run_with_log "$story_id" "$ACTIVE_STORY_TITLE" \
+        "codex" "$phase_label" "$log_file" "plain" \
+        bash -lc 'cat "$1" | codex exec -a never -s workspace-write -C "$2" --skip-git-repo-check --ephemeral -' -- \
+        "$prompt_input_file" "$PROJECT_DIR"
+}
+
+run_claude_review_round() {
+    local story_id="$1"
+    local story_title="$2"
+    local round="$3"
+    local story_file="$4"
+
+    local review_json_tmp review_input_file log_file review_schema_json
+    review_json_tmp="$(mktemp "$RUN_DIR/review-round-${story_id}-${round}.XXXXXX.json")"
+    review_input_file="$RUN_DIR/iter-${i}-claude-review-round-${round}.prompt.txt"
+    log_file="$RUN_DIR/iter-${i}-claude-review-round-${round}.log"
+    review_schema_json="$(cat "$REVIEW_SCHEMA_FILE")"
+
+    echo "Running Claude review round $round for $story_id..." >&2
+    build_review_input "$story_id" "$story_title" "$round" "$story_file" > "$review_input_file"
+
+    run_with_log "$story_id" "$story_title" \
+        "claude-review" "Claude review round $round" "$log_file" "plain" \
+        bash -lc 'cat "$1" | claude -p --dangerously-skip-permissions --output-format json --json-schema "$2" | tee "$3"' -- \
+        "$review_input_file" "$review_schema_json" "$review_json_tmp"
+
+    REVIEW_JSON_RESULT="$review_json_tmp"
+}
+
 run_codex_review_round() {
     local story_id="$1"
     local story_title="$2"
     local round="$3"
-    local previous_review_file="${4:-}"
+    local story_file="$4"
 
-    local review_dir review_md_file review_json_tmp review_input_file events_file
-    local progress_display prd_display
-    review_dir="$REVIEWS_ROOT/$story_id"
-    review_md_file="$review_dir/round-$round.md"
+    local review_json_tmp review_input_file events_file
     review_json_tmp="$(mktemp "$RUN_DIR/review-round-${story_id}-${round}.XXXXXX.json")"
     review_input_file="$RUN_DIR/iter-${i}-codex-review-round-${round}.prompt.txt"
     events_file="$RUN_DIR/iter-${i}-codex-review-round-${round}.jsonl"
 
-    mkdir -p "$review_dir"
-
     echo "Running Codex review round $round for $story_id..." >&2
-    {
-        cat "$REVIEW_PROMPT_FILE"
-        echo ""
-        echo "## Runtime Context"
-        echo "- Active story ID: $story_id"
-        echo "- Active story title: $story_title"
-        echo "- Review round: $round"
-        prd_display="$PRD_FILE"
-        if [[ "$prd_display" == "$PROJECT_DIR/"* ]]; then
-            prd_display="${prd_display#$PROJECT_DIR/}"
-        fi
-        echo "- PRD file: $prd_display"
-        progress_display="$PROGRESS_FILE"
-        if [[ "$progress_display" == "$PROJECT_DIR/"* ]]; then
-            progress_display="${progress_display#$PROJECT_DIR/}"
-        fi
-        echo "- Progress log file: $progress_display"
-        if [ -n "$previous_review_file" ]; then
-            echo "- Previous review artifact: $previous_review_file"
-        fi
-    } > "$review_input_file"
+    build_review_input "$story_id" "$story_title" "$round" "$story_file" > "$review_input_file"
 
     run_with_log "$story_id" "$story_title" \
         "codex" "Codex review round $round" "$events_file" "codex-jsonl" \
         bash -lc 'cat "$1" | codex -a never -s workspace-write exec --ephemeral --json --output-schema "$2" -o "$3" -' -- \
         "$review_input_file" "$REVIEW_SCHEMA_FILE" "$review_json_tmp"
 
-    render_review_markdown "$review_json_tmp" "$review_md_file" "$story_id" "$story_title" "$round"
     REVIEW_JSON_RESULT="$review_json_tmp"
-    REVIEW_ARTIFACT_RESULT="$review_md_file"
+}
+
+run_implementation_phase() {
+    local phase="$1"
+    local story_id="$2"
+    local story_title="$3"
+    local review_round="${4:-}"
+
+    prepare_story_handoff_section "$story_id" "$story_title" "$phase" "$review_round"
+
+    case "$IMPLEMENTATION_AGENT" in
+        claude) run_claude_phase "$phase" "$story_id" "$story_title" "$ACTIVE_STORY_FILE" "$review_round" ;;
+        codex) run_codex_phase "$phase" "$story_id" "$story_title" "$ACTIVE_STORY_FILE" "$review_round" ;;
+    esac
+
+    validate_story_handoff_section "$story_id" "$ACTIVE_STORY_FILE"
+    record_implementation_history "$story_id" "$phase" "$review_round" "$ACTIVE_STORY_FILE"
+}
+
+run_review_round() {
+    local story_id="$1"
+    local story_title="$2"
+    local round="$3"
+    local story_file="$4"
+
+    case "$REVIEW_AGENT" in
+        claude) run_claude_review_round "$story_id" "$story_title" "$round" "$story_file" ;;
+        codex) run_codex_review_round "$story_id" "$story_title" "$round" "$story_file" ;;
+    esac
 }
 
 if [ "$MODE" = "help" ]; then
@@ -865,10 +1832,12 @@ echo -e "${GREEN}Looper starting...${NC}"
 echo "Project: $PROJECT_DIR"
 echo "State dir: $STATE_DIR"
 if [ "$MODE" = "watch" ]; then
-    echo "Mode: watch"
+    echo "Mode: watch ($WATCH_OUTPUT_MODE)"
 else
     echo "Max iterations: $MAX_ITERATIONS"
-    echo "Codex review rounds per story: $REVIEW_MAX_ROUNDS"
+    echo "Implementation agent: $(agent_display_name "$IMPLEMENTATION_AGENT")"
+    echo "Review agent: $(agent_display_name "$REVIEW_AGENT")"
+    echo "Review rounds per story: $REVIEW_MAX_ROUNDS"
 fi
 
 # Validate prerequisites.
@@ -886,13 +1855,19 @@ if ! [[ "$KEEP_LOGS" =~ ^[01]$ ]]; then
     echo -e "${RED}Error: LOOPER_KEEP_LOGS must be 0 or 1.${NC}"
     exit 1
 fi
+validate_agent_name "$IMPLEMENTATION_AGENT" "LOOPER_IMPLEMENTATION_AGENT"
+validate_agent_name "$REVIEW_AGENT" "LOOPER_REVIEW_AGENT"
 
 require_command git
 require_command jq
 
 if [ "$MODE" != "watch" ]; then
-    require_command claude
-    require_command codex
+    if [ "$IMPLEMENTATION_AGENT" = "claude" ] || [ "$REVIEW_AGENT" = "claude" ]; then
+        require_command claude
+    fi
+    if [ "$IMPLEMENTATION_AGENT" = "codex" ] || [ "$REVIEW_AGENT" = "codex" ]; then
+        require_command codex
+    fi
 fi
 
 if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -914,8 +1889,14 @@ if [ ! -f "$PRD_FILE" ]; then
     exit 1
 fi
 
-if [ ! -f "$PROMPT_FILE" ]; then
-    echo -e "${RED}Error: Prompt template not found at $PROMPT_FILE${NC}"
+if [ ! -f "$IMPLEMENTATION_PROMPT_FILE" ]; then
+    echo -e "${RED}Error: implementation prompt template not found at $IMPLEMENTATION_PROMPT_FILE${NC}"
+    echo "Looper installation may be broken. Re-run install.sh"
+    exit 1
+fi
+
+if [ ! -f "$SHARED_PROMPT_FILE" ]; then
+    echo -e "${RED}Error: shared prompt template not found at $SHARED_PROMPT_FILE${NC}"
     echo "Looper installation may be broken. Re-run install.sh"
     exit 1
 fi
@@ -926,19 +1907,24 @@ if [ ! -f "$REVIEW_PROMPT_FILE" ]; then
 fi
 
 if [ ! -f "$REVIEW_SCHEMA_FILE" ]; then
-    echo -e "${RED}Error: Codex review schema not found at $REVIEW_SCHEMA_FILE${NC}"
+    echo -e "${RED}Error: review schema not found at $REVIEW_SCHEMA_FILE${NC}"
     exit 1
 fi
 
-# Show config status
-if [ -f "$CONFIG_FILE" ]; then
-    echo "Project config: $CONFIG_FILE"
-else
-    echo -e "${YELLOW}No project config ($CONFIG_FILE) - using defaults${NC}"
+if [ -f "$PROMPT_SHARED_FILE" ]; then
+    echo "Shared prompt addendum: $PROMPT_SHARED_FILE"
 fi
-
-if [ -f "$LOCAL_PROMPT_FILE" ]; then
-    echo "Project prompt addendum: $LOCAL_PROMPT_FILE"
+if [ -f "$PROMPT_IMPLEMENTER_FILE" ]; then
+    echo "Implementer prompt addendum: $PROMPT_IMPLEMENTER_FILE"
+fi
+if [ -f "$PROMPT_REVIEWER_FILE" ]; then
+    echo "Reviewer prompt addendum: $PROMPT_REVIEWER_FILE"
+fi
+if [ -f "$LEGACY_LOCAL_PROMPT_FILE" ]; then
+    echo -e "${YELLOW}Ignoring deprecated prompt file: $LEGACY_LOCAL_PROMPT_FILE (use prompt.shared.md or prompt.implementer.md).${NC}"
+fi
+if [ -f "$LEGACY_REVIEW_PROMPT_FILE" ]; then
+    echo -e "${YELLOW}Ignoring deprecated prompt file: $LEGACY_REVIEW_PROMPT_FILE (use prompt.reviewer.md).${NC}"
 fi
 
 CURRENT_BRANCH="$(jq -r '.branchName // empty' "$PRD_FILE")"
@@ -995,34 +1981,43 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
 
     echo "Active story: $ACTIVE_STORY_ID - $ACTIVE_STORY_TITLE"
 
-    run_claude_phase "implementation" "$ACTIVE_STORY_ID"
+    ensure_story_state_file "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE"
+    INITIAL_PHASE="implementation"
+    INITIAL_REVIEW_ROUND=""
+    if story_should_resume_remediation "$ACTIVE_STORY_FILE"; then
+        INITIAL_PHASE="remediation"
+        INITIAL_REVIEW_ROUND="$(story_review_round "$ACTIVE_STORY_FILE")"
+        if [ -n "$INITIAL_REVIEW_ROUND" ]; then
+            echo "Resuming remediation for $ACTIVE_STORY_ID after review round $INITIAL_REVIEW_ROUND."
+        else
+            echo "Resuming remediation for $ACTIVE_STORY_ID based on unresolved review findings."
+        fi
+    fi
+
+    run_implementation_phase "$INITIAL_PHASE" "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$INITIAL_REVIEW_ROUND"
 
     if ! has_uncommitted_changes; then
-        echo -e "${YELLOW}No uncommitted changes after Claude implementation for $ACTIVE_STORY_ID; skipping review.${NC}"
+        echo -e "${YELLOW}No uncommitted changes after $(agent_display_name "$IMPLEMENTATION_AGENT") implementation for $ACTIVE_STORY_ID; skipping review.${NC}"
         sleep 2
         continue
     fi
 
     APPROVED=false
     APPROVED_ROUND=0
-    PREVIOUS_REVIEW_FILE=""
     APPROVED_REVIEW_JSON=""
-    APPROVED_REVIEW_ARTIFACT=""
 
     for round in $(seq 1 "$REVIEW_MAX_ROUNDS"); do
         REVIEW_JSON_RESULT=""
-        REVIEW_ARTIFACT_RESULT=""
-        run_codex_review_round "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$round" "$PREVIOUS_REVIEW_FILE"
+        run_review_round "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$round" "$ACTIVE_STORY_FILE"
         REVIEW_JSON_FILE="$REVIEW_JSON_RESULT"
-        REVIEW_ARTIFACT_FILE="$REVIEW_ARTIFACT_RESULT"
+        update_story_review_state "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$REVIEW_JSON_FILE" "$round" "$(agent_display_name "$REVIEW_AGENT")"
         VERDICT="$(jq -r '.verdict // empty' "$REVIEW_JSON_FILE")"
 
         if [ "$VERDICT" = "APPROVED" ]; then
-            echo -e "${GREEN}Codex review APPROVED ($ACTIVE_STORY_ID, round $round).${NC}"
+            echo -e "${GREEN}$(agent_display_name "$REVIEW_AGENT") review APPROVED ($ACTIVE_STORY_ID, round $round).${NC}"
             APPROVED=true
             APPROVED_ROUND="$round"
             APPROVED_REVIEW_JSON="$REVIEW_JSON_FILE"
-            APPROVED_REVIEW_ARTIFACT="$REVIEW_ARTIFACT_FILE"
             break
         fi
 
@@ -1031,25 +2026,26 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
             exit 1
         fi
 
-        echo -e "${YELLOW}Codex requested changes ($ACTIVE_STORY_ID, round $round).${NC}"
-        PREVIOUS_REVIEW_FILE="$REVIEW_ARTIFACT_FILE"
+        echo -e "${YELLOW}$(agent_display_name "$REVIEW_AGENT") requested changes ($ACTIVE_STORY_ID, round $round).${NC}"
 
         if [ "$round" -lt "$REVIEW_MAX_ROUNDS" ]; then
-            run_claude_phase "remediation" "$ACTIVE_STORY_ID" "$REVIEW_ARTIFACT_FILE"
+            run_implementation_phase "remediation" "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$round"
+            rm -f "$REVIEW_JSON_FILE"
         fi
-
-        rm -f "$REVIEW_JSON_FILE"
     done
 
     if [ "$APPROVED" != "true" ]; then
-        echo -e "${YELLOW}Max Codex review rounds reached for $ACTIVE_STORY_ID without approval. Leaving changes uncommitted.${NC}"
-        sleep 2
-        continue
+        record_review_limit_failure "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$REVIEW_JSON_FILE" "$REVIEW_MAX_ROUNDS" "$(agent_display_name "$REVIEW_AGENT")" "$ACTIVE_STORY_FILE"
+        rm -f "$REVIEW_JSON_FILE"
+        echo -e "${RED}Max review rounds reached for $ACTIVE_STORY_ID without approval from $(agent_display_name "$REVIEW_AGENT"). Stopping run for manual intervention.${NC}"
+        exit 1
     fi
 
-    record_approval_summary "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$APPROVED_REVIEW_JSON" "$APPROVED_REVIEW_ARTIFACT" "$APPROVED_ROUND"
+    record_approval_summary "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$APPROVED_REVIEW_JSON" "$ACTIVE_STORY_FILE" "$APPROVED_ROUND" "$(agent_display_name "$REVIEW_AGENT")"
     rm -f "$APPROVED_REVIEW_JSON"
     mark_story_passed "$ACTIVE_STORY_ID"
+    ensure_story_state_file "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE"
+    append_story_history_entry "$ACTIVE_STORY_FILE" "Story approved and marked passed."
     stage_and_commit_story "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" || true
 
     if [ "$(jq '[.userStories[] | select(.passes == false)] | length' "$PRD_FILE")" -eq 0 ]; then
