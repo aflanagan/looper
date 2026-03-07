@@ -262,17 +262,8 @@ start_phase_heartbeat() {
             break
         fi
 
-        local now last_update idle elapsed
+        local now
         now="$(epoch_now)"
-        last_update="$(get_file_mtime_epoch "$log_file")"
-        if [ "$last_update" -eq 0 ]; then
-            idle="no output yet"
-        else
-            idle="$(format_duration "$((now - last_update))") ago"
-        fi
-        elapsed="$(format_duration "$((now - started_at))")"
-
-        echo "  $phase_label ($story_id) | elapsed $elapsed | last log update $idle"
         write_run_state "running" "$story_id" "$story_title" \
             "$phase_kind" "$phase_label" "$log_file" "$log_format" "$started_at" "$now"
     done
@@ -324,9 +315,81 @@ tail_plain_log() {
     tail -n 40 -f "$log_file"
 }
 
+tail_claude_events() {
+    local log_file="$1"
+    tail -n 80 -f "$log_file" | jq --unbuffered -Rr '
+        def collapse:
+          tostring
+          | gsub("\\s+"; " ")
+          | sub("^ "; "")
+          | sub(" $"; "");
+        def truncate($n):
+          if length <= $n then .
+          else .[0:($n - 3)] + "..."
+          end;
+        def short($n):
+          collapse | truncate($n);
+        fromjson? as $event
+        | if $event == null then empty
+          elif ($event.type // "") == "assistant" then
+            ($event.message.content // [])
+            | .[]
+            | if (.type // "") == "tool_use" then
+                "[tool] " + (.name // "unknown")
+                + (
+                    if (.input.command? // null) != null then
+                      " :: " + ((.input.command // "") | short(320))
+                    elif (.input.query? // null) != null then
+                      " :: query=" + ((.input.query // "") | tostring | short(200))
+                    elif (.input // null) != null and ((.input | type) == "object") and ((.input | length) > 0) then
+                      " :: " + ((.input | tojson) | short(320))
+                    elif (.input // null) != null and ((.input | type) == "string") then
+                      " :: " + ((.input // "") | short(320))
+                    else
+                      ""
+                    end
+                  )
+              elif (.type // "") == "text" then
+                ((.text // "") | short(320))
+              else
+                empty
+              end
+          elif ($event.type // "") == "user" and ($event.tool_use_result // null) != null then
+            if ($event.tool_use_result.stdout // "") != "" then
+              "[tool-output] " + (($event.tool_use_result.stdout // "") | short(320))
+            elif ($event.tool_use_result.stderr // "") != "" then
+              "[tool-stderr] " + (($event.tool_use_result.stderr // "") | short(320))
+            elif ($event.tool_use_result.matches // [] | length) > 0 then
+              "[tool-output] " + (($event.tool_use_result.matches | join(", ")) | short(320))
+            else
+              (($event.message.content // [])
+                | map(select(.type == "tool_result") | .content)
+                | map(if type == "string" then . else tojson end)
+                | join(" ")
+                | short(320)
+              ) as $content
+              | if $content == "" then empty else "[tool-output] " + $content end
+            end
+          else
+            empty
+          end
+    '
+}
+
 tail_codex_events() {
     local log_file="$1"
     tail -n 80 -f "$log_file" | jq --unbuffered -Rr '
+        def collapse:
+          tostring
+          | gsub("\\s+"; " ")
+          | sub("^ "; "")
+          | sub(" $"; "");
+        def truncate($n):
+          if length <= $n then .
+          else .[0:($n - 3)] + "..."
+          end;
+        def short($n):
+          collapse | truncate($n);
         fromjson? as $event
         | if $event == null then empty
           elif ($event.type // "") == "event_msg" then ($event.payload.message // empty)
@@ -336,6 +399,23 @@ tail_codex_events() {
             "[tool] " + ($event.payload.name // "unknown")
           elif ($event.type // "") == "response_item" and ($event.payload.type // "") == "function_call_output" then
             "[tool-output] " + (($event.payload.output // "") | tostring | gsub("\\s+"; " ") | .[0:200])
+          elif ($event.type // "") == "item.completed" and ($event.item.type // "") == "reasoning" then
+            "[reasoning] " + (($event.item.text // "") | short(320))
+          elif ($event.type // "") == "item.started" and ($event.item.type // "") == "command_execution" then
+            "[command] " + (($event.item.command // "") | short(320))
+          elif ($event.type // "") == "item.completed" and ($event.item.type // "") == "command_execution" then
+            if ($event.item.exit_code // 0) != 0 then
+              "[command failed] exit " + (($event.item.exit_code // 0) | tostring) + " :: " + (($event.item.command // "") | short(220))
+            elif (($event.item.aggregated_output // "") | length) > 0 then
+              "[output] " + (($event.item.aggregated_output // "") | short(320))
+            else
+              empty
+            end
+          elif ($event.type // "") == "item.completed" and ($event.item.type // "") == "file_change" then
+            ($event.item.changes // [] | .[] | "[file] " + (.kind // "update") + " " + (.path // ""))
+          elif ($event.type // "") == "item.updated" and ($event.item.type // "") == "todo_list" then
+            ($event.item.items // []) as $items
+            | "[todo] " + (([$items[]? | select(.completed == true)] | length | tostring)) + "/" + (($items | length) | tostring) + " complete"
           else
             empty
           end
@@ -357,22 +437,18 @@ watch_active_run() {
             continue
         fi
 
-        local run_dir story_id story_title phase_label log_file log_format status_line
-        run_dir="$(jq -r '.run_dir // empty' "$RUN_STATE_FILE")"
+        local story_id story_title phase_label log_file log_format phase_banner
         story_id="$(jq -r '.story_id // empty' "$RUN_STATE_FILE")"
         story_title="$(jq -r '.story_title // empty' "$RUN_STATE_FILE")"
         phase_label="$(jq -r '.phase_label // empty' "$RUN_STATE_FILE")"
         log_file="$(jq -r '.active_log // empty' "$RUN_STATE_FILE")"
         log_format="$(jq -r '.log_format // "plain"' "$RUN_STATE_FILE")"
-        status_line="Story: $story_id"
+        phase_banner="$story_id"
         if [ -n "$story_title" ]; then
-            status_line="$status_line - $story_title"
+            phase_banner="$phase_banner - $story_title"
         fi
         if [ -n "$phase_label" ]; then
-            status_line="$status_line | Phase: $phase_label"
-        fi
-        if [ -n "$run_dir" ]; then
-            status_line="$status_line | Run dir: $run_dir"
+            phase_banner="$phase_banner | $phase_label"
         fi
 
         if [ "$log_file" != "$current_log" ] || [ "$log_format" != "$current_format" ]; then
@@ -383,11 +459,11 @@ watch_active_run() {
             current_log="$log_file"
             current_format="$log_format"
             echo ""
-            echo "$status_line"
-            echo "Log: $current_log"
-            echo "-------------------------------------------------------"
+            echo "== $phase_banner =="
             if [ "$current_format" = "codex-jsonl" ]; then
                 tail_codex_events "$current_log" &
+            elif [ "$current_format" = "claude-jsonl" ]; then
+                tail_claude_events "$current_log" &
             else
                 tail_plain_log "$current_log" &
             fi
@@ -716,17 +792,17 @@ run_claude_phase() {
     if [ "$phase" = "remediation" ] && [[ "$review_file" =~ round-([0-9]+)\.md$ ]]; then
         review_round="${BASH_REMATCH[1]}"
         phase_label="$phase_label (after round $review_round)"
-        log_file="$RUN_DIR/iter-${i}-claude-${phase}-round-${review_round}.log"
+        log_file="$RUN_DIR/iter-${i}-claude-${phase}-round-${review_round}.jsonl"
     else
-        log_file="$RUN_DIR/iter-${i}-claude-${phase}.log"
+        log_file="$RUN_DIR/iter-${i}-claude-${phase}.jsonl"
     fi
 
     prompt_input_file="$RUN_DIR/iter-${i}-claude-${phase}.prompt.txt"
     build_claude_input "$phase" "$story_id" "$review_file" > "$prompt_input_file"
 
     run_with_log "$story_id" "$ACTIVE_STORY_TITLE" \
-        "claude" "$phase_label" "$log_file" "plain" \
-        bash -lc 'cat "$1" | claude --dangerously-skip-permissions' -- "$prompt_input_file"
+        "claude" "$phase_label" "$log_file" "claude-jsonl" \
+        bash -lc 'cat "$1" | claude -p --verbose --output-format stream-json --dangerously-skip-permissions' -- "$prompt_input_file"
 }
 
 run_codex_review_round() {
