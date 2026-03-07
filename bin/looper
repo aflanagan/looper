@@ -1,6 +1,6 @@
 #!/bin/bash
-# Looper - Autonomous Claude + Codex Loop
-# Runs Claude Code and Codex review repeatedly until all PRD tasks complete.
+# Looper - Autonomous implementation + review loop
+# Runs implementation and review agents repeatedly until all PRD tasks complete.
 #
 # Usage:
 #   looper [max_iterations]
@@ -10,13 +10,15 @@
 #
 # Requires:
 #   - .looper/<branch-name>/prd.json in current directory
-#   - codex, claude, jq, git
+#   - claude and/or codex, plus jq and git
 #
 # Optional:
 #   - .looper/<branch-name>/config.md for project-specific quality checks/context
 #   - .looper/<branch-name>/prompt.local.md for project-specific prompt addendum
 #   - .looper/<branch-name>/review-prompt.md to override the default review prompt template
 #   - LOOPER_STATE_DIR to override the full state dir path
+#   - LOOPER_IMPLEMENTATION_AGENT (default claude)
+#   - LOOPER_REVIEW_AGENT (default codex)
 #   - LOOPER_REVIEW_MAX_ROUNDS (default 5)
 #   - LOOPER_KEEP_LOGS (default 0; set to 1 to keep temp run logs on failure)
 #   - LOOPER_REVIEW_PROMPT_FILE / LOOPER_REVIEW_SCHEMA_FILE to override review artifacts
@@ -76,6 +78,8 @@ REVIEWS_ROOT="$STATE_DIR/reviews"
 PROMPT_FILE="$LOOPER_DIR/templates/looper-prompt.md"
 REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$STATE_DIR/review-prompt.md}"
 REVIEW_SCHEMA_FILE="${LOOPER_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-review-schema.json}"
+IMPLEMENTATION_AGENT="${LOOPER_IMPLEMENTATION_AGENT:-claude}"
+REVIEW_AGENT="${LOOPER_REVIEW_AGENT:-codex}"
 REVIEW_MAX_ROUNDS="${LOOPER_REVIEW_MAX_ROUNDS:-5}"
 KEEP_LOGS="${LOOPER_KEEP_LOGS:-0}"
 RUN_STATE_FILE="$STATE_DIR/.active-run.json"
@@ -100,7 +104,9 @@ Usage:
 
 Environment:
   LOOPER_STATE_DIR            Override the full state dir path
-  LOOPER_REVIEW_MAX_ROUNDS    Number of Codex review rounds per story (default: 5)
+  LOOPER_IMPLEMENTATION_AGENT Agent for implementation/remediation (claude|codex; default: claude)
+  LOOPER_REVIEW_AGENT         Agent for review (claude|codex; default: codex)
+  LOOPER_REVIEW_MAX_ROUNDS    Number of review rounds per story (default: 5)
   LOOPER_KEEP_LOGS            Keep temp run logs on failure (default: 0)
 EOF
 }
@@ -111,6 +117,27 @@ require_command() {
         echo -e "${RED}Error: required command '$cmd' not found in PATH.${NC}"
         exit 1
     fi
+}
+
+validate_agent_name() {
+    local value="$1"
+    local var_name="$2"
+    case "$value" in
+        claude|codex) ;;
+        *)
+            echo -e "${RED}Error: $var_name must be 'claude' or 'codex'.${NC}"
+            exit 1
+            ;;
+    esac
+}
+
+agent_display_name() {
+    local agent="$1"
+    case "$agent" in
+        claude) printf "Claude" ;;
+        codex) printf "Codex" ;;
+        *) printf "%s" "$agent" ;;
+    esac
 }
 
 epoch_now() {
@@ -551,14 +578,17 @@ render_review_markdown() {
     local story_id="$3"
     local story_title="$4"
     local round="$5"
+    local reviewer_name="$6"
 
     jq -r \
         --arg story_id "$story_id" \
         --arg story_title "$story_title" \
-        --arg round "$round" '
-        "# Codex Review\n\n" +
+        --arg round "$round" \
+        --arg reviewer_name "$reviewer_name" '
+        "# Looper Review\n\n" +
         "- Story ID: " + $story_id + "\n" +
         "- Story title: " + $story_title + "\n" +
+        "- Reviewer: " + $reviewer_name + "\n" +
         "- Round: " + $round + "\n" +
         "- Verdict: " + (.verdict // "unknown") + "\n\n" +
         "## Summary\n\n" +
@@ -598,6 +628,7 @@ record_approval_summary() {
     local review_json_file="$3"
     local review_artifact_file="$4"
     local approved_round="$5"
+    local reviewer_name="$6"
 
     local rel_review_file summary findings_snapshot ac_failures test_gaps
     local note_line timestamp progress_timestamp
@@ -629,6 +660,7 @@ record_approval_summary() {
     {
         echo "## $progress_timestamp - $story_id: Review closure summary"
         echo "- Story title: $story_title"
+        echo "- Reviewer: $reviewer_name"
         echo "- Final verdict: APPROVED (round $approved_round of $REVIEW_MAX_ROUNDS)"
         echo "- Review artifact: $rel_review_file"
         echo "- Review summary: $summary"
@@ -639,7 +671,7 @@ record_approval_summary() {
         echo ""
     } >> "$PROGRESS_FILE"
 
-    note_line="Codex review: APPROVED in $approved_round round(s) at $timestamp; summary: $summary; review artifact: $rel_review_file"
+    note_line="$reviewer_name review: APPROVED in $approved_round round(s) at $timestamp; summary: $summary; review artifact: $rel_review_file"
     note_line="$(truncate_text "$(normalize_single_line "$note_line")" 500)"
 
     tmp="$(mktemp "$STATE_DIR/prd-notes.XXXXXX")"
@@ -650,7 +682,7 @@ record_approval_summary() {
     mv "$tmp" "$PRD_FILE"
 }
 
-build_claude_input() {
+build_phase_input() {
     local phase="$1"
     local story_id="$2"
     local review_file="${3:-}"
@@ -663,8 +695,8 @@ build_claude_input() {
     echo ""
     echo "## Looper Runtime Context"
     echo "- Active story id: $story_id"
-    echo "- Commit changes: NO (Looper commits after Codex review approval)."
-    echo "- Set \`passes\` to true: NO (Looper updates \`prd.json\` after Codex approval)."
+    echo "- Commit changes: NO (Looper commits after review approval)."
+    echo "- Set \`passes\` to true: NO (Looper updates \`prd.json\` after review approval)."
     prd_display="$PRD_FILE"
     if [[ "$prd_display" == "$PROJECT_DIR/"* ]]; then
         prd_display="${prd_display#$PROJECT_DIR/}"
@@ -704,6 +736,34 @@ build_claude_input() {
     fi
 }
 
+build_review_input() {
+    local story_id="$1"
+    local story_title="$2"
+    local round="$3"
+    local previous_review_file="${4:-}"
+    local progress_display prd_display
+
+    cat "$REVIEW_PROMPT_FILE"
+    echo ""
+    echo "## Runtime Context"
+    echo "- Active story ID: $story_id"
+    echo "- Active story title: $story_title"
+    echo "- Review round: $round"
+    prd_display="$PRD_FILE"
+    if [[ "$prd_display" == "$PROJECT_DIR/"* ]]; then
+        prd_display="${prd_display#$PROJECT_DIR/}"
+    fi
+    echo "- PRD file: $prd_display"
+    progress_display="$PROGRESS_FILE"
+    if [[ "$progress_display" == "$PROJECT_DIR/"* ]]; then
+        progress_display="${progress_display#$PROJECT_DIR/}"
+    fi
+    echo "- Progress log file: $progress_display"
+    if [ -n "$previous_review_file" ]; then
+        echo "- Previous review artifact: $previous_review_file"
+    fi
+}
+
 run_claude_phase() {
     local phase="$1"
     local story_id="$2"
@@ -722,11 +782,65 @@ run_claude_phase() {
     fi
 
     prompt_input_file="$RUN_DIR/iter-${i}-claude-${phase}.prompt.txt"
-    build_claude_input "$phase" "$story_id" "$review_file" > "$prompt_input_file"
+    build_phase_input "$phase" "$story_id" "$review_file" > "$prompt_input_file"
 
     run_with_log "$story_id" "$ACTIVE_STORY_TITLE" \
         "claude" "$phase_label" "$log_file" "plain" \
         bash -lc 'cat "$1" | claude --dangerously-skip-permissions' -- "$prompt_input_file"
+}
+
+run_codex_phase() {
+    local phase="$1"
+    local story_id="$2"
+    local review_file="${3:-}"
+    local prompt_input_file log_file phase_label review_round
+
+    echo "Running Codex phase '$phase' for $story_id..."
+
+    phase_label="Codex $phase"
+    if [ "$phase" = "remediation" ] && [[ "$review_file" =~ round-([0-9]+)\.md$ ]]; then
+        review_round="${BASH_REMATCH[1]}"
+        phase_label="$phase_label (after round $review_round)"
+        log_file="$RUN_DIR/iter-${i}-codex-${phase}-round-${review_round}.log"
+    else
+        log_file="$RUN_DIR/iter-${i}-codex-${phase}.log"
+    fi
+
+    prompt_input_file="$RUN_DIR/iter-${i}-codex-${phase}.prompt.txt"
+    build_phase_input "$phase" "$story_id" "$review_file" > "$prompt_input_file"
+
+    run_with_log "$story_id" "$ACTIVE_STORY_TITLE" \
+        "codex" "$phase_label" "$log_file" "plain" \
+        bash -lc 'cat "$1" | codex exec -a never -s workspace-write -C "$2" --skip-git-repo-check --ephemeral -' -- \
+        "$prompt_input_file" "$PROJECT_DIR"
+}
+
+run_claude_review_round() {
+    local story_id="$1"
+    local story_title="$2"
+    local round="$3"
+    local previous_review_file="${4:-}"
+
+    local review_dir review_md_file review_json_tmp review_input_file log_file review_schema_json
+    review_dir="$REVIEWS_ROOT/$story_id"
+    review_md_file="$review_dir/round-$round.md"
+    review_json_tmp="$(mktemp "$RUN_DIR/review-round-${story_id}-${round}.XXXXXX.json")"
+    review_input_file="$RUN_DIR/iter-${i}-claude-review-round-${round}.prompt.txt"
+    log_file="$RUN_DIR/iter-${i}-claude-review-round-${round}.log"
+    review_schema_json="$(cat "$REVIEW_SCHEMA_FILE")"
+
+    mkdir -p "$review_dir"
+
+    echo "Running Claude review round $round for $story_id..." >&2
+    build_review_input "$story_id" "$story_title" "$round" "$previous_review_file" > "$review_input_file"
+
+    run_with_log "$story_id" "$story_title" \
+        "claude-review" "Claude review round $round" "$log_file" "plain" \
+        bash -lc 'cat "$1" | claude -p --dangerously-skip-permissions --output-format json --json-schema "$2" | tee "$3"' -- \
+        "$review_input_file" "$review_schema_json" "$review_json_tmp"
+
+    render_review_markdown "$review_json_tmp" "$review_md_file" "$story_id" "$story_title" "$round" "Claude"
+    printf "%s\t%s\n" "$review_json_tmp" "$review_md_file"
 }
 
 run_codex_review_round() {
@@ -736,7 +850,6 @@ run_codex_review_round() {
     local previous_review_file="${4:-}"
 
     local review_dir review_md_file review_json_tmp review_input_file events_file
-    local progress_display prd_display
     review_dir="$REVIEWS_ROOT/$story_id"
     review_md_file="$review_dir/round-$round.md"
     review_json_tmp="$(mktemp "$RUN_DIR/review-round-${story_id}-${round}.XXXXXX.json")"
@@ -746,35 +859,38 @@ run_codex_review_round() {
     mkdir -p "$review_dir"
 
     echo "Running Codex review round $round for $story_id..." >&2
-    {
-        cat "$REVIEW_PROMPT_FILE"
-        echo ""
-        echo "## Runtime Context"
-        echo "- Active story ID: $story_id"
-        echo "- Active story title: $story_title"
-        echo "- Review round: $round"
-        prd_display="$PRD_FILE"
-        if [[ "$prd_display" == "$PROJECT_DIR/"* ]]; then
-            prd_display="${prd_display#$PROJECT_DIR/}"
-        fi
-        echo "- PRD file: $prd_display"
-        progress_display="$PROGRESS_FILE"
-        if [[ "$progress_display" == "$PROJECT_DIR/"* ]]; then
-            progress_display="${progress_display#$PROJECT_DIR/}"
-        fi
-        echo "- Progress log file: $progress_display"
-        if [ -n "$previous_review_file" ]; then
-            echo "- Previous review artifact: $previous_review_file"
-        fi
-    } > "$review_input_file"
+    build_review_input "$story_id" "$story_title" "$round" "$previous_review_file" > "$review_input_file"
 
     run_with_log "$story_id" "$story_title" \
         "codex" "Codex review round $round" "$events_file" "codex-jsonl" \
         bash -lc 'cat "$1" | codex -a never -s workspace-write exec --ephemeral --json --output-schema "$2" -o "$3" -' -- \
         "$review_input_file" "$REVIEW_SCHEMA_FILE" "$review_json_tmp"
 
-    render_review_markdown "$review_json_tmp" "$review_md_file" "$story_id" "$story_title" "$round"
+    render_review_markdown "$review_json_tmp" "$review_md_file" "$story_id" "$story_title" "$round" "Codex"
     printf "%s\t%s\n" "$review_json_tmp" "$review_md_file"
+}
+
+run_implementation_phase() {
+    local phase="$1"
+    local story_id="$2"
+    local review_file="${3:-}"
+
+    case "$IMPLEMENTATION_AGENT" in
+        claude) run_claude_phase "$phase" "$story_id" "$review_file" ;;
+        codex) run_codex_phase "$phase" "$story_id" "$review_file" ;;
+    esac
+}
+
+run_review_round() {
+    local story_id="$1"
+    local story_title="$2"
+    local round="$3"
+    local previous_review_file="${4:-}"
+
+    case "$REVIEW_AGENT" in
+        claude) run_claude_review_round "$story_id" "$story_title" "$round" "$previous_review_file" ;;
+        codex) run_codex_review_round "$story_id" "$story_title" "$round" "$previous_review_file" ;;
+    esac
 }
 
 if [ "$MODE" = "help" ]; then
@@ -789,7 +905,9 @@ if [ "$MODE" = "watch" ]; then
     echo "Mode: watch"
 else
     echo "Max iterations: $MAX_ITERATIONS"
-    echo "Codex review rounds per story: $REVIEW_MAX_ROUNDS"
+    echo "Implementation agent: $(agent_display_name "$IMPLEMENTATION_AGENT")"
+    echo "Review agent: $(agent_display_name "$REVIEW_AGENT")"
+    echo "Review rounds per story: $REVIEW_MAX_ROUNDS"
 fi
 
 # Validate prerequisites.
@@ -807,13 +925,19 @@ if ! [[ "$KEEP_LOGS" =~ ^[01]$ ]]; then
     echo -e "${RED}Error: LOOPER_KEEP_LOGS must be 0 or 1.${NC}"
     exit 1
 fi
+validate_agent_name "$IMPLEMENTATION_AGENT" "LOOPER_IMPLEMENTATION_AGENT"
+validate_agent_name "$REVIEW_AGENT" "LOOPER_REVIEW_AGENT"
 
 require_command git
 require_command jq
 
 if [ "$MODE" != "watch" ]; then
-    require_command claude
-    require_command codex
+    if [ "$IMPLEMENTATION_AGENT" = "claude" ] || [ "$REVIEW_AGENT" = "claude" ]; then
+        require_command claude
+    fi
+    if [ "$IMPLEMENTATION_AGENT" = "codex" ] || [ "$REVIEW_AGENT" = "codex" ]; then
+        require_command codex
+    fi
 fi
 
 if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -847,7 +971,7 @@ if [ ! -f "$REVIEW_PROMPT_FILE" ]; then
 fi
 
 if [ ! -f "$REVIEW_SCHEMA_FILE" ]; then
-    echo -e "${RED}Error: Codex review schema not found at $REVIEW_SCHEMA_FILE${NC}"
+    echo -e "${RED}Error: review schema not found at $REVIEW_SCHEMA_FILE${NC}"
     exit 1
 fi
 
@@ -916,10 +1040,10 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
 
     echo "Active story: $ACTIVE_STORY_ID - $ACTIVE_STORY_TITLE"
 
-    run_claude_phase "implementation" "$ACTIVE_STORY_ID"
+    run_implementation_phase "implementation" "$ACTIVE_STORY_ID"
 
     if ! has_uncommitted_changes; then
-        echo -e "${YELLOW}No uncommitted changes after Claude implementation for $ACTIVE_STORY_ID; skipping review.${NC}"
+        echo -e "${YELLOW}No uncommitted changes after $(agent_display_name "$IMPLEMENTATION_AGENT") implementation for $ACTIVE_STORY_ID; skipping review.${NC}"
         sleep 2
         continue
     fi
@@ -931,12 +1055,12 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
     APPROVED_REVIEW_ARTIFACT=""
 
     for round in $(seq 1 "$REVIEW_MAX_ROUNDS"); do
-        REVIEW_RESULT="$(run_codex_review_round "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$round" "$PREVIOUS_REVIEW_FILE")"
+        REVIEW_RESULT="$(run_review_round "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$round" "$PREVIOUS_REVIEW_FILE")"
         IFS=$'\t' read -r REVIEW_JSON_FILE REVIEW_ARTIFACT_FILE <<< "$REVIEW_RESULT"
         VERDICT="$(jq -r '.verdict // empty' "$REVIEW_JSON_FILE")"
 
         if [ "$VERDICT" = "APPROVED" ]; then
-            echo -e "${GREEN}Codex review APPROVED ($ACTIVE_STORY_ID, round $round).${NC}"
+            echo -e "${GREEN}$(agent_display_name "$REVIEW_AGENT") review APPROVED ($ACTIVE_STORY_ID, round $round).${NC}"
             APPROVED=true
             APPROVED_ROUND="$round"
             APPROVED_REVIEW_JSON="$REVIEW_JSON_FILE"
@@ -949,23 +1073,23 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
             exit 1
         fi
 
-        echo -e "${YELLOW}Codex requested changes ($ACTIVE_STORY_ID, round $round).${NC}"
+        echo -e "${YELLOW}$(agent_display_name "$REVIEW_AGENT") requested changes ($ACTIVE_STORY_ID, round $round).${NC}"
         PREVIOUS_REVIEW_FILE="$REVIEW_ARTIFACT_FILE"
 
         if [ "$round" -lt "$REVIEW_MAX_ROUNDS" ]; then
-            run_claude_phase "remediation" "$ACTIVE_STORY_ID" "$REVIEW_ARTIFACT_FILE"
+            run_implementation_phase "remediation" "$ACTIVE_STORY_ID" "$REVIEW_ARTIFACT_FILE"
         fi
 
         rm -f "$REVIEW_JSON_FILE"
     done
 
     if [ "$APPROVED" != "true" ]; then
-        echo -e "${YELLOW}Max Codex review rounds reached for $ACTIVE_STORY_ID without approval. Leaving changes uncommitted.${NC}"
+        echo -e "${YELLOW}Max review rounds reached for $ACTIVE_STORY_ID without approval from $(agent_display_name "$REVIEW_AGENT"). Leaving changes uncommitted.${NC}"
         sleep 2
         continue
     fi
 
-    record_approval_summary "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$APPROVED_REVIEW_JSON" "$APPROVED_REVIEW_ARTIFACT" "$APPROVED_ROUND"
+    record_approval_summary "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$APPROVED_REVIEW_JSON" "$APPROVED_REVIEW_ARTIFACT" "$APPROVED_ROUND" "$(agent_display_name "$REVIEW_AGENT")"
     rm -f "$APPROVED_REVIEW_JSON"
     mark_story_passed "$ACTIVE_STORY_ID"
     stage_and_commit_story "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" || true
