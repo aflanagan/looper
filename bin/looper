@@ -2,8 +2,11 @@
 # Looper - Autonomous Claude + Codex Loop
 # Runs Claude Code and Codex review repeatedly until all PRD tasks complete.
 #
-# Usage: looper [max_iterations]
-# Default: 10 iterations
+# Usage:
+#   looper [max_iterations]
+#   looper watch
+#
+# Default max iterations: 10
 #
 # Requires:
 #   - .looper/<branch-name>/prd.json in current directory
@@ -15,7 +18,7 @@
 #   - .looper/<branch-name>/review-prompt.md to override the default review prompt template
 #   - LOOPER_STATE_DIR to override the full state dir path
 #   - LOOPER_REVIEW_MAX_ROUNDS (default 5)
-#   - LOOPER_REVIEW_SAVE_EVENTS (default 0; set to 1 to persist Codex jsonl event logs)
+#   - LOOPER_KEEP_LOGS (default 0; set to 1 to keep temp run logs on failure)
 #   - LOOPER_REVIEW_PROMPT_FILE / LOOPER_REVIEW_SCHEMA_FILE to override review artifacts
 
 set -euo pipefail
@@ -24,10 +27,26 @@ set -euo pipefail
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
 LOOPER_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 
-MAX_ITERATIONS=${1:-10}
+MODE="run"
+MAX_ITERATIONS=10
+if [ "${1:-}" = "watch" ]; then
+    MODE="watch"
+    shift
+elif [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    MODE="help"
+    shift
+elif [ $# -gt 0 ]; then
+    MAX_ITERATIONS="$1"
+    shift
+fi
+
 PROJECT_DIR="$PWD"
 
-CURRENT_GIT_BRANCH_RAW="$(git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown-branch")"
+CURRENT_GIT_BRANCH_RAW="$(
+    git -C "$PROJECT_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null \
+        || git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null \
+        || echo "unknown-branch"
+)"
 STATE_BRANCH_NAME="$CURRENT_GIT_BRANCH_RAW"
 case "$STATE_BRANCH_NAME" in
     codex/*|looper/*)
@@ -58,7 +77,10 @@ PROMPT_FILE="$LOOPER_DIR/templates/looper-prompt.md"
 REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$STATE_DIR/review-prompt.md}"
 REVIEW_SCHEMA_FILE="${LOOPER_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-review-schema.json}"
 REVIEW_MAX_ROUNDS="${LOOPER_REVIEW_MAX_ROUNDS:-5}"
-REVIEW_SAVE_EVENTS="${LOOPER_REVIEW_SAVE_EVENTS:-0}"
+KEEP_LOGS="${LOOPER_KEEP_LOGS:-0}"
+RUN_STATE_FILE="$STATE_DIR/.active-run.json"
+RUN_DIR=""
+PHASE_HEARTBEAT_INTERVAL=10
 
 if [ ! -f "$REVIEW_PROMPT_FILE" ]; then
     REVIEW_PROMPT_FILE="$LOOPER_DIR/templates/review-prompt.md"
@@ -70,12 +92,320 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+print_usage() {
+    cat <<EOF
+Usage:
+  looper [max_iterations]
+  looper watch
+
+Environment:
+  LOOPER_STATE_DIR            Override the full state dir path
+  LOOPER_REVIEW_MAX_ROUNDS    Number of Codex review rounds per story (default: 5)
+  LOOPER_KEEP_LOGS            Keep temp run logs on failure (default: 0)
+EOF
+}
+
 require_command() {
     local cmd="$1"
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo -e "${RED}Error: required command '$cmd' not found in PATH.${NC}"
         exit 1
     fi
+}
+
+epoch_now() {
+    date +%s
+}
+
+format_duration() {
+    local seconds="$1"
+    local minutes hours
+    if [ "$seconds" -lt 60 ]; then
+        printf "%ss" "$seconds"
+        return 0
+    fi
+
+    minutes=$((seconds / 60))
+    seconds=$((seconds % 60))
+    if [ "$minutes" -lt 60 ]; then
+        printf "%sm%02ds" "$minutes" "$seconds"
+        return 0
+    fi
+
+    hours=$((minutes / 60))
+    minutes=$((minutes % 60))
+    printf "%sh%02dm%02ds" "$hours" "$minutes" "$seconds"
+}
+
+get_file_mtime_epoch() {
+    local file="$1"
+    if [ ! -e "$file" ]; then
+        printf "0"
+        return 0
+    fi
+
+    if stat -f %m "$file" >/dev/null 2>&1; then
+        stat -f %m "$file"
+        return 0
+    fi
+
+    stat -c %Y "$file"
+}
+
+write_run_state() {
+    local status="$1"
+    local story_id="$2"
+    local story_title="$3"
+    local phase_kind="$4"
+    local phase_label="$5"
+    local log_file="$6"
+    local log_format="${7:-plain}"
+    local started_at="${8:-}"
+    local heartbeat_at="${9:-}"
+
+    local tmp
+
+    mkdir -p "$STATE_DIR"
+    tmp="$(mktemp "$STATE_DIR/run-state.XXXXXX")"
+    jq -n \
+        --arg pid "$$" \
+        --arg project_dir "$PROJECT_DIR" \
+        --arg state_dir "$STATE_DIR" \
+        --arg run_dir "$RUN_DIR" \
+        --arg status "$status" \
+        --arg branch "$CURRENT_BRANCH" \
+        --arg story_id "$story_id" \
+        --arg story_title "$story_title" \
+        --arg phase_kind "$phase_kind" \
+        --arg phase_label "$phase_label" \
+        --arg log_file "$log_file" \
+        --arg log_format "$log_format" \
+        --arg started_at "$started_at" \
+        --arg heartbeat_at "$heartbeat_at" \
+        '{
+            pid: ($pid | tonumber),
+            project_dir: $project_dir,
+            state_dir: $state_dir,
+            run_dir: $run_dir,
+            branch: $branch,
+            status: $status,
+            story_id: $story_id,
+            story_title: $story_title,
+            phase_kind: $phase_kind,
+            phase_label: $phase_label,
+            active_log: $log_file,
+            log_format: $log_format,
+            started_at: $started_at,
+            heartbeat_at: $heartbeat_at
+        }' > "$tmp"
+    mv "$tmp" "$RUN_STATE_FILE"
+}
+
+init_run_dir() {
+    if [ -n "${TMPDIR:-}" ]; then
+        RUN_DIR="${TMPDIR%/}/looper-$$"
+    else
+        RUN_DIR="/tmp/looper-$$"
+    fi
+    rm -rf "$RUN_DIR"
+    mkdir -p "$RUN_DIR"
+}
+
+cleanup_run_artifacts() {
+    local exit_code="${1:-0}"
+    local keep_logs=0
+
+    rm -f "$RUN_STATE_FILE"
+
+    if [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ]; then
+        return 0
+    fi
+
+    if [ "$exit_code" -ne 0 ] && [ "$KEEP_LOGS" = "1" ]; then
+        keep_logs=1
+    fi
+
+    if [ "$keep_logs" -eq 1 ]; then
+        echo -e "${YELLOW}Looper run failed; preserving temp logs.${NC}"
+        echo "Run dir: $RUN_DIR"
+        return 0
+    fi
+
+    rm -rf "$RUN_DIR"
+}
+
+on_exit() {
+    local exit_code=$?
+    trap - EXIT
+    cleanup_run_artifacts "$exit_code"
+}
+
+on_signal() {
+    trap - EXIT INT TERM
+    cleanup_run_artifacts 130
+    exit 130
+}
+
+start_phase_heartbeat() {
+    local phase_kind="$1"
+    local phase_label="$2"
+    local story_id="$3"
+    local story_title="$4"
+    local log_file="$5"
+    local log_format="$6"
+    local started_at="$7"
+    local monitor_pid="$8"
+
+    while kill -0 "$monitor_pid" >/dev/null 2>&1; do
+        sleep "$PHASE_HEARTBEAT_INTERVAL"
+        if ! kill -0 "$monitor_pid" >/dev/null 2>&1; then
+            break
+        fi
+
+        local now last_update idle elapsed
+        now="$(epoch_now)"
+        last_update="$(get_file_mtime_epoch "$log_file")"
+        if [ "$last_update" -eq 0 ]; then
+            idle="no output yet"
+        else
+            idle="$(format_duration "$((now - last_update))") ago"
+        fi
+        elapsed="$(format_duration "$((now - started_at))")"
+
+        echo "  $phase_label ($story_id) | elapsed $elapsed | last log update $idle"
+        write_run_state "running" "$story_id" "$story_title" \
+            "$phase_kind" "$phase_label" "$log_file" "$log_format" "$started_at" "$now"
+    done
+}
+
+run_with_log() {
+    local story_id="$1"
+    local story_title="$2"
+    local phase_kind="$3"
+    local phase_label="$4"
+    local log_file="$5"
+    local log_format="$6"
+    shift 6
+
+    local started_at cmd_pid heartbeat_pid exit_code
+
+    mkdir -p "$RUN_DIR"
+    : > "$log_file"
+    started_at="$(epoch_now)"
+    write_run_state "running" "$story_id" "$story_title" \
+        "$phase_kind" "$phase_label" "$log_file" "$log_format" "$started_at" "$started_at"
+
+    (
+        "$@"
+    ) >"$log_file" 2>&1 &
+    cmd_pid=$!
+
+    start_phase_heartbeat "$phase_kind" "$phase_label" "$story_id" "$story_title" "$log_file" "$log_format" "$started_at" "$cmd_pid" &
+    heartbeat_pid=$!
+
+    set +e
+    wait "$cmd_pid"
+    exit_code=$?
+    set -e
+
+    kill "$heartbeat_pid" >/dev/null 2>&1 || true
+    wait "$heartbeat_pid" 2>/dev/null || true
+
+    local finished_at
+    finished_at="$(epoch_now)"
+    write_run_state "idle" "$story_id" "$story_title" \
+        "$phase_kind" "$phase_label" "$log_file" "$log_format" "$started_at" "$finished_at"
+
+    return "$exit_code"
+}
+
+tail_plain_log() {
+    local log_file="$1"
+    tail -n 40 -f "$log_file"
+}
+
+tail_codex_events() {
+    local log_file="$1"
+    tail -n 80 -f "$log_file" | jq --unbuffered -Rr '
+        fromjson? as $event
+        | if $event == null then empty
+          elif ($event.type // "") == "event_msg" then ($event.payload.message // empty)
+          elif ($event.type // "") == "response_item" and ($event.payload.type // "") == "message" then
+            ($event.payload.content // [] | map(select(.type == "output_text") | .text) | join(""))
+          elif ($event.type // "") == "response_item" and ($event.payload.type // "") == "function_call" then
+            "[tool] " + ($event.payload.name // "unknown")
+          elif ($event.type // "") == "response_item" and ($event.payload.type // "") == "function_call_output" then
+            "[tool-output] " + (($event.payload.output // "") | tostring | gsub("\\s+"; " ") | .[0:200])
+          else
+            empty
+          end
+    '
+}
+
+watch_active_run() {
+    local current_log="" current_format="" tail_pid=""
+    local marker_waited=0
+
+    echo "Watching looper activity for $STATE_DIR"
+    while :; do
+        if [ ! -f "$RUN_STATE_FILE" ]; then
+            if [ "$marker_waited" -eq 0 ]; then
+                echo "Waiting for an active looper run..."
+                marker_waited=1
+            fi
+            sleep 1
+            continue
+        fi
+
+        local run_dir story_id story_title phase_label log_file log_format status_line
+        run_dir="$(jq -r '.run_dir // empty' "$RUN_STATE_FILE")"
+        story_id="$(jq -r '.story_id // empty' "$RUN_STATE_FILE")"
+        story_title="$(jq -r '.story_title // empty' "$RUN_STATE_FILE")"
+        phase_label="$(jq -r '.phase_label // empty' "$RUN_STATE_FILE")"
+        log_file="$(jq -r '.active_log // empty' "$RUN_STATE_FILE")"
+        log_format="$(jq -r '.log_format // "plain"' "$RUN_STATE_FILE")"
+        status_line="Story: $story_id"
+        if [ -n "$story_title" ]; then
+            status_line="$status_line - $story_title"
+        fi
+        if [ -n "$phase_label" ]; then
+            status_line="$status_line | Phase: $phase_label"
+        fi
+        if [ -n "$run_dir" ]; then
+            status_line="$status_line | Run dir: $run_dir"
+        fi
+
+        if [ "$log_file" != "$current_log" ] || [ "$log_format" != "$current_format" ]; then
+            if [ -n "$tail_pid" ]; then
+                kill "$tail_pid" >/dev/null 2>&1 || true
+                wait "$tail_pid" 2>/dev/null || true
+            fi
+            current_log="$log_file"
+            current_format="$log_format"
+            echo ""
+            echo "$status_line"
+            echo "Log: $current_log"
+            echo "-------------------------------------------------------"
+            if [ "$current_format" = "codex-jsonl" ]; then
+                tail_codex_events "$current_log" &
+            else
+                tail_plain_log "$current_log" &
+            fi
+            tail_pid=$!
+        fi
+
+        sleep 1
+        if [ ! -f "$RUN_STATE_FILE" ]; then
+            break
+        fi
+    done
+
+    if [ -n "$tail_pid" ]; then
+        kill "$tail_pid" >/dev/null 2>&1 || true
+        wait "$tail_pid" 2>/dev/null || true
+    fi
+    echo ""
+    echo "Looper run ended."
 }
 
 get_active_story_id() {
@@ -146,6 +476,7 @@ has_uncommitted_changes() {
             [ -n "$(git -C "$PROJECT_DIR" status --porcelain -- . \
                 ":(exclude)$rel_state_dir/reviews/**" \
                 ":(exclude)$rel_state_dir/progress.txt" \
+                ":(exclude)$rel_state_dir/.active-run.json" \
                 ":(exclude)$rel_state_dir/archive/**")" ]
             return
         fi
@@ -181,6 +512,7 @@ stage_and_commit_story() {
         git -C "$PROJECT_DIR" reset -q -- \
             "$rel_state_dir/reviews" \
             "$rel_state_dir/progress.txt" \
+            "$rel_state_dir/.active-run.json" \
             "$rel_state_dir/archive" 2>/dev/null || true
     fi
 
@@ -376,9 +708,25 @@ run_claude_phase() {
     local phase="$1"
     local story_id="$2"
     local review_file="${3:-}"
+    local prompt_input_file log_file phase_label review_round
 
     echo "Running Claude phase '$phase' for $story_id..."
-    build_claude_input "$phase" "$story_id" "$review_file" | claude --dangerously-skip-permissions >/dev/null
+
+    phase_label="Claude $phase"
+    if [ "$phase" = "remediation" ] && [[ "$review_file" =~ round-([0-9]+)\.md$ ]]; then
+        review_round="${BASH_REMATCH[1]}"
+        phase_label="$phase_label (after round $review_round)"
+        log_file="$RUN_DIR/iter-${i}-claude-${phase}-round-${review_round}.log"
+    else
+        log_file="$RUN_DIR/iter-${i}-claude-${phase}.log"
+    fi
+
+    prompt_input_file="$RUN_DIR/iter-${i}-claude-${phase}.prompt.txt"
+    build_claude_input "$phase" "$story_id" "$review_file" > "$prompt_input_file"
+
+    run_with_log "$story_id" "$ACTIVE_STORY_TITLE" \
+        "claude" "$phase_label" "$log_file" "plain" \
+        bash -lc 'cat "$1" | claude --dangerously-skip-permissions' -- "$prompt_input_file"
 }
 
 run_codex_review_round() {
@@ -387,19 +735,15 @@ run_codex_review_round() {
     local round="$3"
     local previous_review_file="${4:-}"
 
-    local review_dir review_md_file review_json_tmp events_file
-    local progress_display prd_display codex_stdout_target
+    local review_dir review_md_file review_json_tmp review_input_file events_file
+    local progress_display prd_display
     review_dir="$REVIEWS_ROOT/$story_id"
     review_md_file="$review_dir/round-$round.md"
-    review_json_tmp="$(mktemp "${TMPDIR:-/tmp}/looper-review-round-${story_id}-${round}.XXXXXX.json")"
+    review_json_tmp="$(mktemp "$RUN_DIR/review-round-${story_id}-${round}.XXXXXX.json")"
+    review_input_file="$RUN_DIR/iter-${i}-codex-review-round-${round}.prompt.txt"
+    events_file="$RUN_DIR/iter-${i}-codex-review-round-${round}.jsonl"
 
     mkdir -p "$review_dir"
-
-    codex_stdout_target="/dev/null"
-    if [ "$REVIEW_SAVE_EVENTS" = "1" ]; then
-        events_file="$review_dir/round-$round-events.jsonl"
-        codex_stdout_target="$events_file"
-    fi
 
     echo "Running Codex review round $round for $story_id..." >&2
     {
@@ -422,32 +766,55 @@ run_codex_review_round() {
         if [ -n "$previous_review_file" ]; then
             echo "- Previous review artifact: $previous_review_file"
         fi
-    } | codex -a never -s workspace-write exec --ephemeral --json --output-schema "$REVIEW_SCHEMA_FILE" -o "$review_json_tmp" - > "$codex_stdout_target"
+    } > "$review_input_file"
+
+    run_with_log "$story_id" "$story_title" \
+        "codex" "Codex review round $round" "$events_file" "codex-jsonl" \
+        bash -lc 'cat "$1" | codex -a never -s workspace-write exec --ephemeral --json --output-schema "$2" -o "$3" -' -- \
+        "$review_input_file" "$REVIEW_SCHEMA_FILE" "$review_json_tmp"
 
     render_review_markdown "$review_json_tmp" "$review_md_file" "$story_id" "$story_title" "$round"
     printf "%s\t%s\n" "$review_json_tmp" "$review_md_file"
 }
 
+if [ "$MODE" = "help" ]; then
+    print_usage
+    exit 0
+fi
+
 echo -e "${GREEN}Looper starting...${NC}"
 echo "Project: $PROJECT_DIR"
 echo "State dir: $STATE_DIR"
-echo "Max iterations: $MAX_ITERATIONS"
-echo "Codex review rounds per story: $REVIEW_MAX_ROUNDS"
+if [ "$MODE" = "watch" ]; then
+    echo "Mode: watch"
+else
+    echo "Max iterations: $MAX_ITERATIONS"
+    echo "Codex review rounds per story: $REVIEW_MAX_ROUNDS"
+fi
 
 # Validate prerequisites.
+if [ "$MODE" != "watch" ]; then
+    if ! [[ "$MAX_ITERATIONS" =~ ^[0-9]+$ ]] || [ "$MAX_ITERATIONS" -lt 1 ]; then
+        echo -e "${RED}Error: max_iterations must be a positive integer.${NC}"
+        exit 1
+    fi
+fi
 if ! [[ "$REVIEW_MAX_ROUNDS" =~ ^[0-9]+$ ]] || [ "$REVIEW_MAX_ROUNDS" -lt 1 ]; then
     echo -e "${RED}Error: LOOPER_REVIEW_MAX_ROUNDS must be a positive integer.${NC}"
     exit 1
 fi
-if ! [[ "$REVIEW_SAVE_EVENTS" =~ ^[01]$ ]]; then
-    echo -e "${RED}Error: LOOPER_REVIEW_SAVE_EVENTS must be 0 or 1.${NC}"
+if ! [[ "$KEEP_LOGS" =~ ^[01]$ ]]; then
+    echo -e "${RED}Error: LOOPER_KEEP_LOGS must be 0 or 1.${NC}"
     exit 1
 fi
 
 require_command git
 require_command jq
-require_command claude
-require_command codex
+
+if [ "$MODE" != "watch" ]; then
+    require_command claude
+    require_command codex
+fi
 
 if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo -e "${RED}Error: Looper must run inside a git repository.${NC}"
@@ -516,6 +883,15 @@ if [ ! -f "$PROGRESS_FILE" ]; then
     echo "---" >> "$PROGRESS_FILE"
     echo "" >> "$PROGRESS_FILE"
 fi
+
+if [ "$MODE" = "watch" ]; then
+    watch_active_run
+    exit 0
+fi
+
+init_run_dir
+trap on_exit EXIT
+trap on_signal INT TERM
 
 for i in $(seq 1 "$MAX_ITERATIONS"); do
     echo ""
@@ -593,6 +969,11 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
     rm -f "$APPROVED_REVIEW_JSON"
     mark_story_passed "$ACTIVE_STORY_ID"
     stage_and_commit_story "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" || true
+
+    if [ "$(jq '[.userStories[] | select(.passes == false)] | length' "$PRD_FILE")" -eq 0 ]; then
+        echo -e "${GREEN}All stories complete! Looper is done.${NC}"
+        exit 0
+    fi
 
     echo "Iteration $i complete. Pausing 2 seconds..."
     sleep 2
