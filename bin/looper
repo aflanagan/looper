@@ -1745,7 +1745,7 @@ run_codex_phase() {
 
     run_with_log "$story_id" "$ACTIVE_STORY_TITLE" \
         "codex" "$phase_label" "$log_file" "plain" \
-        bash -lc 'cat "$1" | codex exec -a never -s workspace-write -C "$2" --skip-git-repo-check --ephemeral -' -- \
+        bash -lc 'cat "$1" | codex exec -s workspace-write -C "$2" --skip-git-repo-check --ephemeral -' -- \
         "$prompt_input_file" "$PROJECT_DIR"
 }
 

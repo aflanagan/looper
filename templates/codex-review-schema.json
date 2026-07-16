@@ -38,6 +38,10 @@
           "location": {
             "type": "string",
             "minLength": 1
+          },
+          "axis": {
+            "type": "string",
+            "enum": ["standards", "spec"]
           }
         }
       }
