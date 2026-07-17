@@ -48,10 +48,13 @@ export PATH="$HOME/bin:$PATH"
 
 ## Requirements
 
-- [Claude Code CLI](https://claude.ai/code)
-- [Codex CLI](https://github.com/openai/codex)
+- [Claude Code CLI](https://claude.ai/code) — for the `claude` agent
+- [Codex CLI](https://github.com/openai/codex) — for the `codex` agent
+- [opencode](https://opencode.ai) — optional, for the `opencode` agent (run any Models.dev model — Grok, Gemini, GPT, etc.)
 - `jq`
 - Git
+
+You only need the CLI(s) for the agents you actually use. To run Claude on implementation and Codex on review (the default), you need both of those. To drive any other model, install `opencode` (`npm i -g opencode-ai`) and use the `opencode` agent — see [Using any model](#using-any-model).
 
 > **Cost note:** Looper runs one implementation agent and one review agent in a loop. Each story may consume multiple implementation + review cycles. Monitor your API usage, and use `LOOPER_REVIEW_MAX_ROUNDS` and iteration limits to constrain spend. If the review cap is exhausted, Looper stops instead of silently restarting the same story.
 
@@ -204,13 +207,57 @@ Active run metadata and watch logs are kept under your temp directory, not under
 | Environment Variable | Default | Description |
 |---|---|---|
 | `LOOPER_STATE_DIR` | `.looper/<branch-name>` | Override the full state directory path |
-| `LOOPER_IMPLEMENTATION_AGENT` | `claude` | Agent for implementation and remediation (`claude` or `codex`) |
-| `LOOPER_REVIEW_AGENT` | `codex` | Agent for review (`claude` or `codex`) |
+| `LOOPER_IMPLEMENTATION_AGENT` | `claude` | Agent for implementation and remediation (`claude`, `codex`, or `opencode`) |
+| `LOOPER_REVIEW_AGENT` | `codex` | Agent for review (`claude`, `codex`, or `opencode`) |
+| `LOOPER_IMPLEMENTATION_MODEL` | _(opencode default)_ | Model for the `opencode` implementation agent, as `provider/model` (e.g. `xai/grok-4.5`). Ignored by `claude`/`codex`. |
+| `LOOPER_REVIEW_MODEL` | _(opencode default)_ | Model for the `opencode` review agent, as `provider/model` (e.g. `anthropic/claude-sonnet-4-20250514`). Ignored by `claude`/`codex`. |
 | `LOOPER_REVIEW_MAX_ROUNDS` | `5` | Max review/remediation cycles per story before Looper exits non-zero |
 | `LOOPER_KEEP_LOGS` | `0` | Preserve temp run logs on failure when set to `1` |
 | `LOOPER_IMPLEMENTATION_PROMPT_FILE` | `templates/prompt.implementer.md` | Override the base implementation prompt template |
 | `LOOPER_REVIEW_PROMPT_FILE` | `templates/prompt.reviewer.md` | Override the base review prompt template |
 | `LOOPER_REVIEW_SCHEMA_FILE` | `templates/codex-review-schema.json` | Override review schema path |
+
+## Using any model
+
+Looper ships with three interchangeable agents. `claude` and `codex` are pinned to their own CLIs, but **`opencode` decouples the harness from the model** — pick any model from [Models.dev](https://models.dev) (Grok, Gemini, GPT, Claude, local models, …) by setting a single environment variable. No per-model wiring required.
+
+### Setup
+
+1. Install opencode: `npm i -g opencode-ai`
+2. Authenticate the provider(s) you want to use: `opencode auth login` (stores keys in `~/.local/share/opencode/auth.json`). Do this once per provider.
+
+### Select a model
+
+Set the agent to `opencode` and name the model as `provider/model`:
+
+```bash
+# Grok on both implementation and review
+LOOPER_IMPLEMENTATION_AGENT=opencode LOOPER_IMPLEMENTATION_MODEL=xai/grok-4.5 \
+LOOPER_REVIEW_AGENT=opencode        LOOPER_REVIEW_MODEL=xai/grok-4.5 \
+looper
+```
+
+Mix and match freely — the implementation and review agents are independent, so you can pair any two models (or mix opencode with claude/codex):
+
+```bash
+# Implement with Gemini, review with Claude — both via opencode
+LOOPER_IMPLEMENTATION_AGENT=opencode LOOPER_IMPLEMENTATION_MODEL=google/gemini-2.5-pro \
+LOOPER_REVIEW_AGENT=opencode        LOOPER_REVIEW_MODEL=anthropic/claude-sonnet-4-20250514 \
+looper
+
+# Implement with Claude Code, review with Grok via opencode
+LOOPER_IMPLEMENTATION_AGENT=claude \
+LOOPER_REVIEW_AGENT=opencode LOOPER_REVIEW_MODEL=xai/grok-4.5 \
+looper
+```
+
+If you omit `LOOPER_IMPLEMENTATION_MODEL` / `LOOPER_REVIEW_MODEL`, opencode uses its own configured default model.
+
+### How review works with opencode
+
+The review agent must return JSON matching `templates/codex-review-schema.json`. opencode has no schema-constrained output mode, so Looper injects the schema into the review prompt as an output contract, then extracts and validates the returned JSON. If the model returns invalid or non-schema JSON, Looper runs **one repair round** asking for schema-valid JSON before failing the round. This keeps arbitrary models usable as reviewers without a native structured-output mode.
+
+> **Tip:** Follow an opencode run with `looper watch` just like the other agents — opencode events stream into the same compact/verbose/raw transcript.
 
 ## Files
 
@@ -220,7 +267,7 @@ Active run metadata and watch logs are kept under your temp directory, not under
 | `templates/prompt.shared.md` | Base shared prompt context for both agents |
 | `templates/prompt.implementer.md` | Base implementation prompt |
 | `templates/prompt.reviewer.md` | Base review prompt |
-| `templates/codex-review-schema.json` | Structured output schema for Codex review |
+| `templates/codex-review-schema.json` | Structured output schema for the review agent (Codex native; injected into the prompt for opencode) |
 | `skills/looper/SKILL.md` | `/looper` slash command (PRD-to-JSON conversion) |
 | `skills/prd/SKILL.md` | `/prd` slash command (PRD generation) |
 
