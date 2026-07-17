@@ -92,6 +92,44 @@ else
     STATE_DIR="$PROJECT_DIR/.looper/$STATE_BRANCH_SLUG"
 fi
 
+# --- Looper env file -------------------------------------------------------
+# Auto-source a single env file so a run is just `looper` with no long var
+# prefix. The file may hold LOOPER_* config knobs AND provider API keys
+# (e.g. XAI_API_KEY, ANTHROPIC_API_KEY) that the underlying agent CLI reads
+# from the environment — opencode picks these up for model auth.
+#
+# Locations (both optional): a project-local `.looper/env` and a global file
+# (LOOPER_ENV_FILE, default ${XDG_CONFIG_HOME:-~/.config}/looper/env).
+# Precedence: variables already set in the environment always win (so
+# `LOOPER_REVIEW_MODEL=x looper` still overrides the file); then project-local;
+# then global. Never overwrites an already-set variable. Values are never printed.
+load_looper_env_file() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+    local line key val
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"        # strip leading whitespace
+        case "$line" in ''|'#'*) continue ;; esac
+        line="${line#export }"
+        case "$line" in *=*) ;; *) continue ;; esac
+        key="${line%%=*}"
+        val="${line#*=}"
+        key="${key%"${key##*[![:space:]]}"}"           # strip trailing whitespace on key
+        val="${val#"${val%%[![:space:]]*}"}"           # strip leading whitespace on val
+        val="${val%"${val##*[![:space:]]}"}"           # strip trailing whitespace on val
+        case "$key" in [!A-Za-z_]*|*[!A-Za-z0-9_]*) continue ;; esac
+        [ -n "${!key+x}" ] && continue                 # don't clobber pre-set vars
+        case "$val" in
+            \"*\") val="${val%\"}"; val="${val#\"}" ;;
+            \'*\') val="${val%\'}"; val="${val#\'}" ;;
+        esac
+        export "$key=$val"
+    done < "$file"
+    echo "Loaded Looper env from $file" >&2
+}
+load_looper_env_file "$PROJECT_DIR/.looper/env"
+load_looper_env_file "${LOOPER_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/looper/env}"
+
 PROMPT_SHARED_FILE="$STATE_DIR/prompt.shared.md"
 PROMPT_IMPLEMENTER_FILE="$STATE_DIR/prompt.implementer.md"
 PROMPT_REVIEWER_FILE="$STATE_DIR/prompt.reviewer.md"
@@ -140,6 +178,9 @@ Watch output:
   --raw, --full-logs     Tail the underlying log stream verbatim
 
 Environment:
+  LOOPER_ENV_FILE             Global env file to auto-source (default: ~/.config/looper/env).
+                             A project-local .looper/env is also sourced if present.
+                             Holds LOOPER_* config and/or provider keys (e.g. XAI_API_KEY).
   LOOPER_STATE_DIR            Override the full state dir path
   LOOPER_IMPLEMENTATION_AGENT Agent for implementation/remediation (claude|codex|opencode; default: claude)
   LOOPER_REVIEW_AGENT         Agent for review (claude|codex|opencode; default: codex)

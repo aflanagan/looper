@@ -206,6 +206,7 @@ Active run metadata and watch logs are kept under your temp directory, not under
 
 | Environment Variable | Default | Description |
 |---|---|---|
+| `LOOPER_ENV_FILE` | `~/.config/looper/env` | Global env file auto-sourced at startup (also sources `./.looper/env` if present). Holds `LOOPER_*` config and/or provider keys. See [Config via an env file](#config-via-an-env-file). |
 | `LOOPER_STATE_DIR` | `.looper/<branch-name>` | Override the full state directory path |
 | `LOOPER_IMPLEMENTATION_AGENT` | `claude` | Agent for implementation and remediation (`claude`, `codex`, or `opencode`) |
 | `LOOPER_REVIEW_AGENT` | `codex` | Agent for review (`claude`, `codex`, or `opencode`) |
@@ -252,6 +253,28 @@ looper
 ```
 
 If you omit `LOOPER_IMPLEMENTATION_MODEL` / `LOOPER_REVIEW_MODEL`, opencode uses its own configured default model.
+
+### Config via an env file
+
+Typing the agent/model prefix on every run gets old. Looper auto-sources an env file at startup so a run is just `looper`:
+
+- **Global:** `~/.config/looper/env` (override the path with `LOOPER_ENV_FILE`)
+- **Project-local:** `./.looper/env` (sourced if present; wins over the global file)
+
+Both are optional. A file can hold `LOOPER_*` config **and** provider API keys — opencode reads keys like `XAI_API_KEY` / `ANTHROPIC_API_KEY` straight from the environment, so this becomes the single place for your setup (no `opencode auth login` step required, and no scattered per-provider files):
+
+```bash
+# ~/.config/looper/env
+LOOPER_IMPLEMENTATION_AGENT=opencode
+LOOPER_IMPLEMENTATION_MODEL=xai/grok-4.5
+LOOPER_REVIEW_AGENT=opencode
+LOOPER_REVIEW_MODEL=xai/grok-4.5
+XAI_API_KEY=xai-...
+```
+
+Then just `looper`. Precedence: **anything already set in your shell wins** (so `LOOPER_REVIEW_MODEL=other looper` still overrides the file for a one-off), then project-local, then global. A starter template lives at [`templates/looper.env.example`](templates/looper.env.example).
+
+> **Secrets:** the repo `.gitignore` excludes `.looper/env` and `looper.env` so keys never get committed. Prefer the global `~/.config/looper/env` (outside any repo) for API keys.
 
 ### How review works with opencode
 
