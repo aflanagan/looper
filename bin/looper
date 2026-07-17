@@ -92,6 +92,44 @@ else
     STATE_DIR="$PROJECT_DIR/.looper/$STATE_BRANCH_SLUG"
 fi
 
+# --- Looper env file -------------------------------------------------------
+# Auto-source a single env file so a run is just `looper` with no long var
+# prefix. The file may hold LOOPER_* config knobs AND provider API keys
+# (e.g. XAI_API_KEY, ANTHROPIC_API_KEY) that the underlying agent CLI reads
+# from the environment — opencode picks these up for model auth.
+#
+# Locations (both optional): a project-local `.looper/env` and a global file
+# (LOOPER_ENV_FILE, default ${XDG_CONFIG_HOME:-~/.config}/looper/env).
+# Precedence: variables already set in the environment always win (so
+# `LOOPER_REVIEW_MODEL=x looper` still overrides the file); then project-local;
+# then global. Never overwrites an already-set variable. Values are never printed.
+load_looper_env_file() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+    local line key val
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"        # strip leading whitespace
+        case "$line" in ''|'#'*) continue ;; esac
+        line="${line#export }"
+        case "$line" in *=*) ;; *) continue ;; esac
+        key="${line%%=*}"
+        val="${line#*=}"
+        key="${key%"${key##*[![:space:]]}"}"           # strip trailing whitespace on key
+        val="${val#"${val%%[![:space:]]*}"}"           # strip leading whitespace on val
+        val="${val%"${val##*[![:space:]]}"}"           # strip trailing whitespace on val
+        case "$key" in [!A-Za-z_]*|*[!A-Za-z0-9_]*) continue ;; esac
+        [ -n "${!key+x}" ] && continue                 # don't clobber pre-set vars
+        case "$val" in
+            \"*\") val="${val%\"}"; val="${val#\"}" ;;
+            \'*\') val="${val%\'}"; val="${val#\'}" ;;
+        esac
+        export "$key=$val"
+    done < "$file"
+    echo "Loaded Looper env from $file" >&2
+}
+load_looper_env_file "$PROJECT_DIR/.looper/env"
+load_looper_env_file "${LOOPER_ENV_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/looper/env}"
+
 PROMPT_SHARED_FILE="$STATE_DIR/prompt.shared.md"
 PROMPT_IMPLEMENTER_FILE="$STATE_DIR/prompt.implementer.md"
 PROMPT_REVIEWER_FILE="$STATE_DIR/prompt.reviewer.md"
@@ -108,6 +146,8 @@ REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.re
 REVIEW_SCHEMA_FILE="${LOOPER_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-review-schema.json}"
 IMPLEMENTATION_AGENT="${LOOPER_IMPLEMENTATION_AGENT:-claude}"
 REVIEW_AGENT="${LOOPER_REVIEW_AGENT:-codex}"
+IMPLEMENTATION_MODEL="${LOOPER_IMPLEMENTATION_MODEL:-}"
+REVIEW_MODEL="${LOOPER_REVIEW_MODEL:-}"
 REVIEW_MAX_ROUNDS="${LOOPER_REVIEW_MAX_ROUNDS:-5}"
 KEEP_LOGS="${LOOPER_KEEP_LOGS:-0}"
 TMP_ROOT="${TMPDIR:-/tmp}"
@@ -138,9 +178,14 @@ Watch output:
   --raw, --full-logs     Tail the underlying log stream verbatim
 
 Environment:
+  LOOPER_ENV_FILE             Global env file to auto-source (default: ~/.config/looper/env).
+                             A project-local .looper/env is also sourced if present.
+                             Holds LOOPER_* config and/or provider keys (e.g. XAI_API_KEY).
   LOOPER_STATE_DIR            Override the full state dir path
-  LOOPER_IMPLEMENTATION_AGENT Agent for implementation/remediation (claude|codex; default: claude)
-  LOOPER_REVIEW_AGENT         Agent for review (claude|codex; default: codex)
+  LOOPER_IMPLEMENTATION_AGENT Agent for implementation/remediation (claude|codex|opencode; default: claude)
+  LOOPER_REVIEW_AGENT         Agent for review (claude|codex|opencode; default: codex)
+  LOOPER_IMPLEMENTATION_MODEL opencode model for implementation, e.g. xai/grok-4.5 (default: opencode's configured default)
+  LOOPER_REVIEW_MODEL         opencode model for review, e.g. anthropic/claude-... (default: opencode's configured default)
   LOOPER_REVIEW_MAX_ROUNDS    Number of review rounds per story (default: 5)
   LOOPER_KEEP_LOGS            Keep temp run logs on failure (default: 0)
   LOOPER_IMPLEMENTATION_PROMPT_FILE
@@ -161,9 +206,9 @@ validate_agent_name() {
     local value="$1"
     local var_name="$2"
     case "$value" in
-        claude|codex) ;;
+        claude|codex|opencode) ;;
         *)
-            echo -e "${RED}Error: $var_name must be 'claude' or 'codex'.${NC}"
+            echo -e "${RED}Error: $var_name must be 'claude', 'codex', or 'opencode'.${NC}"
             exit 1
             ;;
     esac
@@ -182,6 +227,7 @@ agent_display_name() {
     case "$agent" in
         claude) printf "Claude" ;;
         codex) printf "Codex" ;;
+        opencode) printf "opencode" ;;
         *) printf "%s" "$agent" ;;
     esac
 }
@@ -1311,6 +1357,22 @@ tail_codex_events() {
     '
 }
 
+tail_opencode_events() {
+    local log_file="$1"
+    # opencode is run with `--format json`, so the log is newline-delimited
+    # JSON events. Minimal parser: surface assistant text and tool calls.
+    tail -n 200 -f "$log_file" | jq --unbuffered -Rr '
+        fromjson? as $event
+        | if $event == null then empty
+          elif ($event.type // "") == "text" then ($event.part.text // empty)
+          elif ($event.type // "") == "tool" then
+            "[tool] " + (($event.part.tool // $event.part.name // "unknown") | tostring)
+          elif ($event.type // "") == "step_start" then empty
+          else empty
+          end
+    '
+}
+
 watch_active_run() {
     local current_log="" current_format="" tail_pid=""
     local marker_waited=0
@@ -1359,6 +1421,8 @@ watch_active_run() {
                 tail_claude_events "$current_log" &
             elif [ "$current_format" = "claude-jsonl" ]; then
                 tail_claude_compact_events "$current_log" &
+            elif [ "$current_format" = "opencode-jsonl" ]; then
+                tail_opencode_events "$current_log" &
             else
                 tail_plain_log "$current_log" &
             fi
@@ -1766,7 +1830,7 @@ run_claude_review_round() {
 
     run_with_log "$story_id" "$story_title" \
         "claude-review" "Claude review round $round" "$log_file" "plain" \
-        bash -lc 'cat "$1" | claude -p --dangerously-skip-permissions --output-format json --json-schema "$2" | tee "$3"' -- \
+        bash -lc 'cat "$1" | claude -p --dangerously-skip-permissions --output-format json --json-schema "$2" | jq ".structured_output // (.result | fromjson? // {})" > "$3"; cat "$3"' -- \
         "$review_input_file" "$review_schema_json" "$review_json_tmp"
 
     REVIEW_JSON_RESULT="$review_json_tmp"
@@ -1794,6 +1858,198 @@ run_codex_review_round() {
     REVIEW_JSON_RESULT="$review_json_tmp"
 }
 
+# Run `opencode run` headless, reading the prompt from stdin, streaming raw JSON
+# events to stdout. Model is optional: unset lets opencode use its default.
+opencode_run_stdin() {
+    local prompt_file="$1"
+    local model="$2"
+    local dir="$3"
+    bash -lc '
+        prompt="$1"; model="$2"; dir="$3"
+        set -- run --auto --format json --dir "$dir"
+        [ -n "$model" ] && set -- "$@" --model "$model"
+        cat "$prompt" | opencode "$@"
+    ' -- "$prompt_file" "$model" "$dir"
+}
+
+# Pull the assistant text out of an opencode JSON-event log, extract the first
+# balanced JSON object, and validate it against the review schema shape
+# (mirrors templates/codex-review-schema.json). On success, write the object to
+# $out_json and return 0; otherwise return 1.
+extract_opencode_review_json() {
+    local events_file="$1"
+    local out_json="$2"
+    local assistant_text candidate
+
+    assistant_text="$(jq -rs 'map(select((.type // "") == "text") | .part.text // "") | join("")' "$events_file" 2>/dev/null || true)"
+    if [ -z "$assistant_text" ]; then
+        return 1
+    fi
+
+    # Extract the first complete top-level JSON object, ignoring any prose or
+    # markdown fences the model may have wrapped around it.
+    candidate="$(printf '%s' "$assistant_text" | awk '
+        BEGIN { started=0; depth=0; instr=0; esc=0; buf="" }
+        {
+            n = length($0)
+            for (i = 1; i <= n; i++) {
+                c = substr($0, i, 1)
+                if (!started) {
+                    if (c == "{") { started=1; depth=1; buf="{" }
+                    continue
+                }
+                buf = buf c
+                if (instr) {
+                    if (esc) { esc=0 }
+                    else if (c == "\\") { esc=1 }
+                    else if (c == "\"") { instr=0 }
+                } else {
+                    if (c == "\"") { instr=1 }
+                    else if (c == "{") { depth++ }
+                    else if (c == "}") { depth--; if (depth == 0) { print buf; exit } }
+                }
+            }
+            if (started) { buf = buf "\n" }
+        }
+    ')"
+
+    if [ -z "$candidate" ]; then
+        return 1
+    fi
+
+    # Validate structural conformance to the review schema. jq -e exits non-zero
+    # on a parse error or when the final result is false/null.
+    if ! printf '%s' "$candidate" | jq -e '
+        (.verdict | IN("APPROVED","CHANGES_REQUESTED"))
+        and (.summary | type == "string" and (length > 0))
+        and (.findings | type == "array")
+        and (all(.findings[]?;
+              (.id | type == "string" and (length > 0))
+              and (.priority | IN("P0","P1","P2","P3"))
+              and (.title | type == "string" and (length > 0))
+              and (.details | type == "string" and (length > 0))
+              and (.location | type == "string" and (length > 0))))
+        and (.acCoverage | type == "array")
+        and (all(.acCoverage[]?;
+              (.criterion | type == "string" and (length > 0))
+              and (.status | IN("pass","fail"))
+              and (.details | type == "string" and (length > 0))))
+        and (.testGaps | type == "array")
+        and (all(.testGaps[]?; type == "string"))
+    ' >/dev/null 2>&1; then
+        return 1
+    fi
+
+    # Normalize (compact/canonical) into the output file for downstream jq.
+    printf '%s' "$candidate" | jq '.' > "$out_json"
+}
+
+run_opencode_phase() {
+    local phase="$1"
+    local story_id="$2"
+    local story_title="$3"
+    local story_file="$4"
+    local review_round="${5:-}"
+    local prompt_input_file log_file phase_label
+
+    echo "Running opencode phase '$phase' for $story_id..."
+
+    phase_label="opencode $phase"
+    if [ "$phase" = "remediation" ] && [ -n "$review_round" ]; then
+        phase_label="$phase_label (after round $review_round)"
+        log_file="$RUN_DIR/iter-${i}-opencode-${phase}-round-${review_round}.jsonl"
+    else
+        log_file="$RUN_DIR/iter-${i}-opencode-${phase}.jsonl"
+    fi
+
+    prompt_input_file="$RUN_DIR/iter-${i}-opencode-${phase}.prompt.txt"
+    build_phase_input "$phase" "$story_id" "$story_title" "$story_file" "$review_round" > "$prompt_input_file"
+
+    run_with_log "$story_id" "$ACTIVE_STORY_TITLE" \
+        "opencode" "$phase_label" "$log_file" "opencode-jsonl" \
+        opencode_run_stdin "$prompt_input_file" "$IMPLEMENTATION_MODEL" "$PROJECT_DIR"
+}
+
+run_opencode_review_round() {
+    local story_id="$1"
+    local story_title="$2"
+    local round="$3"
+    local story_file="$4"
+
+    local review_json_tmp review_input_file events_file
+    local repair_input_file repair_events_file schema_json prev_text
+    review_json_tmp="$(mktemp "$RUN_DIR/review-round-${story_id}-${round}.XXXXXX.json")"
+    review_input_file="$RUN_DIR/iter-${i}-opencode-review-round-${round}.prompt.txt"
+    events_file="$RUN_DIR/iter-${i}-opencode-review-round-${round}.jsonl"
+    repair_input_file="$RUN_DIR/iter-${i}-opencode-review-round-${round}.repair.prompt.txt"
+    repair_events_file="$RUN_DIR/iter-${i}-opencode-review-round-${round}.repair.jsonl"
+    schema_json="$(cat "$REVIEW_SCHEMA_FILE")"
+
+    echo "Running opencode review round $round for $story_id..." >&2
+    build_review_input "$story_id" "$story_title" "$round" "$story_file" > "$review_input_file"
+
+    # opencode has no schema-constrained output mode, so inject the schema and a
+    # strict JSON-only contract into the prompt itself.
+    {
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Output Contract (opencode)"
+        echo ""
+        echo "Return ONLY a single JSON object and nothing else: no markdown code"
+        echo "fences, no prose before or after. The object MUST conform to this"
+        echo "JSON Schema:"
+        echo ""
+        echo '```json'
+        echo "$schema_json"
+        echo '```'
+        echo ""
+        echo 'Every required field must be present. "verdict" must be exactly'
+        echo '"APPROVED" or "CHANGES_REQUESTED".'
+    } >> "$review_input_file"
+
+    run_with_log "$story_id" "$story_title" \
+        "opencode-review" "opencode review round $round" "$events_file" "opencode-jsonl" \
+        opencode_run_stdin "$review_input_file" "$REVIEW_MODEL" "$PROJECT_DIR"
+
+    if extract_opencode_review_json "$events_file" "$review_json_tmp"; then
+        REVIEW_JSON_RESULT="$review_json_tmp"
+        return 0
+    fi
+
+    echo -e "${YELLOW}opencode review round $round did not return schema-valid JSON; attempting one repair round.${NC}" >&2
+
+    prev_text="$(jq -rs 'map(select((.type // "") == "text") | .part.text // "") | join("")' "$events_file" 2>/dev/null || true)"
+    {
+        echo "Your previous response was NOT a valid JSON object matching the"
+        echo "required review schema. Output ONLY a single JSON object conforming"
+        echo "to this JSON Schema, with no markdown fences and no prose:"
+        echo ""
+        echo '```json'
+        echo "$schema_json"
+        echo '```'
+        echo ""
+        echo 'Reuse the substance of the review you already produced below and'
+        echo "re-encode it as schema-valid JSON. Do not re-run any tools."
+        echo ""
+        echo "--- your previous (invalid) output ---"
+        echo "$prev_text"
+    } > "$repair_input_file"
+
+    run_with_log "$story_id" "$story_title" \
+        "opencode-review" "opencode review round $round (repair)" "$repair_events_file" "opencode-jsonl" \
+        opencode_run_stdin "$repair_input_file" "$REVIEW_MODEL" "$PROJECT_DIR"
+
+    if ! extract_opencode_review_json "$repair_events_file" "$review_json_tmp"; then
+        echo -e "${RED}Error: opencode review round $round failed to produce schema-valid JSON after one repair attempt.${NC}" >&2
+        # Leave an empty object so downstream verdict handling fails loudly
+        # rather than crashing on a missing/garbage file.
+        echo '{}' > "$review_json_tmp"
+    fi
+
+    REVIEW_JSON_RESULT="$review_json_tmp"
+}
+
 run_implementation_phase() {
     local phase="$1"
     local story_id="$2"
@@ -1805,6 +2061,7 @@ run_implementation_phase() {
     case "$IMPLEMENTATION_AGENT" in
         claude) run_claude_phase "$phase" "$story_id" "$story_title" "$ACTIVE_STORY_FILE" "$review_round" ;;
         codex) run_codex_phase "$phase" "$story_id" "$story_title" "$ACTIVE_STORY_FILE" "$review_round" ;;
+        opencode) run_opencode_phase "$phase" "$story_id" "$story_title" "$ACTIVE_STORY_FILE" "$review_round" ;;
     esac
 
     validate_story_handoff_section "$story_id" "$ACTIVE_STORY_FILE"
@@ -1820,6 +2077,7 @@ run_review_round() {
     case "$REVIEW_AGENT" in
         claude) run_claude_review_round "$story_id" "$story_title" "$round" "$story_file" ;;
         codex) run_codex_review_round "$story_id" "$story_title" "$round" "$story_file" ;;
+        opencode) run_opencode_review_round "$story_id" "$story_title" "$round" "$story_file" ;;
     esac
 }
 
@@ -1836,7 +2094,13 @@ if [ "$MODE" = "watch" ]; then
 else
     echo "Max iterations: $MAX_ITERATIONS"
     echo "Implementation agent: $(agent_display_name "$IMPLEMENTATION_AGENT")"
+    if [ "$IMPLEMENTATION_AGENT" = "opencode" ]; then
+        echo "Implementation model: ${IMPLEMENTATION_MODEL:-<opencode default>}"
+    fi
     echo "Review agent: $(agent_display_name "$REVIEW_AGENT")"
+    if [ "$REVIEW_AGENT" = "opencode" ]; then
+        echo "Review model: ${REVIEW_MODEL:-<opencode default>}"
+    fi
     echo "Review rounds per story: $REVIEW_MAX_ROUNDS"
 fi
 
@@ -1867,6 +2131,9 @@ if [ "$MODE" != "watch" ]; then
     fi
     if [ "$IMPLEMENTATION_AGENT" = "codex" ] || [ "$REVIEW_AGENT" = "codex" ]; then
         require_command codex
+    fi
+    if [ "$IMPLEMENTATION_AGENT" = "opencode" ] || [ "$REVIEW_AGENT" = "opencode" ]; then
+        require_command opencode
     fi
 fi
 

@@ -1,1 +1,7 @@
 .DS_Store
+
+# Looper env files may contain provider API keys — never commit them
+.looper/env
+.looper/**/env
+looper.env
+*.looper.env
