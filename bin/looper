@@ -1766,7 +1766,7 @@ run_claude_review_round() {
 
     run_with_log "$story_id" "$story_title" \
         "claude-review" "Claude review round $round" "$log_file" "plain" \
-        bash -lc 'cat "$1" | claude -p --dangerously-skip-permissions --output-format json --json-schema "$2" | tee "$3"' -- \
+        bash -lc 'cat "$1" | claude -p --dangerously-skip-permissions --output-format json --json-schema "$2" | jq ".structured_output // (.result | fromjson? // {})" > "$3"; cat "$3"' -- \
         "$review_input_file" "$review_schema_json" "$review_json_tmp"
 
     REVIEW_JSON_RESULT="$review_json_tmp"
