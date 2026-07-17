@@ -1879,19 +1879,19 @@ extract_opencode_review_json() {
     # Validate structural conformance to the review schema. jq -e exits non-zero
     # on a parse error or when the final result is false/null.
     if ! printf '%s' "$candidate" | jq -e '
-        (["APPROVED","CHANGES_REQUESTED"] | index(.verdict) != null)
+        (.verdict | IN("APPROVED","CHANGES_REQUESTED"))
         and (.summary | type == "string" and (length > 0))
         and (.findings | type == "array")
         and (all(.findings[]?;
               (.id | type == "string" and (length > 0))
-              and (["P0","P1","P2","P3"] | index(.priority) != null)
+              and (.priority | IN("P0","P1","P2","P3"))
               and (.title | type == "string" and (length > 0))
               and (.details | type == "string" and (length > 0))
               and (.location | type == "string" and (length > 0))))
         and (.acCoverage | type == "array")
         and (all(.acCoverage[]?;
               (.criterion | type == "string" and (length > 0))
-              and (["pass","fail"] | index(.status) != null)
+              and (.status | IN("pass","fail"))
               and (.details | type == "string" and (length > 0))))
         and (.testGaps | type == "array")
         and (all(.testGaps[]?; type == "string"))
