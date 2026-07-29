@@ -9,7 +9,8 @@ Follow these steps exactly:
 
 ### 1. Read Current State
 - Start with the shared Looper project model and file contract above, then use the `## Runtime Context` block at the end of the fully rendered prompt to identify this run's exact paths and phase.
-- Read the active story from `prd.json` and use its `title`, `description`, `acceptanceCriteria`, `priority`, and `notes` as the product contract for this run.
+- Load the immutable contract and approved execution plan from runtime context before reading any live backlog state. The immutable contract is the exclusive product truth and the approved plan is the required execution approach.
+- Treat `prd.json` only as mutable backlog/pass state. Reordering or wording changes there do not alter this run; never merge them into the frozen contract.
 - Use the Story File to determine what is already done and what still needs to be fixed:
   - `Open Findings` tells you what remains unresolved
   - `Latest Review Summary` tells you why the last review failed or what it approved
@@ -22,13 +23,14 @@ Follow these steps exactly:
   - which files or patterns are likely affected
 
 ### 2. Verify Git Branch
-- Check that you are on the branch named in `prd.json`.
-- If not, switch to that branch before making changes.
+- Looper validates the current branch against `prd.json` before this phase.
+- Do not switch branches, create branches, commit, or push inside an agent phase.
 
 ### 3. Work One Story Only
 - Use only the active story id from runtime context.
 - Do not start a second story.
 - Keep the implementation minimal and focused on the active story's acceptance criteria.
+- Follow the approved plan. Do not silently change its architecture or scope; record a blocker when repository evidence makes a material plan assumption false.
 
 ### 4. Implement the Story
 - If the Story File contains open findings, treat them as required work.

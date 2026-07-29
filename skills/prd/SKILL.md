@@ -1,87 +1,87 @@
 # PRD Generator Skill
 
 ## Trigger
-This skill activates when the user asks to:
-- "create a prd"
-- "write prd for"
-- "plan this feature"
-- "requirements for"
-- "spec out"
+Use this skill when the user asks to create, write, plan, or spec a product requirement.
+
+## Contract model
+
+A PRD is the approved product contract. Its stories are not implementation plans. Each story says what outcome is independently valuable and how it will be proved; Looper later creates and adversarially reviews a codebase-grounded execution plan for the selected story.
+
+Stories have two authoring states:
+
+- `DRAFT`: questions, boundaries, or proof are still being refined. Looper must not execute it.
+- `APPROVED`: the user has approved the story block and its material contract fields. Only approved stories may be converted for execution.
+
+Approval applies to the complete story block. A material change to its outcome, acceptance criteria, scope, non-goals, dependencies, proof expectations, or disappointment check returns it to `DRAFT` and requires explicit re-approval. Typographical edits that do not alter meaning are non-material.
 
 ## Process
 
-### Step 1: Gather requirements
-Ask 3-5 clarifying questions to understand the feature. Use lettered options (A/B/C/D) when applicable.
+### 1. Gather requirements
 
-Example questions:
-- What is the primary user for this feature?
-- What problem does this solve?
-- Are there any technical constraints?
-- What's the scope - MVP or full feature?
+Ask only the clarifying questions needed to establish the user, problem, boundary, success proof, dependencies, and important non-goals. Use lettered choices when they make the decision easier.
 
-### Step 2: Generate PRD
+### 2. Draft the PRD
 
-Create a structured PRD with these sections:
+Use this structure:
 
 ```markdown
 # PRD: [Feature Name]
 
-## Introduction/Overview
-Brief description of what this feature does and why it matters.
-
+## Introduction / Overview
 ## Goals
-Specific, measurable objectives:
-- Goal 1
-- Goal 2
-
-## User Stories
-Small, completable stories in this format:
-- US-001: As a [user], I want [feature] so that [benefit]
-- US-002: ...
-
-**Important**: Each story must be completable in ONE context window (2-3 sentences of work).
-If a story is too big, split it into sub-stories.
-
-## Functional Requirements
-Numbered, unambiguous requirements:
-1. The system SHALL...
-2. The system SHALL...
-
 ## Non-Goals
-What this feature explicitly does NOT include:
-- Not doing X
-- Not doing Y
-
+## Functional Requirements
 ## Design Considerations (optional)
-UI/UX considerations if applicable.
-
 ## Technical Considerations (optional)
-Architecture, dependencies, integration points.
-
 ## Success Metrics
-How we'll know this feature is successful:
-- Metric 1
-- Metric 2
-
 ## Open Questions
-Unresolved questions that need answers:
-- Question 1?
-- Question 2?
+
+## Stories
+
+### [ABC-001] Short outcome title
+- Status: DRAFT | APPROVED
+- User outcome: As a ..., I want ..., so that ...
+- Source refs: FR-1, Goal-1
+- Depends on: none | ABC-000
+- Replaces: none | ABC-000
+- In scope:
+  - ...
+- Non-goals:
+  - ...
+- Acceptance criteria:
+  - ABC-001-AC-001: Observable, verifiable outcome.
+  - ABC-001-AC-002: Observable, verifiable outcome.
+- Proof expectations:
+  - ABC-001-PROOF-001: Test, command, or product-level inspection that proves an AC.
+- Disappointment check: What reasonable user expectation would make this technically-correct story still feel unfinished?
 ```
 
-### Step 3: Save the PRD
-Save to `.looper/<branch-name>/prd.md`
+Give Goals and Functional Requirements stable IDs so `Source refs` can preserve traceability. Choose one semantic 2–3 letter uppercase story prefix and use sequential IDs. Acceptance-criterion IDs are permanent: never renumber or reuse one after approval; add a new ID when the contract grows.
 
-Determine `<branch-name>` from the current git branch:
-- Start with `git rev-parse --abbrev-ref HEAD`
-- If it starts with `codex/` or `looper/`, drop that prefix
-- Replace non `[A-Za-z0-9._-]` characters with `-`
-- If empty, use `unknown-branch`
+### 3. Review decomposition before approval
 
-## Output guidelines
+For every story, verify:
 
-- Write for junior developers and AI agents (explicit, unambiguous)
-- Keep user stories SMALL (one context window each)
-- Order stories by dependency (schema -> backend -> frontend)
-- Include acceptance criteria for each story
-- Be specific, not vague ("button shows dialog" not "works correctly")
+- It produces one independently reviewable outcome and can be implemented in one coding context.
+- Its acceptance criteria describe observable behavior, not implementation steps.
+- `Source refs` account for the PRD requirements it implements; every in-scope requirement is owned by at least one story.
+- Dependencies are explicit, acyclic, and refer only to earlier or externally satisfied work.
+- Scope and non-goals prevent neighboring stories from bleeding together.
+- Proof expectations cover tests plus any user/developer/operator experience that code-only tests could miss.
+- The disappointment check catches a hollow implementation that passes literal criteria but misses the intended experience.
+
+If implementation likely spans unrelated subsystems, requires more than one independently useful migration/cutover, or cannot be proved as one unit, split it before approval. Do not invent implementation steps; runtime planning owns that layer.
+
+### 4. Obtain approval and save
+
+Present material unresolved choices. Change story status to `APPROVED` only after the user approves the complete block. Save the PRD to `.looper/<branch-name>/prd.md`.
+
+Derive `<branch-name>` from the current Git branch: drop an initial `codex/` or `looper/`, replace characters outside `[A-Za-z0-9._-]` with `-`, and use `unknown-branch` if empty.
+
+## Output rules
+
+- Write explicitly enough for a junior developer and an AI agent.
+- Do not convert draft stories into executable work.
+- Preserve approved wording and stable IDs during conversion.
+- Order stories by dependency, but never use order as a substitute for `Depends on`.
+- Prefer product-verifiable criteria over vague quality claims such as “works correctly.”

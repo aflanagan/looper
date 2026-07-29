@@ -1,55 +1,63 @@
-# Looper PRD-to-JSON Converter Skill
+# Looper PRD-to-Story-Contract Skill
 
 ## Trigger
-This skill activates when the user asks to:
-- "convert this prd"
-- "turn this into looper format"
-- "create prd.json from this"
-- "looper json"
-- "convert to looper"
+Use this skill when the user asks to convert a PRD to Looper format or create `prd.json`.
+
+## Purpose
+
+This conversion is decomposition layer one: preserve approved product intent as small, dependency-aware story contracts. Do not produce implementation tasks or file-by-file steps here. At runtime Looper locks one story, generates a codebase-grounded execution plan, adversarially reviews it, and only then implements it.
 
 ## Process
 
-### Step 1: Validate the PRD
-Check the input PRD for:
-- [ ] Stories are small enough (completable in one context window)
-- [ ] Stories are ordered by dependency (no story depends on a later story)
-- [ ] Acceptance criteria are verifiable (not vague)
-- [ ] Each story has clear, testable outcomes
+### 1. Validate the approved PRD
 
-If issues are found, suggest fixes before converting.
+Do not silently repair or reinterpret an approved contract. Report problems and obtain approval before material changes.
 
-### Step 2: Determine branch-scoped state directory
+Check that:
 
-Set `<branch-name>` from the current git branch:
-- Start with `git rev-parse --abbrev-ref HEAD`
-- If it starts with `codex/` or `looper/`, drop that prefix
-- Replace non `[A-Za-z0-9._-]` characters with `-`
-- If empty, use `unknown-branch`
+- every converted story is explicitly `APPROVED`;
+- IDs and acceptance-criterion IDs are unique and stable;
+- each story is one independently reviewable outcome small enough for one coding context;
+- acceptance criteria are observable and verifiable;
+- `sourceRefs` trace each story to goals or requirements and all in-scope requirements are covered;
+- `dependsOn` references exist, point to earlier stories, and are acyclic;
+- scope, non-goals, proof expectations, and a disappointment check are present;
+- replacement stories name the superseded story in `replaces` and preserve its uncovered source refs/criteria.
 
-State directory path:
-- `.looper/<branch-name>/`
+If a story is too large, propose revised `DRAFT` story blocks and ask for approval. Never split an approved story invisibly during JSON conversion.
 
-### Step 3: Convert to JSON format
+### 2. Determine the state directory
 
-Create `.looper/<branch-name>/prd.json` with this structure:
+Derive `<branch-name>` from the current Git branch: drop an initial `codex/` or `looper/`, replace characters outside `[A-Za-z0-9._-]` with `-`, and use `unknown-branch` if empty. Write under `.looper/<branch-name>/`.
+
+### 3. Emit canonical JSON
+
+Use `schemaVersion: 2` and preserve approved wording exactly:
 
 ```json
 {
+  "schemaVersion": 2,
   "project": "ProjectName",
   "branchName": "looper/feature-name",
   "description": "Brief feature description",
   "userStories": [
     {
-      "id": "QRY-001",
-      "title": "Short descriptive title",
-      "description": "As a [user], I want [feature] so that [benefit].",
+      "id": "ABC-001",
+      "status": "APPROVED",
+      "title": "Short outcome title",
+      "description": "As a user, I want an outcome so that I receive value.",
+      "sourceRefs": ["Goal-1", "FR-2"],
+      "scope": ["Explicitly included outcome"],
+      "nonGoals": ["Explicitly excluded adjacent behavior"],
       "acceptanceCriteria": [
-        "Specific, verifiable criterion 1",
-        "Specific, verifiable criterion 2",
-        "Tests pass (if applicable)",
-        "Type checks pass (if applicable)"
+        {"id": "ABC-001-AC-001", "text": "Observable criterion."}
       ],
+      "proofExpectations": [
+        {"id": "ABC-001-PROOF-001", "text": "How the outcome should be proved.", "command": "optional safe deterministic command"}
+      ],
+      "disappointmentCheck": "A reasonable expectation that must not be missed.",
+      "dependsOn": [],
+      "replaces": [],
       "priority": 1,
       "passes": false,
       "notes": ""
@@ -58,99 +66,27 @@ Create `.looper/<branch-name>/prd.json` with this structure:
 }
 ```
 
-Before generating stories, choose a single semantic prefix for `userStories[].id`:
-- Prefer the current branch name first.
-- If the branch name is too generic, infer the prefix from the PRD's dominant feature area.
-- Use an uppercase 2-3 letter prefix that stays readable.
-- State the chosen prefix in your response when you save the file.
+Choose one semantic 2–3 letter uppercase prefix based on the branch or dominant feature area. IDs must match `<PREFIX>-001`; do not emit generic `US-*` IDs. Assign numeric priority as a readable tie-breaker, not as the dependency model.
 
-Examples:
-- `query-layer` -> `QRY-001`
-- `data-layer` -> `DL-001`
-- `investigation-engine` -> `INV-001`
+### 4. Material-change rules
 
-### Step 4: Set priorities
-Assign priority numbers based on dependency order:
-- Priority 1: Foundation work (schema, models, core functions)
-- Priority 2: Business logic (services, utilities)
-- Priority 3: Integration (connecting components)
-- Priority 4: UI/presentation layer
-- Priority 5: Polish and edge cases
+When updating an existing `prd.json`:
 
-Lower priority number = do first.
+- Preserve story and AC IDs and all approved material wording.
+- New or materially changed contracts must be `DRAFT` until explicitly approved.
+- Once Looper has locked a story ID, never reuse that ID for a materially different contract; create a new approved ID and use `replaces` when it supersedes the old work.
+- Removing or weakening an approved AC, changing scope/non-goals, changing dependencies, or changing proof/disappointment expectations is material.
+- Replacing a terminal story requires new approved stories whose `replaces` arrays name it. Do not delete the terminal story; lineage is part of the audit trail.
+- `passes`, `notes`, and runtime `execution` fields are Looper-owned state. Preserve them unless the user explicitly requests a state reset.
 
-### Step 5: Archive previous PRD (if exists)
-If there is an existing PRD with a different `branchName`:
-- the looper script handles archiving automatically
-- overwrite the file
+### 5. Legacy normalization
 
-### Step 6: Save the file
-Write to `.looper/<branch-name>/prd.json`.
+Legacy files with string acceptance criteria remain runnable. During explicit conversion, normalize each string to `{ "id": "<STORY-ID>-AC-NNN", "text": "..." }` in existing order and add conservative defaults for absent contract fields. Runtime Looper leaves the legacy PRD unchanged and canonicalizes only its frozen selected-story contract. Never renumber an already-object criterion.
 
-### Step 7: Scaffold prompt addenda
-If these files do not already exist, create them alongside `prd.json`:
-- `.looper/<branch-name>/prompt.shared.md`
-- `.looper/<branch-name>/prompt.implementer.md`
-- `.looper/<branch-name>/prompt.reviewer.md`
+### 6. Scaffold addenda
 
-Keep them short and project-specific:
-- `prompt.shared.md`: checks, architecture invariants, important directories
-- `prompt.implementer.md`: implementation workflow, code-change constraints, testing expectations
-- `prompt.reviewer.md`: review priorities, risky areas, standards to verify
-
-Do not copy Looper's default prompts into these files. Only add the project-specific deltas.
-
-If any of these files already exist, do not overwrite them unless the user explicitly asks.
-
-## JSON field requirements
-
-### `branchName`
-- Format: `looper/feature-name-kebab-case`
-- Must be a valid git branch name
-- Prefix with `looper/` for easy identification
-
-### `userStories[].id`
-- Format: `<PREFIX>-001`, `<PREFIX>-002`, etc.
-- `<PREFIX>` must be a semantic 2-3 letter uppercase code chosen from branch name or PRD intent
-- Sequential numbering
-- Unique within the PRD
-
-### `userStories[].acceptanceCriteria`
-Must be verifiable. Good vs bad examples:
-
-**Bad (vague):**
-- "Works correctly"
-- "User can do the thing"
-- "Feature is implemented"
-
-**Good (verifiable):**
-- "Function returns list of dicts with 'id' and 'name' keys"
-- "Clicking button shows confirmation dialog with 'Cancel' and 'Confirm' options"
-- "API returns 200 status with JSON body containing 'success': true"
-
-### `userStories[].priority`
-- Integer starting at 1
-- 1 = highest priority (do first)
-- Reflects dependency order
-
-### `userStories[].passes`
-- Always start as `false`
-- Looper updates to `true` when a story completes
-
-### `userStories[].notes`
-- Start empty
-- Looper adds implementation notes and learnings
-
-## Critical rules
-
-1. **One context window per story**: if a story seems too big, split it
-2. **No circular dependencies**: story N cannot depend on story N+1
-3. **Verifiable criteria only**: every criterion must be testable
-4. **Include quality checks**: add "Tests pass" or "Type checks pass" where applicable
-5. **No generic story ids**: do not emit `US-001` or `US-QRY-001`; use a semantic 2-3 letter prefix instead
+If absent, create short project-specific `prompt.shared.md`, `prompt.implementer.md`, and `prompt.reviewer.md` files beside `prd.json`. Do not copy Looper defaults and do not overwrite existing addenda without explicit permission.
 
 ## Output
-Save the JSON to `.looper/<branch-name>/prd.json`, scaffold the prompt addenda files if needed, and confirm to the user:
-- which story prefix was chosen
-- where `prd.json` was written
-- which prompt addenda files were created or left unchanged
+
+Confirm the chosen prefix, output path, story count, dependency validation, any legacy normalization, and which addenda were created or preserved.

@@ -6,7 +6,8 @@ Review only the uncommitted changes in the current repository for the active sto
 ## Context to read
 - Start with the shared Looper project model and file contract above, then use the `## Runtime Context` block at the end of the fully rendered prompt to identify this run's exact paths, active story title, and review round.
 - Read any project shared or reviewer addenda included before runtime context. They define the codebase's contract and maturity (see "Codebase maturity" below).
-- Read the active story from `prd.json` and review against its `description`, `acceptanceCriteria`, and `notes`. Treat the acceptance criteria as part of the task contract, not optional extras.
+- Load the immutable contract and approved plan from runtime context first. The frozen contract is the exclusive product truth; verify every stable criterion and verify conformance to the approved plan.
+- Treat `prd.json` only as mutable backlog/pass state. Its current wording, priority, or ordering cannot weaken, replace, or expand the locked contract.
 - Use the Story File as the review handoff record:
   - `Open Findings` shows what was previously unresolved
   - `Latest Review Summary` shows the last review rationale
@@ -51,5 +52,5 @@ Do not nitpick pure style unless it materially affects correctness, maintainabil
 Return JSON only, matching the provided schema.
 - `summary`: one concise paragraph.
 - `findings`: each actionable, with evidence and a `location`; set `axis` to `standards` or `spec`; use `priority` P0–P3 (P0 = must-fix blocker, P3 = minor/simplification).
-- `acCoverage`: evaluate each acceptance criterion as `pass` or `fail` with a reason.
+- `acCoverage`: evaluate each acceptance criterion exactly once as `pass` or `fail`; echo its stable ID in `criterionId` and its text in `criterion`.
 - `testGaps`: concrete missing tests, or an empty array when none.

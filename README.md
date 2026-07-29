@@ -4,25 +4,31 @@
   <img alt="Looper" src="banner-dark.svg" width="480">
 </picture>
 <br /><br />
-Automate multi-story implementation by pairing an implementation agent with a review agent in a loop until both agree on the code.
+Automate multi-story implementation with locked story contracts, adversarially reviewed execution plans, harness-owned validation, and independent code review.
 <br /><br />
-Give Looper a PRD, and it breaks it into dependency-ordered stories, then runs an implementation agent against each one while a review agent checks the uncommitted diff. If review requests changes, Looper runs remediation and re-review until approval or the max review rounds are hit. Then it commits and moves to the next story.
+Give Looper an approved PRD and convert it into dependency-aware story contracts. For each story, Looper snapshots the material contract, asks the implementation agent for a read-only codebase-grounded plan, and has the review agent challenge that plan before code is written. Only an approved `PLAN_READY` plan reaches implementation. The existing implementation/review/remediation loop then runs, and Looper makes one final commit for the story.
 <br /><br />
 
 ```
-PRD → Stories → [ implementation → review → remediate? ] → commit → next story
+PRD → approved story contracts → lock one story
+    → [ read-only plan → adversarial plan review → revise? ]
+    → [ implementation → harness checks → code review → remediate? ]
+    → one final commit → next story
 ```
 
 ## How It Works
 
-1. Create a PRD with dependency-ordered stories
-2. Convert it to `.looper/<branch-name>/prd.json` using the `/looper` slash command (or create `.looper/<branch-name>/` manually and add your own `prd.md`/`prd.json`)
-3. Run `looper`
-4. For each story:
-   - The implementation agent implements the story and runs quality checks
-   - The review agent reviews uncommitted changes
+1. Create a PRD with explicitly approved story blocks, stable acceptance-criterion IDs, dependency edges, scope/non-goals, and proof expectations.
+2. Convert it to canonical `.looper/<branch-name>/prd.json` using `/looper`.
+3. Run `looper`. A new story starts only from a clean worktree outside Looper state.
+4. For each runnable story:
+   - Looper creates an immutable contract snapshot and active-story lock.
+   - The implementation agent plans in read-only mode; the review agent adversarially reviews the plan for up to `LOOPER_PLAN_REVIEW_MAX_ROUNDS` (default 3).
+   - An approved `SPLIT_REQUIRED` or `BLOCKED` disposition stops before code. Approved replacement stories can recover a terminal story through their `replaces` lineage.
+   - The implementation agent implements the approved plan.
+   - Looper runs configured proof commands itself, then the review agent reviews the uncommitted diff.
    - If review requests changes, Looper runs remediation and re-review (up to `LOOPER_REVIEW_MAX_ROUNDS`, default 5)
-   - On approval, Looper commits and marks the story passed
+   - On approval, Looper commits once and marks the story passed atomically. A failed commit remains retryable and never marks the story passed.
 5. Stops when all stories pass or max iterations is reached
 
 > **What happens if they can't agree?** After exhausting review rounds for a story, Looper stops with a non-zero exit and leaves the story unresolved. The next manual rerun resumes remediation for that same story.
@@ -56,7 +62,7 @@ export PATH="$HOME/bin:$PATH"
 
 You only need the CLI(s) for the agents you actually use. To run Claude on implementation and Codex on review (the default), you need both of those. To drive any other model, install `opencode` (`npm i -g opencode-ai`) and use the `opencode` agent — see [Using any model](#using-any-model).
 
-> **Cost note:** Looper runs one implementation agent and one review agent in a loop. Each story may consume multiple implementation + review cycles. Monitor your API usage, and use `LOOPER_REVIEW_MAX_ROUNDS` and iteration limits to constrain spend. If the review cap is exhausted, Looper stops instead of silently restarting the same story.
+> **Cost note:** Each story adds plan generation/review before implementation/review. Use the three-round planning default and `LOOPER_REVIEW_MAX_ROUNDS` to constrain spend. Every phase is persisted so a rerun resumes the exact outstanding boundary rather than silently restarting completed planning work.
 
 ## Usage
 
@@ -76,37 +82,34 @@ Still in Claude Code, convert the PRD to the structured JSON format Looper expec
 /looper convert this prd
 ```
 
-This creates `.looper/<branch-name>/prd.json`. The `/looper` skill now chooses a semantic 2-3 letter story prefix automatically and states it in the response. Example structure:
+This creates schema-version 2 `.looper/<branch-name>/prd.json`. `/looper` preserves approved wording and stable IDs; it does not invent implementation steps. Example story:
 
 ```json
 {
+  "schemaVersion": 2,
   "project": "Dashboard",
   "branchName": "looper/dark-mode",
   "description": "Add dark mode support to the dashboard UI.",
   "userStories": [
     {
       "id": "UI-001",
-      "title": "Add theme toggle component",
+      "status": "APPROVED",
+      "title": "Let users select a theme",
       "description": "As a dashboard user, I want a theme toggle so that I can switch between light and dark mode.",
+      "sourceRefs": ["Goal-1", "FR-2"],
+      "scope": ["Theme selection and persistence"],
+      "nonGoals": ["Redesigning unrelated dashboard layout"],
       "acceptanceCriteria": [
-        "Header shows a theme toggle control.",
-        "Theme preference persists across reloads.",
-        "Relevant tests pass."
+        {"id": "UI-001-AC-001", "text": "Header shows a theme toggle control."},
+        {"id": "UI-001-AC-002", "text": "Theme preference persists across reloads."}
       ],
+      "proofExpectations": [
+        {"id": "UI-001-PROOF-001", "text": "Automated theme behavior tests pass.", "command": "npm test -- theme"}
+      ],
+      "disappointmentCheck": "The selected theme remains visually usable across core dashboard surfaces.",
+      "dependsOn": [],
+      "replaces": [],
       "priority": 1,
-      "passes": false,
-      "notes": ""
-    },
-    {
-      "id": "UI-002",
-      "title": "Implement CSS custom properties for theming",
-      "description": "As a dashboard user, I want all core surfaces themed so that dark mode is usable end to end.",
-      "acceptanceCriteria": [
-        "Core dashboard surfaces render correctly in both themes.",
-        "Theme variables are applied consistently.",
-        "Relevant tests pass."
-      ],
-      "priority": 2,
       "passes": false,
       "notes": ""
     }
@@ -190,8 +193,15 @@ looper watch --raw       # raw underlying log stream
       ├── prompt.implementer.md # Optional: implementation-only addendum
       ├── prompt.reviewer.md   # Optional: review-only addendum
       ├── progress.txt         # Auto-created: iteration log (excluded from auto-commits)
+      ├── active-story.json   # Current lock and explicit resume phase (excluded from auto-commits)
       └── stories/             # Auto-created: one current state file per story (excluded from auto-commits)
-          └── <story-id>.md
+          ├── <story-id>.md
+          ├── <story-id>.contract.json
+          ├── <story-id>.planning.json
+          ├── <story-id>.plan-N.json
+          ├── <story-id>.plan-review-N.json
+          ├── <story-id>.approved-plan.json
+          └── <story-id>.validation.json
 ```
 
 `<branch-name>` defaults to the current git branch slug (with `codex/` and `looper/` prefixes stripped). Set `LOOPER_STATE_DIR` to override the full state path.
@@ -199,6 +209,8 @@ looper watch --raw       # raw underlying log stream
 Older `prompt.local.md` and `review-prompt.md` files are no longer read. Move any reusable content into the new addenda files.
 
 Looper only commits after the review agent returns `APPROVED`. On approval, it appends a review-closure summary to the progress log, updates the active story file under `stories/`, and writes a short outcome note to the story's entry in `prd.json`.
+
+Legacy PRDs with string acceptance criteria remain unchanged on disk. Looper canonicalizes the selected story only inside its frozen lock/contract, assigning deterministic `<STORY-ID>-AC-NNN` IDs there. Once a story ID has a locked contract, Looper never overwrites it: materially revised work needs a new approved story ID (and `replaces` lineage when appropriate).
 
 Active run metadata and watch logs are kept under your temp directory, not under `.looper/`. `looper watch` defaults to a compact transcript and supports `--verbose` and `--raw` (`--full-logs` alias) when you want more detail.
 
@@ -213,10 +225,14 @@ Active run metadata and watch logs are kept under your temp directory, not under
 | `LOOPER_IMPLEMENTATION_MODEL` | _(opencode default)_ | Model for the `opencode` implementation agent, as `provider/model` (e.g. `xai/grok-4.5`). Ignored by `claude`/`codex`. |
 | `LOOPER_REVIEW_MODEL` | _(opencode default)_ | Model for the `opencode` review agent, as `provider/model` (e.g. `anthropic/claude-sonnet-4-20250514`). Ignored by `claude`/`codex`. |
 | `LOOPER_REVIEW_MAX_ROUNDS` | `5` | Max review/remediation cycles per story before Looper exits non-zero |
+| `LOOPER_PLAN_REVIEW_MAX_ROUNDS` | `3` | Max persisted plan/review cycles before implementation is blocked |
+| `LOOPER_VALIDATION_COMMANDS` | _(empty)_ | Optional newline-separated harness commands; story proof-expectation commands are also run |
 | `LOOPER_KEEP_LOGS` | `0` | Preserve temp run logs on failure when set to `1` |
 | `LOOPER_IMPLEMENTATION_PROMPT_FILE` | `templates/prompt.implementer.md` | Override the base implementation prompt template |
 | `LOOPER_REVIEW_PROMPT_FILE` | `templates/prompt.reviewer.md` | Override the base review prompt template |
 | `LOOPER_REVIEW_SCHEMA_FILE` | `templates/codex-review-schema.json` | Override review schema path |
+| `LOOPER_PLANNER_PROMPT_FILE` | `templates/prompt.planner.md` | Override the read-only planner prompt |
+| `LOOPER_PLAN_REVIEW_PROMPT_FILE` | `templates/prompt.plan-reviewer.md` | Override the adversarial plan-review prompt |
 
 ## Using any model
 

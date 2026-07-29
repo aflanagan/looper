@@ -17,7 +17,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "priority", "title", "details", "location"],
+        "required": ["id", "priority", "title", "details", "location", "axis"],
         "properties": {
           "id": {
             "type": "string",
@@ -51,8 +51,12 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["criterion", "status", "details"],
+        "required": ["criterionId", "criterion", "status", "details"],
         "properties": {
+          "criterionId": {
+            "type": "string",
+            "minLength": 1
+          },
           "criterion": {
             "type": "string",
             "minLength": 1

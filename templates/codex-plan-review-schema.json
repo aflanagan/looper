@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["storyId", "contractHash", "planHash", "verdict", "summary", "findings", "acCoverage"],
+  "properties": {
+    "storyId": { "type": "string", "minLength": 1 },
+    "contractHash": { "type": "string", "minLength": 1 },
+    "planHash": { "type": "string", "minLength": 1 },
+    "verdict": { "enum": ["APPROVED", "CHANGES_REQUESTED"] },
+    "summary": { "type": "string", "minLength": 1 },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "priority", "details", "evidence"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "priority": { "enum": ["P0", "P1", "P2", "P3"] },
+          "details": { "type": "string", "minLength": 1 },
+          "evidence": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "acCoverage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["acId", "status", "details"],
+        "properties": {
+          "acId": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["pass", "fail"] },
+          "details": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

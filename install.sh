@@ -68,5 +68,5 @@ fi
 
 echo "Usage:"
 echo "  1. In any project, create .looper/<branch-name>/prd.json (use /looper skill)"
-echo "  2. Optionally create .looper/<branch-name>/config.md for project-specific config"
+echo "  2. Optionally add prompt.shared.md, prompt.implementer.md, and prompt.reviewer.md beside prd.json"
 echo "  3. Run: looper [max_iterations]"

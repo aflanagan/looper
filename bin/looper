@@ -20,6 +20,8 @@
 #   - LOOPER_IMPLEMENTATION_AGENT (default claude)
 #   - LOOPER_REVIEW_AGENT (default codex)
 #   - LOOPER_REVIEW_MAX_ROUNDS (default 5)
+#   - LOOPER_PLAN_REVIEW_MAX_ROUNDS (default 3)
+#   - LOOPER_VALIDATION_COMMANDS (optional newline-separated harness checks)
 #   - LOOPER_KEEP_LOGS (default 0; set to 1 to keep temp run logs on failure)
 #   - LOOPER_IMPLEMENTATION_PROMPT_FILE / LOOPER_REVIEW_PROMPT_FILE to override base prompt templates
 #   - LOOPER_REVIEW_SCHEMA_FILE to override review schema
@@ -144,21 +146,33 @@ SHARED_PROMPT_FILE="$LOOPER_DIR/templates/prompt.shared.md"
 IMPLEMENTATION_PROMPT_FILE="${LOOPER_IMPLEMENTATION_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.implementer.md}"
 REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.reviewer.md}"
 REVIEW_SCHEMA_FILE="${LOOPER_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-review-schema.json}"
+PRD_SCHEMA_FILE="${LOOPER_PRD_SCHEMA_FILE:-$LOOPER_DIR/templates/prd.schema.json}"
+PLANNER_PROMPT_FILE="${LOOPER_PLANNER_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.planner.md}"
+PLAN_REVIEW_PROMPT_FILE="${LOOPER_PLAN_REVIEW_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.plan-reviewer.md}"
+PLAN_SCHEMA_FILE="${LOOPER_PLAN_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-plan-schema.json}"
+PLAN_REVIEW_SCHEMA_FILE="${LOOPER_PLAN_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-plan-review-schema.json}"
 IMPLEMENTATION_AGENT="${LOOPER_IMPLEMENTATION_AGENT:-claude}"
 REVIEW_AGENT="${LOOPER_REVIEW_AGENT:-codex}"
 IMPLEMENTATION_MODEL="${LOOPER_IMPLEMENTATION_MODEL:-}"
 REVIEW_MODEL="${LOOPER_REVIEW_MODEL:-}"
+CODEX_BIN="${LOOPER_CODEX_BIN:-codex}"
 REVIEW_MAX_ROUNDS="${LOOPER_REVIEW_MAX_ROUNDS:-5}"
+PLAN_REVIEW_MAX_ROUNDS="${LOOPER_PLAN_REVIEW_MAX_ROUNDS:-3}"
+VALIDATION_COMMANDS="${LOOPER_VALIDATION_COMMANDS:-}"
 KEEP_LOGS="${LOOPER_KEEP_LOGS:-0}"
 TMP_ROOT="${TMPDIR:-/tmp}"
 RUN_STATE_ROOT="${TMP_ROOT%/}/looper-active"
 RUN_STATE_KEY="$(printf '%s\n%s\n' "$PROJECT_DIR" "$STATE_DIR" | cksum | awk '{print $1}')"
 RUN_STATE_FILE="$RUN_STATE_ROOT/$RUN_STATE_KEY.json"
 RUN_DIR=""
-PHASE_HEARTBEAT_INTERVAL=10
+PHASE_HEARTBEAT_INTERVAL="${LOOPER_HEARTBEAT_INTERVAL:-10}"
 REVIEW_JSON_RESULT=""
 ACTIVE_STORY_FILE=""
 ACTIVE_HANDOFF_TOKEN=""
+ACTIVE_CONTRACT_FILE=""
+ACTIVE_PLAN_FILE=""
+ACTIVE_LOCK_FILE="$STATE_DIR/active-story.json"
+ALLOW_DIRTY_LEGACY_START="${LOOPER_ALLOW_DIRTY_LEGACY_START:-0}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -187,10 +201,15 @@ Environment:
   LOOPER_IMPLEMENTATION_MODEL opencode model for implementation, e.g. xai/grok-4.5 (default: opencode's configured default)
   LOOPER_REVIEW_MODEL         opencode model for review, e.g. anthropic/claude-... (default: opencode's configured default)
   LOOPER_REVIEW_MAX_ROUNDS    Number of review rounds per story (default: 5)
+  LOOPER_PLAN_REVIEW_MAX_ROUNDS
+                             Number of adversarial plan rounds per story (default: 3)
+  LOOPER_VALIDATION_COMMANDS Optional newline-separated commands run by the harness before code review
   LOOPER_KEEP_LOGS            Keep temp run logs on failure (default: 0)
   LOOPER_IMPLEMENTATION_PROMPT_FILE
                              Override the base implementation prompt template
   LOOPER_REVIEW_PROMPT_FILE  Override the base review prompt template
+  LOOPER_PLANNER_PROMPT_FILE / LOOPER_PLAN_REVIEW_PROMPT_FILE
+                             Override planning prompt templates
 EOF
 }
 
@@ -424,32 +443,37 @@ append_story_history_block() {
 
 render_story_details_section() {
     local story_id="$1"
-
+    if [ -z "$ACTIVE_CONTRACT_FILE" ] || [ ! -f "$ACTIVE_CONTRACT_FILE" ]; then
+        echo -e "${RED}Error: cannot render Story Details before the immutable contract is locked.${NC}" >&2
+        return 1
+    fi
     jq -r --arg id "$story_id" '
-        first(.userStories[] | select(.id == $id)) as $story
-        | if $story == null then
-            error("story not found")
+        . as $story
+        | if $story.id != $id then
+            error("locked contract identity mismatch")
           else
             (
               [
                 "- Story ID: \($story.id)",
                 "- Title: \($story.title)",
                 "- Priority: \($story.priority)",
-                "- Passes: \($story.passes)"
+                "- Contract status: \($story.status)"
               ]
               + ["", "### Description", "", ($story.description // ""), "", "### Acceptance Criteria", ""]
-              + (($story.acceptanceCriteria // []) | map("- " + .))
-              + ["", "### Notes", ""]
-              + (
-                  if ($story.notes // "") == "" then
-                    ["- None."]
-                  else
-                    ($story.notes | split("\n") | map(select(length > 0) | "- " + .))
-                  end
-                )
+              + (($story.acceptanceCriteria // []) | map("- " + (.id // "criterion") + ": " + (.text // "")))
+              + ["", "### Scope", ""]
+              + (($story.scope // []) | map("- " + .))
+              + ["", "### Non-Goals", ""]
+              + (($story.nonGoals // []) | map("- " + .))
+              + ["", "### Dependencies", ""]
+              + (if (($story.dependsOn // []) | length) == 0 then ["- None."] else (($story.dependsOn // []) | map("- " + .)) end)
+              + ["", "### Proof Expectations", ""]
+              + (($story.proofExpectations // []) | map("- " + (.id // "proof") + ": " + (.text // "")))
+              + ["", "### Disappointment Check", "", ($story.disappointmentCheck // "")]
+              + ["", "### Contract Provenance", "", "- Frozen immutable contract; live PRD fields are not product authority for this run."]
             ) | join("\n")
           end
-    ' "$PRD_FILE"
+    ' "$ACTIVE_CONTRACT_FILE"
 }
 
 latest_legacy_review_file() {
@@ -831,7 +855,7 @@ story_should_resume_remediation() {
     fi
 
     verdict="$(story_status_value "$story_file" "Latest review verdict")"
-    [ "$verdict" = "CHANGES_REQUESTED" ]
+    [ "$verdict" = "CHANGES_REQUESTED" ] || [ "$verdict" = "VALIDATION_FAILED" ]
 }
 
 story_review_round() {
@@ -1443,8 +1467,467 @@ watch_active_run() {
     echo "Looper run ended."
 }
 
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+atomic_jq_replace() {
+    local file="$1"
+    shift
+    local tmp
+    tmp="$(mktemp "$STATE_DIR/json.XXXXXX")"
+    jq "$@" "$file" > "$tmp"
+    mv "$tmp" "$file"
+}
+
+prd_is_legacy() {
+    [ "$(jq -r '.schemaVersion // 1' "$PRD_FILE")" != "2" ]
+}
+
+canonical_story_snapshot() {
+    local story_id="$1"
+    jq -S --arg id "$story_id" '
+      first(.userStories[] | select(.id == $id)) as $story
+      | if $story == null then error("story not found") else
+          ($story.acceptanceCriteria // []) as $acs
+          | ($acs | map(type) | unique) as $types
+          | if ($types | length) > 1 then error("mixed acceptance criterion formats")
+            elif ($types == ["string"]) then
+              $story
+              | .status = (.status // "APPROVED")
+              | .sourceRefs = (.sourceRefs // []) | .scope = (.scope // []) | .nonGoals = (.nonGoals // [])
+              | .proofExpectations = [] | .disappointmentCheck = (.disappointmentCheck // "")
+              | .dependsOn = (.dependsOn // []) | .replaces = (.replaces // [])
+              | .acceptanceCriteria = ($acs | to_entries | map({
+                  id: ($story.id + "-AC-" + (if (.key+1)<10 then "00" elif (.key+1)<100 then "0" else "" end) + ((.key+1)|tostring)),
+                  text: .value}))
+              | .legacyApprovalAssumed = true
+            else
+              $story | .legacyApprovalAssumed = false
+            end
+          | {id,status,title,description,sourceRefs,scope,nonGoals,acceptanceCriteria,
+             proofExpectations,disappointmentCheck,dependsOn,replaces,priority,legacyApprovalAssumed}
+        end
+    ' "$PRD_FILE"
+}
+
+validate_prd_contracts() {
+    if ! jq -e . "$PRD_FILE" >/dev/null 2>&1; then
+        echo -e "${RED}Error: $PRD_FILE is not valid JSON.${NC}"
+        exit 1
+    fi
+
+    local error legacy
+    legacy=0
+    prd_is_legacy && legacy=1
+    error="$(jq -r '
+      def safe_id: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$");
+      if ($legacy == 0 and .schemaVersion != 2) then "schemaVersion must be 2"
+      elif (.userStories | type) != "array" or (.userStories | length) == 0 then "userStories must be a non-empty array"
+      elif ([.userStories[].id] | unique | length) != (.userStories | length) then "story IDs must be unique"
+      elif any(.userStories[]; (.id | safe_id) | not) then "story IDs may contain only letters, numbers, dot, underscore, and hyphen"
+      elif any(.userStories[]; ((.acceptanceCriteria // []) | map(type) | unique | length) > 1) then "mixed string/object acceptance criteria are forbidden"
+      elif ($legacy == 0 and any(.userStories[]; (.status | IN("DRAFT", "APPROVED") | not))) then "story status must be DRAFT or APPROVED"
+      elif any(.userStories[]; (.acceptanceCriteria | type) != "array" or (.acceptanceCriteria | length) == 0) then "every story needs acceptance criteria"
+      elif ($legacy == 0 and any(.userStories[]; any(.acceptanceCriteria[]; (.id | type) != "string" or (.id | length) == 0 or (.text | type) != "string" or (.text | length) == 0))) then "acceptance criteria require stable id and text"
+      elif ($legacy == 0 and ([.userStories[].acceptanceCriteria[].id] | unique | length) != ([.userStories[].acceptanceCriteria[].id] | length)) then "acceptance criterion IDs must be globally unique"
+      elif ($legacy == 0 and any(.userStories[]; has("sourceRefs") and has("scope") and has("nonGoals") and has("proofExpectations") and has("disappointmentCheck") and has("dependsOn") and has("replaces") | not)) then "schema v2 stories are missing required contract fields"
+      elif .userStories as $stories | [$stories[].id] as $ids
+           | any($stories[]; any(((.dependsOn // []) + (.replaces // []))[]?; . as $ref | ($ids | index($ref)) == null)) then "dependency or replacement references a missing story"
+      else "" end
+    ' --argjson legacy "$legacy" "$PRD_FILE" 2>/dev/null || true)"
+    if [ -n "$error" ]; then
+        echo -e "${RED}Error: invalid PRD contract: $error.${NC}"
+        exit 1
+    fi
+
+    # Requiring dependencies to appear earlier makes cycles impossible and keeps
+    # the JSON readable without making priority carry dependency semantics.
+    if ! jq -e --argjson legacy "$legacy" '
+      [.userStories[].id] as $ids
+      | all(.userStories | to_entries[];
+          .key as $index | all((.value.dependsOn // [])[]?; . as $dep | ($ids | index($dep)) < $index))
+    ' "$PRD_FILE" >/dev/null; then
+        echo -e "${RED}Error: dependsOn entries must reference an earlier story; forward/circular dependencies are not runnable.${NC}"
+        exit 1
+    fi
+}
+
+recover_terminal_replacements() {
+    local locked_id planning_file planning_status expected current_source resolution_tmp archived_lock replacements
+    [ -f "$ACTIVE_LOCK_FILE" ] || return 0
+    locked_id="$(jq -r '.storyId // empty' "$ACTIVE_LOCK_FILE")"
+    planning_file="$(planning_state_file "$locked_id")"
+    [ -f "$planning_file" ] || return 0
+    planning_status="$(jq -r '.status // empty' "$planning_file")"
+    if [ "$planning_status" != "SPLIT_REQUIRED" ] && [ "$planning_status" != "BLOCKED" ]; then
+        return 0
+    fi
+
+    # Resolution is an exact backlog replacement: the terminal ID disappears,
+    # every replacement is approved and names it, and any IDs proposed by the
+    # reviewed terminal plan are present exactly.
+    if jq -e --arg id "$locked_id" 'any(.userStories[]; .id==$id)' "$PRD_FILE" >/dev/null; then
+        return 0
+    fi
+    replacements="$(jq -c --arg id "$locked_id" '[.userStories[] | select((.replaces // []) | index($id)) | select((.status // "APPROVED")=="APPROVED") | .id] | sort' "$PRD_FILE")"
+    [ "$replacements" != "[]" ] || return 0
+    expected="$(jq -c '.replacementStories // [] | sort' "$STORIES_ROOT/${locked_id}.approved-plan.json")"
+    if [ "$expected" != "[]" ] && [ "$expected" != "$replacements" ]; then
+        echo -e "${RED}Error: terminal replacement IDs do not exactly match the reviewed plan ($expected).${NC}"
+        exit 1
+    fi
+    current_source="$(sha256_file "$PRD_FILE")"
+    resolution_tmp="$(mktemp "$STATE_DIR/terminal-resolution.XXXXXX")"
+    jq -n --arg oldStoryId "$locked_id" --arg disposition "$planning_status" \
+      --arg contractHash "$(jq -r '.contractHash' "$ACTIVE_LOCK_FILE")" \
+      --arg originalSourceHash "$(jq -r '.sourceHash' "$ACTIVE_LOCK_FILE")" \
+      --arg currentSourceHash "$current_source" --argjson replacements "$replacements" --arg resolvedAt "$(utc_timestamp)" \
+      '{oldStoryId:$oldStoryId,disposition:$disposition,contractHash:$contractHash,originalSourceHash:$originalSourceHash,currentSourceHash:$currentSourceHash,replacements:$replacements,resolvedAt:$resolvedAt}' > "$resolution_tmp"
+    mv "$resolution_tmp" "$STORIES_ROOT/${locked_id}.terminal-resolution.json"
+    archived_lock="$STORIES_ROOT/${locked_id}.terminal-lock.json"
+    [ ! -e "$archived_lock" ] || { echo -e "${RED}Error: terminal lock archive already exists for $locked_id.${NC}"; exit 1; }
+    mv "$ACTIVE_LOCK_FILE" "$archived_lock"
+    echo "Resolved terminal story $locked_id through approved replacement lineage."
+}
+
+worktree_snapshot_outside_state() {
+    local rel_state_dir=""
+    if [[ "$STATE_DIR" == "$PROJECT_DIR/"* ]]; then
+        rel_state_dir="${STATE_DIR#$PROJECT_DIR/}"
+    fi
+    if [ -n "$rel_state_dir" ]; then
+        git -C "$PROJECT_DIR" status --porcelain=v1 --untracked-files=all -- . ":(exclude)$rel_state_dir/**"
+    else
+        git -C "$PROJECT_DIR" status --porcelain=v1 --untracked-files=all
+    fi
+}
+
+require_clean_story_start() {
+    local snapshot
+    snapshot="$(worktree_snapshot_outside_state)"
+    if [ -n "$snapshot" ]; then
+        echo -e "${RED}Error: a new story requires a clean worktree outside Looper runtime state.${NC}"
+        printf '%s\n' "$snapshot"
+        exit 1
+    fi
+}
+
+write_new_active_lock() {
+    local story_id="$1" snapshot_file="$2" source_hash="$3" tmp contract_hash
+    contract_hash="$(sha256_file "$snapshot_file")"
+    tmp="$(mktemp "$STATE_DIR/active-story.XXXXXX")"
+    jq -n --arg storyId "$story_id" --arg contractHash "$contract_hash" --arg sourceHash "$source_hash" \
+      --arg baseCommit "$(git -C "$PROJECT_DIR" rev-parse HEAD)" --arg phase "LOCKED" \
+      --arg updatedAt "$(utc_timestamp)" --slurpfile storySnapshot "$snapshot_file" \
+      '{storyId:$storyId,contractHash:$contractHash,sourceHash:$sourceHash,baseCommit:$baseCommit,phase:$phase,updatedAt:$updatedAt,storySnapshot:$storySnapshot[0]}' > "$tmp"
+    mv "$tmp" "$ACTIVE_LOCK_FILE"
+}
+
+set_active_phase() {
+    local phase="$1" tmp
+    [ -f "$ACTIVE_LOCK_FILE" ] || return 0
+    tmp="$(mktemp "$STATE_DIR/active-phase.XXXXXX")"
+    jq --arg phase "$phase" --arg updatedAt "$(utc_timestamp)" '.phase=$phase | .updatedAt=$updatedAt' "$ACTIVE_LOCK_FILE" > "$tmp"
+    mv "$tmp" "$ACTIVE_LOCK_FILE"
+}
+
+ensure_story_contract_lock() {
+    local story_id="$1" material_tmp candidate_hash existing_hash
+    mkdir -p "$STORIES_ROOT"
+    ACTIVE_CONTRACT_FILE="$STORIES_ROOT/${story_id}.contract.json"
+    [ -f "$ACTIVE_LOCK_FILE" ] || { echo -e "${RED}Error: story contract cannot be created before the active lock.${NC}"; exit 1; }
+    [ "$(jq -r '.storyId' "$ACTIVE_LOCK_FILE")" = "$story_id" ] || { echo -e "${RED}Error: active lock identity mismatch.${NC}"; exit 1; }
+    material_tmp="$(mktemp "$STATE_DIR/contract.XXXXXX")"
+    jq -S '.storySnapshot' "$ACTIVE_LOCK_FILE" > "$material_tmp"
+    candidate_hash="$(sha256_file "$material_tmp")"
+    [ "$(jq -r '.contractHash' "$ACTIVE_LOCK_FILE")" = "$candidate_hash" ] || { rm -f "$material_tmp"; echo -e "${RED}Error: active lock snapshot hash is invalid.${NC}"; exit 1; }
+    if [ -f "$ACTIVE_CONTRACT_FILE" ]; then
+        existing_hash="$(sha256_file "$ACTIVE_CONTRACT_FILE")"
+        if [ "$existing_hash" != "$candidate_hash" ]; then
+            rm -f "$material_tmp"
+            echo -e "${RED}Error: story ID $story_id was reused for a different immutable contract. Create a new story ID with replaces lineage.${NC}"
+            exit 1
+        fi
+        rm -f "$material_tmp"
+    else
+        mv "$material_tmp" "$ACTIVE_CONTRACT_FILE"
+    fi
+    if [ "$(jq -r '.phase' "$ACTIVE_LOCK_FILE")" = "LOCKED" ]; then
+        set_active_phase "PLANNING"
+    fi
+}
+
+planning_state_file() {
+    printf '%s/%s.planning.json' "$STORIES_ROOT" "$1"
+}
+
+write_planning_state() {
+    local story_id="$1" status="$2" round="$3" plan_file="${4:-}" review_file="${5:-}" disposition="${6:-}"
+    local file tmp
+    file="$(planning_state_file "$story_id")"
+    tmp="$(mktemp "$STATE_DIR/planning-state.XXXXXX")"
+    jq -n --arg status "$status" --argjson round "$round" --arg planFile "$plan_file" \
+      --arg reviewFile "$review_file" --arg disposition "$disposition" --arg updatedAt "$(utc_timestamp)" \
+      '{status:$status,round:$round,planFile:$planFile,reviewFile:$reviewFile,disposition:$disposition,updatedAt:$updatedAt}' > "$tmp"
+    mv "$tmp" "$file"
+}
+
+extract_first_json_object() {
+    local source_file="$1" out_file="$2" input
+    input="$(jq -rs 'map(select((.type // "") == "text") | .part.text // "") | join("")' "$source_file" 2>/dev/null || cat "$source_file")"
+    printf '%s' "$input" | awk '
+      BEGIN {started=0;depth=0;instr=0;esc=0;buf=""}
+      { for(i=1;i<=length($0);i++){c=substr($0,i,1); if(!started){if(c=="{"){started=1;depth=1;buf="{"};continue}; buf=buf c; if(instr){if(esc)esc=0;else if(c=="\\")esc=1;else if(c=="\"")instr=0}else{if(c=="\"")instr=1;else if(c=="{")depth++;else if(c=="}"){depth--;if(depth==0){print buf;exit}}}} if(started)buf=buf "\n" }
+    ' | jq '.' > "$out_file" 2>/dev/null
+}
+
+run_structured_readonly_agent() {
+    local agent="$1" model="$2" schema="$3" prompt="$4" output="$5" story_id="$6" label="$7"
+    local log="$RUN_DIR/${story_id}-${label}.log" schema_json before after
+    before="$(git -C "$PROJECT_DIR" rev-parse HEAD)|$(worktree_snapshot_outside_state)"
+    schema_json="$(cat "$schema")"
+    case "$agent" in
+      claude)
+        run_with_log "$story_id" "$ACTIVE_STORY_TITLE" "planning" "$label" "$log" "plain" \
+          bash -lc 'cat "$1" | claude -p --permission-mode plan --output-format json --json-schema "$2" | jq ".structured_output // (.result | fromjson? // {})" > "$3"; cat "$3"' -- "$prompt" "$schema_json" "$output"
+        ;;
+      codex)
+        run_with_log "$story_id" "$ACTIVE_STORY_TITLE" "planning" "$label" "$log" "codex-jsonl" \
+          bash -c 'cat "$1" | "$4" -a never -s read-only exec --ephemeral --json --output-schema "$2" -o "$3" -' -- "$prompt" "$schema" "$output" "$CODEX_BIN"
+        ;;
+      opencode)
+        {
+            printf '\n\n## Output Contract\nReturn only one JSON object matching this schema:\n```json\n'
+            cat "$schema"
+            printf '\n```\n'
+        } >> "$prompt"
+        run_with_log "$story_id" "$ACTIVE_STORY_TITLE" "planning" "$label" "$log" "opencode-jsonl" \
+          opencode_run_stdin "$prompt" "$model" "$PROJECT_DIR" "readonly"
+        if ! extract_first_json_object "$log" "$output"; then
+            echo -e "${RED}Error: opencode did not return valid structured JSON for $label.${NC}"
+            exit 1
+        fi
+        ;;
+    esac
+    after="$(git -C "$PROJECT_DIR" rev-parse HEAD)|$(worktree_snapshot_outside_state)"
+    if [ "$before" != "$after" ]; then
+        echo -e "${RED}Error: read-only planning phase changed the worktree. Looper will not continue or discard those changes.${NC}"
+        exit 1
+    fi
+    jq -e . "$output" >/dev/null || { echo -e "${RED}Error: $label returned invalid JSON.${NC}"; exit 1; }
+}
+
+build_planner_input() {
+    local story_id="$1" round="$2" prior_review="${3:-}" contract_hash
+    contract_hash="$(sha256_file "$ACTIVE_CONTRACT_FILE")"
+    cat "$PLANNER_PROMPT_FILE"
+    printf '\n## Runtime Context\n- Story ID: %s\n- Contract hash: %s\n- Planning round: %s of %s\n- Repository root: %s\n\n## Immutable Contract\n```json\n' "$story_id" "$contract_hash" "$round" "$PLAN_REVIEW_MAX_ROUNDS" "$PROJECT_DIR"
+    cat "$ACTIVE_CONTRACT_FILE"
+    printf '\n```\n'
+    if [ -n "$prior_review" ] && [ -f "$prior_review" ]; then
+        printf '\n## Prior Adversarial Review\n```json\n'
+        cat "$prior_review"
+        printf '\n```\nRevise the plan to resolve every material finding; do not implement.\n'
+    fi
+}
+
+build_plan_review_input() {
+    local story_id="$1" round="$2" plan_file="$3" contract_hash plan_hash
+    contract_hash="$(sha256_file "$ACTIVE_CONTRACT_FILE")"
+    plan_hash="$(sha256_file "$plan_file")"
+    cat "$PLAN_REVIEW_PROMPT_FILE"
+    printf '\n## Runtime Context\n- Story ID: %s\n- Contract hash: %s\n- Plan hash: %s\n- Review round: %s of %s\n\n## Immutable Contract\n```json\n' "$story_id" "$contract_hash" "$plan_hash" "$round" "$PLAN_REVIEW_MAX_ROUNDS"
+    cat "$ACTIVE_CONTRACT_FILE"
+    printf '\n```\n\n## Proposed Plan\n```json\n'
+    cat "$plan_file"
+    printf '\n```\n'
+}
+
+validate_plan_semantics() {
+    local story_id="$1" plan_file="$2" expected_hash ac_expected ac_actual disposition
+    expected_hash="$(sha256_file "$ACTIVE_CONTRACT_FILE")"
+    if ! jq -e --arg id "$story_id" --arg hash "$expected_hash" '
+      .storyId == $id and .contractHash == $hash
+      and (.disposition | IN("PLAN_READY","SPLIT_REQUIRED","BLOCKED"))
+      and (.summary | type == "string" and length > 0)
+      and (.assumptions | type == "array") and (.evidence | type == "array")
+      and (.acProof | type == "array") and (.steps | type == "array") and (.risks | type == "array")
+      and (.terminalReason | type == "string") and (.replacementStories | type == "array")
+      and all(.evidence[]?; (.path|type=="string" and length>0) and (.detail|type=="string" and length>0))
+      and all(.acProof[]?; (.acId|type=="string" and length>0) and (.proof|type=="string" and length>0))
+    ' "$plan_file" >/dev/null; then
+        echo -e "${RED}Error: planner output violates the plan schema or locked identity.${NC}"
+        exit 1
+    fi
+    disposition="$(jq -r '.disposition' "$plan_file")"
+    ac_expected="$(jq -c '[.acceptanceCriteria[].id] | sort' "$ACTIVE_CONTRACT_FILE")"
+    ac_actual="$(jq -c '[.acProof[].acId] | sort' "$plan_file")"
+    if [ "$ac_expected" != "$ac_actual" ]; then
+        echo -e "${RED}Error: every disposition must map each locked acceptance criterion exactly once with nonempty proof.${NC}"
+        exit 1
+    fi
+    if [ "$disposition" = "PLAN_READY" ]; then
+        if ! jq -e '(.steps|length)>0 and ([.steps[].id]|unique|length)==(.steps|length) and all(.steps[]; (.id|length)>0 and (.description|length)>0)' "$plan_file" >/dev/null; then
+            echo -e "${RED}Error: PLAN_READY must map every AC exactly once and use unique non-empty steps.${NC}"
+            exit 1
+        fi
+    elif ! jq -e '(.terminalReason | length) > 0' "$plan_file" >/dev/null; then
+        echo -e "${RED}Error: terminal planning dispositions require terminalReason.${NC}"
+        exit 1
+    fi
+}
+
+validate_plan_review_semantics() {
+    local story_id="$1" plan_file="$2" review_file="$3" contract_hash plan_hash expected actual
+    contract_hash="$(sha256_file "$ACTIVE_CONTRACT_FILE")"
+    plan_hash="$(sha256_file "$plan_file")"
+    if ! jq -e --arg id "$story_id" --arg ch "$contract_hash" --arg ph "$plan_hash" '
+      .storyId==$id and .contractHash==$ch and .planHash==$ph
+      and (.verdict|IN("APPROVED","CHANGES_REQUESTED"))
+      and (.summary|type=="string" and length>0) and (.findings|type=="array") and (.acCoverage|type=="array")
+      and all(.acCoverage[]; (.acId|type=="string" and length>0) and (.details|type=="string" and length>0))
+      and (if .verdict=="APPROVED" then (.findings|length)==0 and all(.acCoverage[]; .status=="pass") else true end)
+    ' "$review_file" >/dev/null; then
+        echo -e "${RED}Error: plan review violates schema, identity hashes, or approval invariants.${NC}"
+        exit 1
+    fi
+    expected="$(jq -c '[.acceptanceCriteria[].id]|sort' "$ACTIVE_CONTRACT_FILE")"
+    actual="$(jq -c '[.acCoverage[].acId]|sort' "$review_file")"
+    if [ "$expected" != "$actual" ]; then
+        echo -e "${RED}Error: plan review must evaluate every acceptance criterion exactly once.${NC}"
+        exit 1
+    fi
+}
+
+ensure_approved_story_plan() {
+    local story_id="$1" state_file status round prior_review plan_file review_file prompt_file disposition verdict
+    state_file="$(planning_state_file "$story_id")"
+    if [ ! -f "$state_file" ]; then
+        write_planning_state "$story_id" "PLANNING" 0
+    fi
+
+    while :; do
+        status="$(jq -r '.status' "$state_file")"
+        round="$(jq -r '.round' "$state_file")"
+        case "$status" in
+          APPROVED)
+            ACTIVE_PLAN_FILE="$STORIES_ROOT/${story_id}.approved-plan.json"
+            [ -f "$ACTIVE_PLAN_FILE" ] || { echo -e "${RED}Error: approved plan state has no artifact.${NC}"; exit 1; }
+            return 0
+            ;;
+          SPLIT_REQUIRED|BLOCKED|PLAN_REVIEW_LIMIT)
+            echo -e "${RED}Planning stopped for $story_id with state $status. See $(display_path "$state_file").${NC}"
+            return 2
+            ;;
+          PLANNING|CHANGES_REQUESTED)
+            if [ "$round" -ge "$PLAN_REVIEW_MAX_ROUNDS" ]; then
+                write_planning_state "$story_id" "PLAN_REVIEW_LIMIT" "$round" "$(jq -r '.planFile // empty' "$state_file")" "$(jq -r '.reviewFile // empty' "$state_file")"
+                continue
+            fi
+            prior_review="$(jq -r '.reviewFile // empty' "$state_file")"
+            round=$((round + 1))
+            plan_file="$STORIES_ROOT/${story_id}.plan-${round}.json"
+            prompt_file="$RUN_DIR/${story_id}-plan-${round}.prompt.txt"
+            build_planner_input "$story_id" "$round" "$prior_review" > "$prompt_file"
+            set_active_phase "PLANNING"
+            run_structured_readonly_agent "$IMPLEMENTATION_AGENT" "$IMPLEMENTATION_MODEL" "$PLAN_SCHEMA_FILE" "$prompt_file" "$plan_file" "$story_id" "plan-$round"
+            validate_plan_semantics "$story_id" "$plan_file"
+            write_planning_state "$story_id" "REVIEW_REQUIRED" "$round" "$plan_file"
+            ;;
+          REVIEW_REQUIRED)
+            plan_file="$(jq -r '.planFile' "$state_file")"
+            [ -f "$plan_file" ] || { echo -e "${RED}Error: planning resume artifact is missing: $plan_file${NC}"; exit 1; }
+            review_file="$STORIES_ROOT/${story_id}.plan-review-${round}.json"
+            prompt_file="$RUN_DIR/${story_id}-plan-review-${round}.prompt.txt"
+            build_plan_review_input "$story_id" "$round" "$plan_file" > "$prompt_file"
+            set_active_phase "PLAN_REVIEW"
+            run_structured_readonly_agent "$REVIEW_AGENT" "$REVIEW_MODEL" "$PLAN_REVIEW_SCHEMA_FILE" "$prompt_file" "$review_file" "$story_id" "plan-review-$round"
+            validate_plan_review_semantics "$story_id" "$plan_file" "$review_file"
+            verdict="$(jq -r '.verdict' "$review_file")"
+            if [ "$verdict" = "CHANGES_REQUESTED" ]; then
+                write_planning_state "$story_id" "CHANGES_REQUESTED" "$round" "$plan_file" "$review_file"
+                continue
+            fi
+            disposition="$(jq -r '.disposition' "$plan_file")"
+            if [ "$disposition" = "PLAN_READY" ]; then
+                cp "$plan_file" "$STORIES_ROOT/${story_id}.approved-plan.json"
+                ACTIVE_PLAN_FILE="$STORIES_ROOT/${story_id}.approved-plan.json"
+                write_planning_state "$story_id" "APPROVED" "$round" "$plan_file" "$review_file" "$disposition"
+                set_active_phase "PLAN_APPROVED"
+                return 0
+            fi
+            atomic_jq_replace "$PRD_FILE" --arg id "$story_id" --arg status "$disposition" --arg reason "$(jq -r '.terminalReason' "$plan_file")" --arg at "$(utc_timestamp)" \
+              '(.userStories[] | select(.id==$id)).execution={status:$status,reason:$reason,at:$at}'
+            write_planning_state "$story_id" "$disposition" "$round" "$plan_file" "$review_file" "$disposition"
+            set_active_phase "$disposition"
+            echo -e "${YELLOW}Adversarial planning approved terminal disposition $disposition for $story_id.${NC}"
+            return 2
+            ;;
+          *)
+            echo -e "${RED}Error: unknown persisted planning state '$status'.${NC}"
+            exit 1
+            ;;
+        esac
+    done
+}
+
 get_active_story_id() {
-    jq -r '[.userStories[] | select(.passes == false)] | sort_by(.priority, .id) | .[0].id // empty' "$PRD_FILE"
+    jq -r '
+      .userStories as $stories
+      | [.userStories[]
+         | select((.passes // false) == false and ((.status // "APPROVED") == "APPROVED"))
+         | select(all((.dependsOn // [])[]?; . as $dep | any($stories[]; .id == $dep and (.passes // false) == true)))]
+      | sort_by(.priority, .id) | .[0].id // empty
+    ' "$PRD_FILE"
+}
+
+select_or_load_active_story() {
+    local snapshot_tmp source_hash snapshot_hash locked_hash
+    if [ -f "$ACTIVE_LOCK_FILE" ]; then
+        if ! jq -e '
+          (.storyId | type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"))
+          and (.sourceHash|type=="string" and length>0) and (.contractHash|type=="string" and length>0)
+          and (.storySnapshot|type=="object") and .storySnapshot.id==.storyId
+        ' "$ACTIVE_LOCK_FILE" >/dev/null; then
+            echo -e "${RED}Error: active-story lock is malformed.${NC}"
+            exit 1
+        fi
+        ACTIVE_STORY_ID="$(jq -r '.storyId' "$ACTIVE_LOCK_FILE")"
+        ACTIVE_STORY_TITLE="$(jq -r '.storySnapshot.title' "$ACTIVE_LOCK_FILE")"
+        snapshot_tmp="$(mktemp "$STATE_DIR/locked-snapshot.XXXXXX")"
+        jq -S '.storySnapshot' "$ACTIVE_LOCK_FILE" > "$snapshot_tmp"
+        snapshot_hash="$(sha256_file "$snapshot_tmp")"
+        rm -f "$snapshot_tmp"
+        locked_hash="$(jq -r '.contractHash' "$ACTIVE_LOCK_FILE")"
+        [ "$snapshot_hash" = "$locked_hash" ] || { echo -e "${RED}Error: active-story lock snapshot hash mismatch.${NC}"; exit 1; }
+        return 0
+    fi
+
+    ACTIVE_STORY_ID="$(get_active_story_id)"
+    [ -n "$ACTIVE_STORY_ID" ] || { echo -e "${RED}Error: no runnable approved story. Resolve drafts or dependencies.${NC}"; exit 1; }
+    if prd_is_legacy && [ -n "$(worktree_snapshot_outside_state)" ]; then
+        if [ "$ALLOW_DIRTY_LEGACY_START" != "1" ]; then
+            echo -e "${RED}Error: interrupted legacy remediation requires LOOPER_ALLOW_DIRTY_LEGACY_START=1 to adopt existing changes.${NC}"
+            exit 1
+        fi
+    else
+        require_clean_story_start
+    fi
+    snapshot_tmp="$(mktemp "$STATE_DIR/story-snapshot.XXXXXX")"
+    if ! canonical_story_snapshot "$ACTIVE_STORY_ID" > "$snapshot_tmp"; then
+        rm -f "$snapshot_tmp"
+        echo -e "${RED}Error: could not canonicalize selected story without mutating the PRD.${NC}"
+        exit 1
+    fi
+    source_hash="$(sha256_file "$PRD_FILE")"
+    write_new_active_lock "$ACTIVE_STORY_ID" "$snapshot_tmp" "$source_hash"
+    ACTIVE_STORY_TITLE="$(jq -r '.title' "$snapshot_tmp")"
+    rm -f "$snapshot_tmp"
 }
 
 get_story_title() {
@@ -1504,26 +1987,7 @@ migrate_legacy_state_layout() {
 }
 
 has_uncommitted_changes() {
-    local rel_state_dir
-    if [[ "$STATE_DIR" == "$PROJECT_DIR/"* ]]; then
-        rel_state_dir="${STATE_DIR#$PROJECT_DIR/}"
-        if [ -n "$rel_state_dir" ]; then
-            [ -n "$(git -C "$PROJECT_DIR" status --porcelain -- . \
-                ":(exclude)$rel_state_dir/reviews/**" \
-                ":(exclude)$rel_state_dir/stories/**" \
-                ":(exclude)$rel_state_dir/progress.txt" \
-                ":(exclude)$rel_state_dir/archive/**")" ]
-            return
-        fi
-    fi
-
-    if ! git -C "$PROJECT_DIR" diff --quiet; then
-        return 0
-    fi
-    if ! git -C "$PROJECT_DIR" diff --cached --quiet; then
-        return 0
-    fi
-    [ -n "$(git -C "$PROJECT_DIR" ls-files --others --exclude-standard)" ]
+    [ -n "$(worktree_snapshot_outside_state)" ]
 }
 
 mark_story_passed() {
@@ -1537,7 +2001,12 @@ mark_story_passed() {
 stage_and_commit_story() {
     local story_id="$1"
     local story_title="$2"
-    local rel_state_dir
+    local rel_state_dir prd_backup
+
+    prd_backup="$(mktemp "$RUN_DIR/prd-before-commit.XXXXXX")"
+    cp "$PRD_FILE" "$prd_backup"
+    mark_story_passed "$story_id"
+    set_active_phase "COMMITTING"
 
     git -C "$PROJECT_DIR" add -A
 
@@ -1547,19 +2016,31 @@ stage_and_commit_story() {
         git -C "$PROJECT_DIR" reset -q -- \
             "$rel_state_dir/reviews" \
             "$rel_state_dir/stories" \
+            "$rel_state_dir/active-story.json" \
             "$rel_state_dir/progress.txt" \
             "$rel_state_dir/archive" 2>/dev/null || true
     fi
 
     if git -C "$PROJECT_DIR" diff --cached --quiet; then
         echo -e "${YELLOW}No staged changes to commit for $story_id.${NC}"
+        cp "$prd_backup" "$PRD_FILE"
         return 1
     fi
 
     if [ -z "$story_title" ]; then
         story_title="Story"
     fi
-    git -C "$PROJECT_DIR" commit -m "$story_id: $story_title"
+    if ! git -C "$PROJECT_DIR" commit -m "$story_id: $story_title"; then
+        cp "$prd_backup" "$PRD_FILE"
+        if [[ "$PRD_FILE" == "$PROJECT_DIR/"* ]]; then
+            git -C "$PROJECT_DIR" reset -q -- "${PRD_FILE#$PROJECT_DIR/}" 2>/dev/null || true
+        fi
+        set_active_phase "COMMIT_FAILED"
+        echo -e "${RED}Error: commit failed; $story_id remains unresolved and its approved plan is preserved for retry.${NC}"
+        return 1
+    fi
+    rm -f "$ACTIVE_LOCK_FILE"
+    return 0
 }
 
 normalize_single_line() {
@@ -1693,6 +2174,8 @@ build_phase_input() {
     echo "- PRD file: $prd_display"
     story_display="$(display_path "$story_file")"
     echo "- Story file: $story_display"
+    echo "- Immutable contract file: $(display_path "$ACTIVE_CONTRACT_FILE")"
+    echo "- Approved plan file: $(display_path "$ACTIVE_PLAN_FILE")"
     progress_display="$PROGRESS_FILE"
     if [[ "$progress_display" == "$PROJECT_DIR/"* ]]; then
         progress_display="${progress_display#$PROJECT_DIR/}"
@@ -1758,6 +2241,8 @@ build_review_input() {
     echo "- Progress log file: $progress_display"
     story_display="$(display_path "$story_file")"
     echo "- Story file: $story_display"
+    echo "- Immutable contract file: $(display_path "$ACTIVE_CONTRACT_FILE")"
+    echo "- Approved plan file: $(display_path "$ACTIVE_PLAN_FILE")"
 }
 
 run_claude_phase() {
@@ -1809,8 +2294,8 @@ run_codex_phase() {
 
     run_with_log "$story_id" "$ACTIVE_STORY_TITLE" \
         "codex" "$phase_label" "$log_file" "plain" \
-        bash -lc 'cat "$1" | codex exec -s danger-full-access -C "$2" --skip-git-repo-check --ephemeral -' -- \
-        "$prompt_input_file" "$PROJECT_DIR"
+        bash -c 'cat "$1" | "$3" exec -s danger-full-access -C "$2" --skip-git-repo-check --ephemeral -' -- \
+        "$prompt_input_file" "$PROJECT_DIR" "$CODEX_BIN"
 }
 
 run_claude_review_round() {
@@ -1852,8 +2337,8 @@ run_codex_review_round() {
 
     run_with_log "$story_id" "$story_title" \
         "codex" "Codex review round $round" "$events_file" "codex-jsonl" \
-        bash -lc 'cat "$1" | codex -a never -s workspace-write exec --ephemeral --json --output-schema "$2" -o "$3" -' -- \
-        "$review_input_file" "$REVIEW_SCHEMA_FILE" "$review_json_tmp"
+        bash -c 'cat "$1" | "$4" -a never -s workspace-write exec --ephemeral --json --output-schema "$2" -o "$3" -' -- \
+        "$review_input_file" "$REVIEW_SCHEMA_FILE" "$review_json_tmp" "$CODEX_BIN"
 
     REVIEW_JSON_RESULT="$review_json_tmp"
 }
@@ -1864,12 +2349,14 @@ opencode_run_stdin() {
     local prompt_file="$1"
     local model="$2"
     local dir="$3"
+    local mode="${4:-auto}"
     bash -lc '
-        prompt="$1"; model="$2"; dir="$3"
-        set -- run --auto --format json --dir "$dir"
+        prompt="$1"; model="$2"; dir="$3"; mode="$4"
+        set -- run --format json --dir "$dir"
+        if [ "$mode" = "auto" ]; then set -- "$@" --auto; fi
         [ -n "$model" ] && set -- "$@" --model "$model"
         cat "$prompt" | opencode "$@"
-    ' -- "$prompt_file" "$model" "$dir"
+    ' -- "$prompt_file" "$model" "$dir" "$mode"
 }
 
 # Pull the assistant text out of an opencode JSON-event log, extract the first
@@ -1928,10 +2415,12 @@ extract_opencode_review_json() {
               and (.priority | IN("P0","P1","P2","P3"))
               and (.title | type == "string" and (length > 0))
               and (.details | type == "string" and (length > 0))
-              and (.location | type == "string" and (length > 0))))
+              and (.location | type == "string" and (length > 0))
+              and (.axis | IN("standards","spec"))))
         and (.acCoverage | type == "array")
         and (all(.acCoverage[]?;
-              (.criterion | type == "string" and (length > 0))
+              (.criterionId | type == "string" and (length > 0))
+              and (.criterion | type == "string" and (length > 0))
               and (.status | IN("pass","fail"))
               and (.details | type == "string" and (length > 0))))
         and (.testGaps | type == "array")
@@ -1967,7 +2456,7 @@ run_opencode_phase() {
 
     run_with_log "$story_id" "$ACTIVE_STORY_TITLE" \
         "opencode" "$phase_label" "$log_file" "opencode-jsonl" \
-        opencode_run_stdin "$prompt_input_file" "$IMPLEMENTATION_MODEL" "$PROJECT_DIR"
+        opencode_run_stdin "$prompt_input_file" "$IMPLEMENTATION_MODEL" "$PROJECT_DIR" "auto"
 }
 
 run_opencode_review_round() {
@@ -2010,7 +2499,7 @@ run_opencode_review_round() {
 
     run_with_log "$story_id" "$story_title" \
         "opencode-review" "opencode review round $round" "$events_file" "opencode-jsonl" \
-        opencode_run_stdin "$review_input_file" "$REVIEW_MODEL" "$PROJECT_DIR"
+        opencode_run_stdin "$review_input_file" "$REVIEW_MODEL" "$PROJECT_DIR" "auto"
 
     if extract_opencode_review_json "$events_file" "$review_json_tmp"; then
         REVIEW_JSON_RESULT="$review_json_tmp"
@@ -2038,7 +2527,7 @@ run_opencode_review_round() {
 
     run_with_log "$story_id" "$story_title" \
         "opencode-review" "opencode review round $round (repair)" "$repair_events_file" "opencode-jsonl" \
-        opencode_run_stdin "$repair_input_file" "$REVIEW_MODEL" "$PROJECT_DIR"
+        opencode_run_stdin "$repair_input_file" "$REVIEW_MODEL" "$PROJECT_DIR" "auto"
 
     if ! extract_opencode_review_json "$repair_events_file" "$review_json_tmp"; then
         echo -e "${RED}Error: opencode review round $round failed to produce schema-valid JSON after one repair attempt.${NC}" >&2
@@ -2050,12 +2539,55 @@ run_opencode_review_round() {
     REVIEW_JSON_RESULT="$review_json_tmp"
 }
 
+run_harness_validations() {
+    local story_id="$1" validation_file command command_id=0 failed=0 log_file tmp
+    validation_file="$STORIES_ROOT/${story_id}.validation.json"
+    tmp="$(mktemp "$STATE_DIR/validation.XXXXXX")"
+    echo '[]' > "$tmp"
+    set_active_phase "VALIDATING"
+
+    while IFS= read -r command || [ -n "$command" ]; do
+        [ -n "$command" ] || continue
+        command_id=$((command_id + 1))
+        log_file="$RUN_DIR/${story_id}-validation-${command_id}.log"
+        echo "Running harness validation $command_id: $command"
+        if run_with_log "$story_id" "$ACTIVE_STORY_TITLE" "validation" "Harness validation $command_id" "$log_file" "plain" \
+            bash -lc "$command"; then
+            jq --arg command "$command" --arg log "$(display_path "$log_file")" '. += [{command:$command,status:"pass",log:$log}]' "$tmp" > "$tmp.next"
+        else
+            jq --arg command "$command" --arg log "$(display_path "$log_file")" '. += [{command:$command,status:"fail",log:$log}]' "$tmp" > "$tmp.next"
+            failed=1
+        fi
+        mv "$tmp.next" "$tmp"
+    done < <(
+        if [ -n "$VALIDATION_COMMANDS" ]; then printf '%s\n' "$VALIDATION_COMMANDS"; fi
+        jq -r '.proofExpectations[]? | .command // empty' "$ACTIVE_CONTRACT_FILE"
+    )
+
+    mv "$tmp" "$validation_file"
+    if [ "$failed" -ne 0 ]; then
+        set_active_phase "VALIDATION_FAILED"
+        ensure_story_state_file "$story_id" "$ACTIVE_STORY_TITLE"
+        replace_story_section "$ACTIVE_STORY_FILE" "current-status" "- Phase: validation failed
+- Review round: 0
+- Latest review verdict: VALIDATION_FAILED
+- Last updated: $(utc_timestamp)"
+        replace_story_section "$ACTIVE_STORY_FILE" "open-findings" "- Harness-owned validation failed. Inspect $(display_path "$validation_file") and its logs, fix the implementation, and rerun every check."
+        append_story_history_entry "$ACTIVE_STORY_FILE" "Harness validation failed; remediation is required before code review."
+        echo -e "${RED}Error: harness validation failed for $story_id. See $(display_path "$validation_file").${NC}"
+        return 1
+    fi
+    set_active_phase "VALIDATED"
+    return 0
+}
+
 run_implementation_phase() {
     local phase="$1"
     local story_id="$2"
     local story_title="$3"
     local review_round="${4:-}"
 
+    set_active_phase "IMPLEMENTING"
     prepare_story_handoff_section "$story_id" "$story_title" "$phase" "$review_round"
 
     case "$IMPLEMENTATION_AGENT" in
@@ -2066,6 +2598,7 @@ run_implementation_phase() {
 
     validate_story_handoff_section "$story_id" "$ACTIVE_STORY_FILE"
     record_implementation_history "$story_id" "$phase" "$review_round" "$ACTIVE_STORY_FILE"
+    run_harness_validations "$story_id"
 }
 
 run_review_round() {
@@ -2074,11 +2607,34 @@ run_review_round() {
     local round="$3"
     local story_file="$4"
 
+    set_active_phase "CODE_REVIEW"
     case "$REVIEW_AGENT" in
         claude) run_claude_review_round "$story_id" "$story_title" "$round" "$story_file" ;;
         codex) run_codex_review_round "$story_id" "$story_title" "$round" "$story_file" ;;
         opencode) run_opencode_review_round "$story_id" "$story_title" "$round" "$story_file" ;;
     esac
+}
+
+validate_code_review_semantics() {
+    local review_file="$1" expected actual
+    if ! jq -e '
+      (.verdict | IN("APPROVED","CHANGES_REQUESTED"))
+      and (.summary | type == "string" and length > 0)
+      and (.findings | type == "array") and (.acCoverage | type == "array") and (.testGaps | type == "array")
+      and all(.findings[]?; (.axis | IN("standards","spec")))
+      and (if .verdict == "APPROVED" then
+             (.findings | length) == 0 and (.testGaps | length) == 0 and all(.acCoverage[]; .status == "pass")
+           else true end)
+    ' "$review_file" >/dev/null; then
+        echo -e "${RED}Error: code review output violates approval invariants.${NC}"
+        exit 1
+    fi
+    expected="$(jq -c '[.acceptanceCriteria[] | {id:.id,text:.text}] | sort_by(.id)' "$ACTIVE_CONTRACT_FILE")"
+    actual="$(jq -c '[.acCoverage[] | {id:.criterionId,text:.criterion}] | sort_by(.id)' "$review_file")"
+    if [ "$expected" != "$actual" ]; then
+        echo -e "${RED}Error: code review must evaluate every locked acceptance criterion exactly once by stable ID.${NC}"
+        exit 1
+    fi
 }
 
 if [ "$MODE" = "help" ]; then
@@ -2102,6 +2658,7 @@ else
         echo "Review model: ${REVIEW_MODEL:-<opencode default>}"
     fi
     echo "Review rounds per story: $REVIEW_MAX_ROUNDS"
+    echo "Plan review rounds per story: $PLAN_REVIEW_MAX_ROUNDS"
 fi
 
 # Validate prerequisites.
@@ -2113,6 +2670,10 @@ if [ "$MODE" != "watch" ]; then
 fi
 if ! [[ "$REVIEW_MAX_ROUNDS" =~ ^[0-9]+$ ]] || [ "$REVIEW_MAX_ROUNDS" -lt 1 ]; then
     echo -e "${RED}Error: LOOPER_REVIEW_MAX_ROUNDS must be a positive integer.${NC}"
+    exit 1
+fi
+if ! [[ "$PLAN_REVIEW_MAX_ROUNDS" =~ ^[0-9]+$ ]] || [ "$PLAN_REVIEW_MAX_ROUNDS" -lt 1 ]; then
+    echo -e "${RED}Error: LOOPER_PLAN_REVIEW_MAX_ROUNDS must be a positive integer.${NC}"
     exit 1
 fi
 if ! [[ "$KEEP_LOGS" =~ ^[01]$ ]]; then
@@ -2130,7 +2691,7 @@ if [ "$MODE" != "watch" ]; then
         require_command claude
     fi
     if [ "$IMPLEMENTATION_AGENT" = "codex" ] || [ "$REVIEW_AGENT" = "codex" ]; then
-        require_command codex
+        require_command "$CODEX_BIN"
     fi
     if [ "$IMPLEMENTATION_AGENT" = "opencode" ] || [ "$REVIEW_AGENT" = "opencode" ]; then
         require_command opencode
@@ -2177,6 +2738,12 @@ if [ ! -f "$REVIEW_SCHEMA_FILE" ]; then
     echo -e "${RED}Error: review schema not found at $REVIEW_SCHEMA_FILE${NC}"
     exit 1
 fi
+for required_file in "$PRD_SCHEMA_FILE" "$PLANNER_PROMPT_FILE" "$PLAN_REVIEW_PROMPT_FILE" "$PLAN_SCHEMA_FILE" "$PLAN_REVIEW_SCHEMA_FILE"; do
+    if [ ! -f "$required_file" ]; then
+        echo -e "${RED}Error: required Looper planning asset not found at $required_file${NC}"
+        exit 1
+    fi
+done
 
 if [ -f "$PROMPT_SHARED_FILE" ]; then
     echo "Shared prompt addendum: $PROMPT_SHARED_FILE"
@@ -2194,11 +2761,25 @@ if [ -f "$LEGACY_REVIEW_PROMPT_FILE" ]; then
     echo -e "${YELLOW}Ignoring deprecated prompt file: $LEGACY_REVIEW_PROMPT_FILE (use prompt.reviewer.md).${NC}"
 fi
 
+if [ -f "$ACTIVE_LOCK_FILE" ]; then
+    jq -e . "$PRD_FILE" >/dev/null 2>&1 || { echo -e "${RED}Error: live PRD backlog is not valid JSON.${NC}"; exit 1; }
+    recover_terminal_replacements
+else
+    validate_prd_contracts
+fi
+
 CURRENT_BRANCH="$(jq -r '.branchName // empty' "$PRD_FILE")"
 if [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" = "null" ]; then
     CURRENT_BRANCH="$CURRENT_GIT_BRANCH_RAW"
 fi
 mkdir -p "$STATE_DIR"
+
+EXPECTED_BRANCH_SLUG="$CURRENT_BRANCH"
+case "$EXPECTED_BRANCH_SLUG" in codex/*|looper/*) EXPECTED_BRANCH_SLUG="${EXPECTED_BRANCH_SLUG#*/}" ;; esac
+if [ "$EXPECTED_BRANCH_SLUG" != "$STATE_BRANCH_NAME" ] && [ "$CURRENT_BRANCH" != "$CURRENT_GIT_BRANCH_RAW" ]; then
+    echo -e "${RED}Error: PRD branch '$CURRENT_BRANCH' does not match current branch '$CURRENT_GIT_BRANCH_RAW'.${NC}"
+    exit 1
+fi
 
 echo "Branch: $CURRENT_BRANCH"
 echo "Progress file: $PROGRESS_FILE"
@@ -2232,21 +2813,36 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
     echo -e "${GREEN}=======================================================${NC}"
     echo ""
 
-    INCOMPLETE="$(jq '[.userStories[] | select(.passes == false)] | length' "$PRD_FILE")"
-    if [ "$INCOMPLETE" -eq 0 ]; then
+    INCOMPLETE="$(jq '[.userStories[] | select((.passes // false) == false)] | length' "$PRD_FILE")"
+    if [ "$INCOMPLETE" -eq 0 ] && [ ! -f "$ACTIVE_LOCK_FILE" ]; then
         echo -e "${GREEN}All stories complete! Looper is done.${NC}"
         exit 0
     fi
 
-    ACTIVE_STORY_ID="$(get_active_story_id)"
-    ACTIVE_STORY_TITLE="$(get_story_title "$ACTIVE_STORY_ID")"
+    select_or_load_active_story
 
-    if [ -z "$ACTIVE_STORY_ID" ]; then
-        echo -e "${RED}Error: Could not determine active story.${NC}"
+    echo "Active story: $ACTIVE_STORY_ID - $ACTIVE_STORY_TITLE"
+
+    ensure_story_contract_lock "$ACTIVE_STORY_ID"
+    if ! ensure_approved_story_plan "$ACTIVE_STORY_ID"; then
+        echo -e "${RED}Looper stopped before implementation; the persisted planning state is resumable.${NC}"
         exit 1
     fi
 
-    echo "Active story: $ACTIVE_STORY_ID - $ACTIVE_STORY_TITLE"
+    RESUME_PHASE="$(jq -r '.phase // empty' "$ACTIVE_LOCK_FILE")"
+    if [ "$RESUME_PHASE" = "COMMIT_FAILED" ] || [ "$RESUME_PHASE" = "APPROVED_PENDING_COMMIT" ] || [ "$RESUME_PHASE" = "COMMITTING" ]; then
+        echo "Resuming approved commit for $ACTIVE_STORY_ID from state $RESUME_PHASE."
+        if ! stage_and_commit_story "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE"; then
+            exit 1
+        fi
+        ensure_story_state_file "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE"
+        append_story_history_entry "$ACTIVE_STORY_FILE" "Story committed and marked passed after commit resume."
+        if [ "$(jq '[.userStories[] | select(.passes == false and ((.execution.status // "PENDING") != "REPLACED"))] | length' "$PRD_FILE")" -eq 0 ]; then
+            echo -e "${GREEN}All stories complete! Looper is done.${NC}"
+            exit 0
+        fi
+        continue
+    fi
 
     ensure_story_state_file "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE"
     INITIAL_PHASE="implementation"
@@ -2277,6 +2873,7 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
         REVIEW_JSON_RESULT=""
         run_review_round "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$round" "$ACTIVE_STORY_FILE"
         REVIEW_JSON_FILE="$REVIEW_JSON_RESULT"
+        validate_code_review_semantics "$REVIEW_JSON_FILE"
         update_story_review_state "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$REVIEW_JSON_FILE" "$round" "$(agent_display_name "$REVIEW_AGENT")"
         VERDICT="$(jq -r '.verdict // empty' "$REVIEW_JSON_FILE")"
 
@@ -2310,12 +2907,14 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
 
     record_approval_summary "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" "$APPROVED_REVIEW_JSON" "$ACTIVE_STORY_FILE" "$APPROVED_ROUND" "$(agent_display_name "$REVIEW_AGENT")"
     rm -f "$APPROVED_REVIEW_JSON"
-    mark_story_passed "$ACTIVE_STORY_ID"
+    set_active_phase "APPROVED_PENDING_COMMIT"
+    if ! stage_and_commit_story "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE"; then
+        exit 1
+    fi
     ensure_story_state_file "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE"
-    append_story_history_entry "$ACTIVE_STORY_FILE" "Story approved and marked passed."
-    stage_and_commit_story "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE" || true
+    append_story_history_entry "$ACTIVE_STORY_FILE" "Story approved, committed, and marked passed."
 
-    if [ "$(jq '[.userStories[] | select(.passes == false)] | length' "$PRD_FILE")" -eq 0 ]; then
+    if [ "$(jq '[.userStories[] | select(.passes == false and ((.execution.status // "PENDING") != "REPLACED"))] | length' "$PRD_FILE")" -eq 0 ]; then
         echo -e "${GREEN}All stories complete! Looper is done.${NC}"
         exit 0
     fi
