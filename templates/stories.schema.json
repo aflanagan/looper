@@ -50,6 +50,7 @@
         "round": { "type": "integer", "minimum": 1 },
         "proposalHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "reviewHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "revisionHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "sourceHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "author": { "type": "object", "required": ["agent", "model"], "properties": { "agent": {"type":"string","minLength":1}, "model": {"type":"string"} } },
         "reviewer": { "type": "object", "required": ["agent", "model"], "properties": { "agent": {"type":"string","minLength":1}, "model": {"type":"string"} } },

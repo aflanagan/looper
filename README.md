@@ -10,20 +10,49 @@ Give Looper an authoritative PRD or bounded task spec. It snapshots the source, 
 <br /><br />
 
 ```
-PRD or bounded spec → proposed stories → adversarial decomposition review
+PRD or bounded spec → complete round-1 proposal → validate/repair author output
+    → broad adversarial decomposition review
+    → [ stable-ID revision → deterministic reconstruction → focused closure review ]
     → approved story contracts → lock one story
     → [ read-only plan → adversarial plan review → revise? ]
     → [ implementation → harness checks → code review → remediate? ]
     → one final commit → next story
 ```
 
+## Quick Start
+
+Choose the input by scope; both routes enter the same decomposition, planning, implementation, validation, and review pipeline.
+
+| Starting point | Prepare and inspect first | Prepare and run end to end |
+|---|---|---|
+| Whole-feature or multi-story PRD | `looper prepare --prd plans/feature.md` | `looper start --prd plans/feature.md` |
+| Bounded end-to-end task spec | `looper prepare --spec tasks/task.md` | `looper start --spec tasks/task.md` |
+
+`prepare` snapshots the source, decomposes it into independently reviewed stories, and stops after publishing approved `stories.json`. Run `looper` afterward to execute those stories. `start` performs that same preparation and immediately continues into story execution; it is not a separate or weaker workflow.
+
+```bash
+# Inspect the generated stories before implementation
+looper prepare --spec tasks/theme-toggle.md
+jq '.stories[] | {id, title, dependsOn}' .looper/my-branch/stories.json
+looper
+
+# Or run a complete PRD without stopping after preparation
+looper start --prd plans/dark-mode.md
+```
+
+Rerunning the same `prepare` or `start` command resumes from the persisted boundary. Correctable author/reviewer output defects and bounded timeouts recover automatically; Looper asks for human input only for genuine source contradictions or material product choices. Each run uses the executable, prompts, and schemas captured when preparation first began, so updating the live Looper checkout does not alter an in-progress run.
+
 ## How It Works
 
 1. Create an authoritative PRD or bounded task spec.
 2. Run `looper prepare --prd PATH` or `looper prepare --spec PATH`. Looper snapshots it as immutable `source.md`, proposes stories, and adversarially reviews their source coverage and boundaries.
-3. On approval, Looper atomically publishes schema-v3 `.looper/<branch-name>/stories.json`. Contradictions or material ambiguity stop in `NEEDS_HUMAN`; review exhaustion stops in `REVIEW_LIMIT`.
-4. Run `looper`. A new story starts only from a clean worktree outside Looper state. (`looper start` combines preparation and execution.)
-5. For each runnable story:
+3. Looper validates the complete first-round decomposition before broad review. Later `CHANGES_REQUESTED` rounds return stable-ID revision operations against the last reviewed proposal; Looper applies them deterministically and validates the reconstructed complete proposal before focused closure review.
+4. Correctable author- and reviewer-output defects get separate bounded same-round repairs. Transport/API failures retain their original diagnostics, author and reviewer timeouts receive bounded increased-timeout retries, and exhausted content repairs stop in distinct non-human invalid-output states.
+5. The first preparation captures the Looper executable and every resolved prompt/schema—including environment overrides—under the run state. Every later phase verifies and executes that pinned runtime, so a live checkout update cannot reinterpret persisted state.
+6. Genuine contradictions or material ambiguity stop in `NEEDS_HUMAN`. Mechanically correctable findings at the configured review limit stop in resumable `CORRECTABLE_REVIEW_LIMIT` rather than a human state.
+7. On approval, Looper atomically publishes schema-v3 `.looper/<branch-name>/stories.json`.
+8. Run `looper`. A new story starts only from a clean worktree outside Looper state. (`looper start` combines preparation and execution.)
+9. For each runnable story:
    - Looper creates an immutable contract snapshot and active-story lock.
    - The implementation agent plans in read-only mode; the review agent adversarially reviews the plan for up to `LOOPER_PLAN_REVIEW_MAX_ROUNDS` (default 3).
    - An approved `SPLIT_REQUIRED` or `BLOCKED` disposition stops before code. Approved replacement stories can recover a terminal story through their `replaces` lineage.
@@ -31,7 +60,7 @@ PRD or bounded spec → proposed stories → adversarial decomposition review
    - Looper runs configured proof commands itself, then the review agent reviews the uncommitted diff.
    - If review requests changes, Looper runs remediation and re-review (up to `LOOPER_REVIEW_MAX_ROUNDS`, default 5)
    - On approval, Looper commits once and marks the story passed atomically. A failed commit remains retryable and never marks the story passed.
-6. Stops when all stories pass or max iterations is reached
+10. Stops when all stories pass or max iterations is reached
 
 > **What happens if they can't agree?** After exhausting review rounds for a story, Looper stops with a non-zero exit and leaves the story unresolved. The next manual rerun resumes remediation for that same story.
 
@@ -64,7 +93,7 @@ export PATH="$HOME/bin:$PATH"
 
 You only need the CLI(s) for the agents you actually use. To run Claude on implementation and Codex on review (the default), you need both of those. To drive any other model, install `opencode` (`npm i -g opencode-ai`) and use the `opencode` agent — see [Using any model](#using-any-model).
 
-> **Cost note:** Source preparation adds a bounded decomposition/review loop, and each story adds plan generation/review before implementation/review. The defaults are three decomposition rounds, three planning rounds, and five code-review rounds. Every phase is persisted for exact-boundary resume.
+> **Cost note:** Source preparation adds a bounded decomposition/review loop, and each story adds plan generation/review before implementation/review. The defaults are three decomposition-review rounds, up to three same-round author repairs and three independent reviewer repairs, three planning rounds, and five code-review rounds. Every phase is persisted for exact-boundary resume.
 
 ## Usage
 
@@ -77,7 +106,7 @@ looper prepare --prd plans/dark-mode.md
 looper prepare --spec tasks/theme-toggle.md
 ```
 
-The source is copied byte-for-byte to `source.md` and bound to its kind and SHA-256 hash. The implementation agent proposes stories in read-only mode, the review agent adversarially reviews them, and only an approved proposal becomes `stories.json`. `NEEDS_HUMAN` and `REVIEW_LIMIT` preserve all artifacts without publishing partial work.
+The source is copied byte-for-byte to `source.md` and bound to its kind and SHA-256 hash. The implementation agent creates one complete first-round proposal in read-only mode, starts at the supplied repository root, and is explicitly prohibited from wider filesystem traversal. This is a command/prompt boundary plus write detection, not an OS-level filesystem read boundary. Later rounds return only stable-ID add/replace/remove operations. Looper applies those operations to the hash-locked base without array-index patching, preserves unaffected ordering/content, and runs the same complete semantic validator over the reconstructed proposal. Correctable failures are returned with machine-readable diagnostics without consuming a review round. Only an independently approved complete proposal becomes `stories.json`; terminal and resumable stops preserve their source, base, review, revision, transport, and diagnostic hashes.
 
 Use `start` to prepare and immediately enter the same execution engine:
 
@@ -146,9 +175,21 @@ looper watch --raw       # raw underlying log stream
       ├── stories.json         # Reviewed story contracts and execution state
       ├── decomposition/       # Persisted proposal/review rounds and approval
       │   ├── state.json
+      │   ├── proposal-N-attempt-A.json
+      │   ├── proposal-N-diagnostic-A.json
+      │   ├── revision-N-attempt-A.json
+      │   ├── revision-N-diagnostic-A.json
+      │   ├── proposal-N-attempt-A-agent-T.json
+      │   ├── proposal-N-attempt-A-raw-T.log
       │   ├── proposal-N.json
+      │   ├── review-N-attempt-A.json
+      │   ├── review-N-diagnostic-A.json
       │   ├── review-N.json
       │   └── approved.json
+      ├── runtime/             # Hash-verified executable + prompt/schema snapshot
+      │   ├── manifest.json
+      │   ├── bin/looper
+      │   └── templates/
       ├── prompt.shared.md     # Optional: prompt guidance shared by both agents
       ├── prompt.implementer.md # Optional: implementation-only addendum
       ├── prompt.reviewer.md   # Optional: review-only addendum
@@ -186,7 +227,11 @@ Active run metadata and watch logs are kept under your temp directory, not under
 | `LOOPER_REVIEW_MODEL` | _(opencode default)_ | Model for the `opencode` review agent, as `provider/model` (e.g. `anthropic/claude-sonnet-4-20250514`). Ignored by `claude`/`codex`. |
 | `LOOPER_REVIEW_MAX_ROUNDS` | `5` | Max review/remediation cycles per story before Looper exits non-zero |
 | `LOOPER_PLAN_REVIEW_MAX_ROUNDS` | `3` | Max persisted plan/review cycles before implementation is blocked |
-| `LOOPER_DECOMPOSITION_REVIEW_MAX_ROUNDS` | `3` | Max persisted source decomposition/review cycles before `REVIEW_LIMIT` |
+| `LOOPER_DECOMPOSITION_REVIEW_MAX_ROUNDS` | `3` | Max persisted source decomposition/review cycles before mechanically correctable findings pause in `CORRECTABLE_REVIEW_LIMIT` |
+| `LOOPER_DECOMPOSITION_OUTPUT_REPAIR_MAX_ATTEMPTS` | `3` | Max same-round decomposer repairs after an invalid author output before `DECOMPOSITION_OUTPUT_INVALID` |
+| `LOOPER_DECOMPOSITION_REVIEW_OUTPUT_REPAIR_MAX_ATTEMPTS` | `3` | Max same-round reviewer repairs after invalid reviewer output before `DECOMPOSITION_REVIEW_OUTPUT_INVALID` |
+| `LOOPER_DECOMPOSITION_AGENT_TIMEOUT_SECONDS` | `600` | Base per-invocation timeout for read-only decomposition author and reviewer agents |
+| `LOOPER_DECOMPOSITION_TIMEOUT_MAX_RETRIES` | `1` | Bounded author/reviewer timeout retries; each retry increases the timeout without consuming a review/content-repair round |
 | `LOOPER_VALIDATION_COMMANDS` | _(empty)_ | Optional newline-separated harness commands; story proof-expectation commands are also run |
 | `LOOPER_KEEP_LOGS` | `0` | Preserve temp run logs on failure when set to `1` |
 | `LOOPER_IMPLEMENTATION_PROMPT_FILE` | `templates/prompt.implementer.md` | Override the base implementation prompt template |
@@ -195,7 +240,9 @@ Active run metadata and watch logs are kept under your temp directory, not under
 | `LOOPER_PLANNER_PROMPT_FILE` | `templates/prompt.planner.md` | Override the read-only planner prompt |
 | `LOOPER_PLAN_REVIEW_PROMPT_FILE` | `templates/prompt.plan-reviewer.md` | Override the adversarial plan-review prompt |
 | `LOOPER_DECOMPOSER_PROMPT_FILE` | `templates/prompt.decomposer.md` | Override the read-only source-decomposer prompt |
+| `LOOPER_DECOMPOSITION_REVISER_PROMPT_FILE` | `templates/prompt.decomposition-reviser.md` | Override the stable-ID late-round revision prompt |
 | `LOOPER_DECOMPOSITION_REVIEW_PROMPT_FILE` | `templates/prompt.decomposition-reviewer.md` | Override the adversarial decomposition-review prompt |
+| `LOOPER_DECOMPOSITION_REVISION_SCHEMA_FILE` | `templates/codex-decomposition-revision-schema.json` | Override the stable-ID revision structured-output schema |
 
 ## Using any model
 
@@ -270,7 +317,9 @@ The review agent must return JSON matching `templates/codex-review-schema.json`.
 | `templates/prompt.implementer.md` | Base implementation prompt |
 | `templates/prompt.reviewer.md` | Base review prompt |
 | `templates/prompt.decomposer.md` | Source decomposition prompt |
+| `templates/prompt.decomposition-reviser.md` | Stable-ID late-round decomposition revision prompt |
 | `templates/prompt.decomposition-reviewer.md` | Adversarial source-decomposition review prompt |
+| `templates/codex-decomposition-revision-schema.json` | Structured stable-ID revision contract |
 | `templates/codex-review-schema.json` | Structured output schema for the review agent (Codex native; injected into the prompt for opencode) |
 | `templates/stories.schema.json` | Published schema-v3 story-list contract |
 | `skills/looper/SKILL.md` | `/looper` source preparation and execution workflow |

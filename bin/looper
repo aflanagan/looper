@@ -24,12 +24,19 @@
 #   - LOOPER_REVIEW_AGENT (default codex)
 #   - LOOPER_REVIEW_MAX_ROUNDS (default 5)
 #   - LOOPER_PLAN_REVIEW_MAX_ROUNDS (default 3)
+#   - LOOPER_DECOMPOSITION_REVIEW_MAX_ROUNDS (default 3)
+#   - LOOPER_DECOMPOSITION_OUTPUT_REPAIR_MAX_ATTEMPTS (default 3)
+#   - LOOPER_DECOMPOSITION_REVIEW_OUTPUT_REPAIR_MAX_ATTEMPTS (default 3)
+#   - LOOPER_DECOMPOSITION_AGENT_TIMEOUT_SECONDS (default 600)
+#   - LOOPER_DECOMPOSITION_TIMEOUT_MAX_RETRIES (default 1)
 #   - LOOPER_VALIDATION_COMMANDS (optional newline-separated harness checks)
 #   - LOOPER_KEEP_LOGS (default 0; set to 1 to keep temp run logs on failure)
 #   - LOOPER_IMPLEMENTATION_PROMPT_FILE / LOOPER_REVIEW_PROMPT_FILE to override base prompt templates
 #   - LOOPER_REVIEW_SCHEMA_FILE to override review schema
 
 set -euo pipefail
+
+ORIGINAL_ARGS=("$@")
 
 # Find the looper installation directory (resolve symlinks)
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
@@ -186,6 +193,8 @@ SOURCE_FILE="$STATE_DIR/source.md"
 STORIES_FILE="$STATE_DIR/stories.json"
 DECOMPOSITION_ROOT="$STATE_DIR/decomposition"
 DECOMPOSITION_STATE_FILE="$DECOMPOSITION_ROOT/state.json"
+RUNTIME_ROOT="$STATE_DIR/runtime"
+RUNTIME_MANIFEST_FILE="$RUNTIME_ROOT/manifest.json"
 PROGRESS_FILE="$STATE_DIR/progress.txt"
 STORIES_ROOT="$STATE_DIR/stories"
 LEGACY_REVIEWS_ROOT="$STATE_DIR/reviews"
@@ -195,8 +204,10 @@ REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.re
 REVIEW_SCHEMA_FILE="${LOOPER_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-review-schema.json}"
 STORIES_SCHEMA_FILE="${LOOPER_STORIES_SCHEMA_FILE:-$LOOPER_DIR/templates/stories.schema.json}"
 DECOMPOSER_PROMPT_FILE="${LOOPER_DECOMPOSER_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.decomposer.md}"
+DECOMPOSITION_REVISER_PROMPT_FILE="${LOOPER_DECOMPOSITION_REVISER_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.decomposition-reviser.md}"
 DECOMPOSITION_REVIEW_PROMPT_FILE="${LOOPER_DECOMPOSITION_REVIEW_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.decomposition-reviewer.md}"
 DECOMPOSITION_SCHEMA_FILE="${LOOPER_DECOMPOSITION_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-decomposition-schema.json}"
+DECOMPOSITION_REVISION_SCHEMA_FILE="${LOOPER_DECOMPOSITION_REVISION_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-decomposition-revision-schema.json}"
 DECOMPOSITION_REVIEW_SCHEMA_FILE="${LOOPER_DECOMPOSITION_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-decomposition-review-schema.json}"
 PLANNER_PROMPT_FILE="${LOOPER_PLANNER_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.planner.md}"
 PLAN_REVIEW_PROMPT_FILE="${LOOPER_PLAN_REVIEW_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.plan-reviewer.md}"
@@ -210,6 +221,10 @@ CODEX_BIN="${LOOPER_CODEX_BIN:-codex}"
 REVIEW_MAX_ROUNDS="${LOOPER_REVIEW_MAX_ROUNDS:-5}"
 PLAN_REVIEW_MAX_ROUNDS="${LOOPER_PLAN_REVIEW_MAX_ROUNDS:-3}"
 DECOMPOSITION_REVIEW_MAX_ROUNDS="${LOOPER_DECOMPOSITION_REVIEW_MAX_ROUNDS:-3}"
+DECOMPOSITION_OUTPUT_REPAIR_MAX_ATTEMPTS="${LOOPER_DECOMPOSITION_OUTPUT_REPAIR_MAX_ATTEMPTS:-3}"
+DECOMPOSITION_REVIEW_OUTPUT_REPAIR_MAX_ATTEMPTS="${LOOPER_DECOMPOSITION_REVIEW_OUTPUT_REPAIR_MAX_ATTEMPTS:-3}"
+DECOMPOSITION_AGENT_TIMEOUT_SECONDS="${LOOPER_DECOMPOSITION_AGENT_TIMEOUT_SECONDS:-600}"
+DECOMPOSITION_TIMEOUT_MAX_RETRIES="${LOOPER_DECOMPOSITION_TIMEOUT_MAX_RETRIES:-1}"
 VALIDATION_COMMANDS="${LOOPER_VALIDATION_COMMANDS:-}"
 KEEP_LOGS="${LOOPER_KEEP_LOGS:-0}"
 TMP_ROOT="${TMPDIR:-/tmp}"
@@ -261,6 +276,14 @@ Environment:
                              Number of adversarial plan rounds per story (default: 3)
   LOOPER_DECOMPOSITION_REVIEW_MAX_ROUNDS
                              Number of adversarial source decomposition rounds (default: 3)
+  LOOPER_DECOMPOSITION_OUTPUT_REPAIR_MAX_ATTEMPTS
+                             Same-round decomposer output repairs before a non-human terminal stop (default: 3)
+  LOOPER_DECOMPOSITION_REVIEW_OUTPUT_REPAIR_MAX_ATTEMPTS
+                             Same-round reviewer output repairs before a non-human terminal stop (default: 3)
+  LOOPER_DECOMPOSITION_AGENT_TIMEOUT_SECONDS
+                             Base timeout for each read-only source author/reviewer invocation (default: 600)
+  LOOPER_DECOMPOSITION_TIMEOUT_MAX_RETRIES
+                             Increased-timeout retries for a timed-out decomposer call (default: 1)
   LOOPER_VALIDATION_COMMANDS Optional newline-separated commands run by the harness before code review
   LOOPER_KEEP_LOGS            Keep temp run logs on failure (default: 0)
   LOOPER_IMPLEMENTATION_PROMPT_FILE
@@ -268,6 +291,8 @@ Environment:
   LOOPER_REVIEW_PROMPT_FILE  Override the base review prompt template
   LOOPER_PLANNER_PROMPT_FILE / LOOPER_PLAN_REVIEW_PROMPT_FILE
                              Override planning prompt templates
+  LOOPER_DECOMPOSITION_REVISER_PROMPT_FILE / LOOPER_DECOMPOSITION_REVISION_SCHEMA_FILE
+                             Override late-round stable-ID revision contracts
 EOF
 }
 
@@ -1103,7 +1128,20 @@ start_phase_heartbeat() {
     done
 }
 
-run_with_log() {
+terminate_process_tree() {
+    local process_id="$1" signal_name="$2" child_id
+    if command -v pgrep >/dev/null 2>&1; then
+        while IFS= read -r child_id; do
+            [ -n "$child_id" ] || continue
+            terminate_process_tree "$child_id" "$signal_name"
+        done < <(pgrep -P "$process_id" 2>/dev/null || true)
+    fi
+    kill "-$signal_name" "$process_id" >/dev/null 2>&1 || true
+}
+
+run_with_log_internal() {
+    local timeout_seconds="$1"
+    shift
     local story_id="$1"
     local story_title="$2"
     local phase_kind="$3"
@@ -1112,7 +1150,7 @@ run_with_log() {
     local log_format="$6"
     shift 6
 
-    local started_at cmd_pid heartbeat_pid exit_code
+    local started_at cmd_pid heartbeat_pid timeout_pid="" timeout_marker="" exit_code
 
     mkdir -p "$RUN_DIR"
     : > "$log_file"
@@ -1128,6 +1166,20 @@ run_with_log() {
     start_phase_heartbeat "$phase_kind" "$phase_label" "$story_id" "$story_title" "$log_file" "$log_format" "$started_at" "$cmd_pid" &
     heartbeat_pid=$!
 
+    if [ "$timeout_seconds" -gt 0 ]; then
+        timeout_marker="$RUN_DIR/timeout-$cmd_pid"
+        (
+            sleep "$timeout_seconds"
+            if kill -0 "$cmd_pid" >/dev/null 2>&1; then
+                : > "$timeout_marker"
+                terminate_process_tree "$cmd_pid" TERM
+                sleep 1
+                terminate_process_tree "$cmd_pid" KILL
+            fi
+        ) &
+        timeout_pid=$!
+    fi
+
     set +e
     wait "$cmd_pid"
     exit_code=$?
@@ -1135,6 +1187,15 @@ run_with_log() {
 
     kill "$heartbeat_pid" >/dev/null 2>&1 || true
     wait "$heartbeat_pid" 2>/dev/null || true
+    if [ -n "$timeout_pid" ]; then
+        kill "$timeout_pid" >/dev/null 2>&1 || true
+        wait "$timeout_pid" 2>/dev/null || true
+    fi
+    if [ -n "$timeout_marker" ] && [ -f "$timeout_marker" ]; then
+        rm -f "$timeout_marker"
+        exit_code=124
+        echo "Command timed out after ${timeout_seconds}s: $phase_label" >> "$log_file"
+    fi
 
     local finished_at
     finished_at="$(epoch_now)"
@@ -1142,6 +1203,16 @@ run_with_log() {
         "$phase_kind" "$phase_label" "$log_file" "$log_format" "$started_at" "$finished_at"
 
     return "$exit_code"
+}
+
+run_with_log() {
+    run_with_log_internal 0 "$@"
+}
+
+run_with_log_bounded() {
+    local timeout_seconds="$1"
+    shift
+    run_with_log_internal "$timeout_seconds" "$@"
 }
 
 tail_plain_log() {
@@ -1533,6 +1604,122 @@ sha256_file() {
     fi
 }
 
+runtime_asset_specs() {
+    printf '%s\t%s\t%s\n' \
+      executable "$SCRIPT_PATH" bin/looper \
+      sharedPrompt "$SHARED_PROMPT_FILE" templates/prompt.shared.md \
+      implementationPrompt "$IMPLEMENTATION_PROMPT_FILE" templates/prompt.implementer.md \
+      implementationReviewPrompt "$REVIEW_PROMPT_FILE" templates/prompt.reviewer.md \
+      implementationReviewSchema "$REVIEW_SCHEMA_FILE" templates/codex-review-schema.json \
+      storiesSchema "$STORIES_SCHEMA_FILE" templates/stories.schema.json \
+      decomposerPrompt "$DECOMPOSER_PROMPT_FILE" templates/prompt.decomposer.md \
+      decompositionReviserPrompt "$DECOMPOSITION_REVISER_PROMPT_FILE" templates/prompt.decomposition-reviser.md \
+      decompositionReviewerPrompt "$DECOMPOSITION_REVIEW_PROMPT_FILE" templates/prompt.decomposition-reviewer.md \
+      decompositionSchema "$DECOMPOSITION_SCHEMA_FILE" templates/codex-decomposition-schema.json \
+      decompositionRevisionSchema "$DECOMPOSITION_REVISION_SCHEMA_FILE" templates/codex-decomposition-revision-schema.json \
+      decompositionReviewSchema "$DECOMPOSITION_REVIEW_SCHEMA_FILE" templates/codex-decomposition-review-schema.json \
+      plannerPrompt "$PLANNER_PROMPT_FILE" templates/prompt.planner.md \
+      planReviewerPrompt "$PLAN_REVIEW_PROMPT_FILE" templates/prompt.plan-reviewer.md \
+      planSchema "$PLAN_SCHEMA_FILE" templates/codex-plan-schema.json \
+      planReviewSchema "$PLAN_REVIEW_SCHEMA_FILE" templates/codex-plan-review-schema.json
+    [ ! -f "$PROMPT_SHARED_FILE" ] || printf '%s\t%s\t%s\n' localSharedPrompt "$PROMPT_SHARED_FILE" optional/prompt.shared.md
+    [ ! -f "$PROMPT_IMPLEMENTER_FILE" ] || printf '%s\t%s\t%s\n' localImplementationPrompt "$PROMPT_IMPLEMENTER_FILE" optional/prompt.implementer.md
+    [ ! -f "$PROMPT_REVIEWER_FILE" ] || printf '%s\t%s\t%s\n' localReviewerPrompt "$PROMPT_REVIEWER_FILE" optional/prompt.reviewer.md
+}
+
+verify_runtime_snapshot() {
+    local snapshot_path expected_hash actual_hash source_path
+    [ -f "$RUNTIME_MANIFEST_FILE" ] || { echo -e "${RED}Error: pinned Looper runtime manifest is missing at $RUNTIME_MANIFEST_FILE. This run cannot be resumed with live runtime files.${NC}"; exit 1; }
+    jq -e '.stateSchemaVersion==1 and (.assets|type=="array" and length>0)' "$RUNTIME_MANIFEST_FILE" >/dev/null \
+      || { echo -e "${RED}Error: pinned Looper runtime manifest is invalid or unsupported.${NC}"; exit 1; }
+    if [ -f "$DECOMPOSITION_STATE_FILE" ]; then
+        expected_hash="$(jq -r '.runtimeManifestHash // empty' "$DECOMPOSITION_STATE_FILE")"
+        [ -n "$expected_hash" ] || { echo -e "${RED}Error: persisted decomposition state predates runtime pinning; implicit compatibility migration is not supported.${NC}"; exit 1; }
+        [ "$(sha256_file "$RUNTIME_MANIFEST_FILE")" = "$expected_hash" ] \
+          || { echo -e "${RED}Error: pinned runtime manifest hash does not match decomposition state.${NC}"; exit 1; }
+    fi
+    while IFS=$'\t' read -r snapshot_path expected_hash source_path; do
+        [ -f "$snapshot_path" ] || { echo -e "${RED}Error: pinned runtime asset is missing: $snapshot_path (captured from $source_path).${NC}"; exit 1; }
+        actual_hash="$(sha256_file "$snapshot_path")"
+        [ "$actual_hash" = "$expected_hash" ] || { echo -e "${RED}Error: pinned runtime asset hash mismatch: $snapshot_path. Restore the captured runtime or start a new state directory.${NC}"; exit 1; }
+    done < <(jq -r '.assets[] | [.snapshotPath,.sha256,.sourcePath] | @tsv' "$RUNTIME_MANIFEST_FILE")
+}
+
+create_runtime_snapshot() {
+    local key source_path relative_path snapshot_path assets_tmp manifest_tmp
+    [ ! -e "$RUNTIME_ROOT" ] || { echo -e "${RED}Error: incomplete runtime snapshot already exists at $RUNTIME_ROOT; use a new state directory.${NC}"; exit 1; }
+    mkdir -p "$RUNTIME_ROOT/bin" "$RUNTIME_ROOT/templates" "$RUNTIME_ROOT/optional"
+    assets_tmp="$(mktemp "$RUNTIME_ROOT/assets.XXXXXX")"
+    printf '[]\n' > "$assets_tmp"
+    while IFS=$'\t' read -r key source_path relative_path; do
+        [ -f "$source_path" ] || { echo -e "${RED}Error: runtime asset '$key' not found at $source_path.${NC}"; exit 1; }
+        snapshot_path="$RUNTIME_ROOT/$relative_path"
+        cp "$source_path" "$snapshot_path"
+        chmod a-w "$snapshot_path"
+        atomic_jq_replace "$assets_tmp" --arg key "$key" --arg source "$source_path" --arg snapshot "$snapshot_path" \
+          --arg hash "$(sha256_file "$snapshot_path")" '. + [{key:$key,sourcePath:$source,snapshotPath:$snapshot,sha256:$hash}]'
+    done < <(runtime_asset_specs)
+    chmod +x "$RUNTIME_ROOT/bin/looper"
+    manifest_tmp="$(mktemp "$RUNTIME_ROOT/manifest.XXXXXX")"
+    jq -n --arg createdAt "$(utc_timestamp)" --argjson assets "$(cat "$assets_tmp")" \
+      '{stateSchemaVersion:1,createdAt:$createdAt,assets:$assets}' > "$manifest_tmp"
+    mv "$manifest_tmp" "$RUNTIME_MANIFEST_FILE"
+    chmod a-w "$RUNTIME_MANIFEST_FILE"
+    rm -f "$assets_tmp"
+    verify_runtime_snapshot
+}
+
+apply_pinned_runtime_paths() {
+    local missing="$RUNTIME_ROOT/optional/not-captured"
+    SHARED_PROMPT_FILE="$(jq -r '.assets[] | select(.key=="sharedPrompt") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    IMPLEMENTATION_PROMPT_FILE="$(jq -r '.assets[] | select(.key=="implementationPrompt") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    REVIEW_PROMPT_FILE="$(jq -r '.assets[] | select(.key=="implementationReviewPrompt") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    REVIEW_SCHEMA_FILE="$(jq -r '.assets[] | select(.key=="implementationReviewSchema") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    STORIES_SCHEMA_FILE="$(jq -r '.assets[] | select(.key=="storiesSchema") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    DECOMPOSER_PROMPT_FILE="$(jq -r '.assets[] | select(.key=="decomposerPrompt") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    DECOMPOSITION_REVISER_PROMPT_FILE="$(jq -r '.assets[] | select(.key=="decompositionReviserPrompt") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    DECOMPOSITION_REVIEW_PROMPT_FILE="$(jq -r '.assets[] | select(.key=="decompositionReviewerPrompt") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    DECOMPOSITION_SCHEMA_FILE="$(jq -r '.assets[] | select(.key=="decompositionSchema") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    DECOMPOSITION_REVISION_SCHEMA_FILE="$(jq -r '.assets[] | select(.key=="decompositionRevisionSchema") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    DECOMPOSITION_REVIEW_SCHEMA_FILE="$(jq -r '.assets[] | select(.key=="decompositionReviewSchema") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    PLANNER_PROMPT_FILE="$(jq -r '.assets[] | select(.key=="plannerPrompt") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    PLAN_REVIEW_PROMPT_FILE="$(jq -r '.assets[] | select(.key=="planReviewerPrompt") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    PLAN_SCHEMA_FILE="$(jq -r '.assets[] | select(.key=="planSchema") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    PLAN_REVIEW_SCHEMA_FILE="$(jq -r '.assets[] | select(.key=="planReviewSchema") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    PROMPT_SHARED_FILE="$(jq -r --arg missing "$missing" '[.assets[] | select(.key=="localSharedPrompt") | .snapshotPath][0] // $missing' "$RUNTIME_MANIFEST_FILE")"
+    PROMPT_IMPLEMENTER_FILE="$(jq -r --arg missing "$missing" '[.assets[] | select(.key=="localImplementationPrompt") | .snapshotPath][0] // $missing' "$RUNTIME_MANIFEST_FILE")"
+    PROMPT_REVIEWER_FILE="$(jq -r --arg missing "$missing" '[.assets[] | select(.key=="localReviewerPrompt") | .snapshotPath][0] // $missing' "$RUNTIME_MANIFEST_FILE")"
+}
+
+pin_runtime_and_reexec() {
+    local snapshot_executable
+    [ "$MODE" != "watch" ] || return 0
+    if [ -f "$RUNTIME_MANIFEST_FILE" ]; then
+        verify_runtime_snapshot
+    elif [ "$MODE" = "prepare" ] || [ "$MODE" = "start" ]; then
+        if [ -f "$DECOMPOSITION_STATE_FILE" ]; then
+            echo -e "${RED}Error: existing decomposition state has no pinned runtime manifest; implicit compatibility migration is not supported.${NC}"
+            exit 1
+        fi
+        create_runtime_snapshot
+    else
+        echo -e "${RED}Error: this stateful run has no pinned runtime manifest; start a new prepared run.${NC}"
+        exit 1
+    fi
+    snapshot_executable="$(jq -r '.assets[] | select(.key=="executable") | .snapshotPath' "$RUNTIME_MANIFEST_FILE")"
+    snapshot_executable="$(readlink -f "$snapshot_executable" 2>/dev/null || realpath "$snapshot_executable" 2>/dev/null || printf '%s' "$snapshot_executable")"
+    if [ "${LOOPER_RUNTIME_PINNED:-0}" = "1" ]; then
+        [ "$SCRIPT_PATH" = "$snapshot_executable" ] || { echo -e "${RED}Error: LOOPER_RUNTIME_PINNED does not match the verified snapshot executable.${NC}"; exit 1; }
+        return 0
+    fi
+    exec env -u LOOPER_IMPLEMENTATION_PROMPT_FILE -u LOOPER_REVIEW_PROMPT_FILE -u LOOPER_REVIEW_SCHEMA_FILE \
+      -u LOOPER_STORIES_SCHEMA_FILE -u LOOPER_DECOMPOSER_PROMPT_FILE -u LOOPER_DECOMPOSITION_REVISER_PROMPT_FILE \
+      -u LOOPER_DECOMPOSITION_REVIEW_PROMPT_FILE -u LOOPER_DECOMPOSITION_SCHEMA_FILE -u LOOPER_DECOMPOSITION_REVISION_SCHEMA_FILE \
+      -u LOOPER_DECOMPOSITION_REVIEW_SCHEMA_FILE -u LOOPER_PLANNER_PROMPT_FILE -u LOOPER_PLAN_REVIEW_PROMPT_FILE \
+      -u LOOPER_PLAN_SCHEMA_FILE -u LOOPER_PLAN_REVIEW_SCHEMA_FILE LOOPER_RUNTIME_PINNED=1 \
+      "$snapshot_executable" "${ORIGINAL_ARGS[@]}"
+}
+
 atomic_jq_replace() {
     local file="$1"
     shift
@@ -1543,22 +1730,190 @@ atomic_jq_replace() {
 }
 
 write_decomposition_state() {
-    local status="$1" round="$2" proposal_file="${3:-}" review_file="${4:-}" reason="${5:-}" tmp proposal_hash="" review_hash=""
+    local status="$1" round="$2" proposal_file="${3:-}" review_file="${4:-}" reason="${5:-}"
+    local repair_attempt="${6:-}" invalid_proposal_file="${7:-}" diagnostic_file="${8:-}" corrected_proposal_file="${9:-}"
+    local tmp proposal_hash="" review_hash="" invalid_proposal_hash="" diagnostic_hash="" corrected_proposal_hash="" existing_round=""
+    local timeout_attempt=0 agent_failure_file="" agent_failure_hash="" raw_response_file="" raw_response_hash=""
+    local context_proposal_file="" context_proposal_hash="" context_review_file="" context_review_hash=""
+    local revision_file="" revision_hash="" revision_attempt=0 outstanding_finding_ids='[]'
+    local review_repair_attempt=0 invalid_review_file="" invalid_review_hash="" review_diagnostic_file="" review_diagnostic_hash=""
+    local corrected_review_file="" corrected_review_hash="" review_timeout_attempt=0 review_agent_failure_file="" review_agent_failure_hash=""
+    local review_raw_response_file="" review_raw_response_hash="" review_context_proposal_file="" review_context_proposal_hash=""
+    local review_context_prior_review_file="" review_context_prior_review_hash="" review_outstanding_finding_ids='[]'
     mkdir -p "$DECOMPOSITION_ROOT"
+    if [ -f "$DECOMPOSITION_STATE_FILE" ]; then
+        existing_round="$(jq -r '.round // 0' "$DECOMPOSITION_STATE_FILE")"
+    fi
+    if [ "$existing_round" = "$round" ]; then
+        [ -n "$repair_attempt" ] || repair_attempt="$(jq -r '.repairAttempt // 0' "$DECOMPOSITION_STATE_FILE")"
+        [ -n "$invalid_proposal_file" ] || invalid_proposal_file="$(jq -r '.invalidProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        [ -n "$diagnostic_file" ] || diagnostic_file="$(jq -r '.diagnosticFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        [ -n "$corrected_proposal_file" ] || corrected_proposal_file="$(jq -r '.correctedProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        timeout_attempt="$(jq -r '.timeoutAttempt // 0' "$DECOMPOSITION_STATE_FILE")"
+        agent_failure_file="$(jq -r '.agentFailureFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        raw_response_file="$(jq -r '.rawResponseFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        context_proposal_file="$(jq -r '.contextProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        context_review_file="$(jq -r '.contextReviewFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        revision_file="$(jq -r '.revisionFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        revision_attempt="$(jq -r '.revisionAttempt // 0' "$DECOMPOSITION_STATE_FILE")"
+        outstanding_finding_ids="$(jq -c '.outstandingFindingIds // []' "$DECOMPOSITION_STATE_FILE")"
+        review_repair_attempt="$(jq -r '.reviewRepairAttempt // 0' "$DECOMPOSITION_STATE_FILE")"
+        invalid_review_file="$(jq -r '.invalidReviewFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        review_diagnostic_file="$(jq -r '.reviewDiagnosticFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        corrected_review_file="$(jq -r '.correctedReviewFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        review_timeout_attempt="$(jq -r '.reviewTimeoutAttempt // 0' "$DECOMPOSITION_STATE_FILE")"
+        review_agent_failure_file="$(jq -r '.reviewAgentFailureFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        review_raw_response_file="$(jq -r '.reviewRawResponseFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        review_context_proposal_file="$(jq -r '.reviewContextProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        review_context_prior_review_file="$(jq -r '.reviewContextPriorReviewFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        review_outstanding_finding_ids="$(jq -c '.reviewOutstandingFindingIds // []' "$DECOMPOSITION_STATE_FILE")"
+    else
+        [ -n "$repair_attempt" ] || repair_attempt=0
+    fi
+    [ -n "$repair_attempt" ] || repair_attempt=0
     [ -n "$proposal_file" ] && [ -f "$proposal_file" ] && proposal_hash="$(sha256_file "$proposal_file")"
     [ -n "$review_file" ] && [ -f "$review_file" ] && review_hash="$(sha256_file "$review_file")"
+    [ -n "$invalid_proposal_file" ] && [ -f "$invalid_proposal_file" ] && invalid_proposal_hash="$(sha256_file "$invalid_proposal_file")"
+    [ -n "$diagnostic_file" ] && [ -f "$diagnostic_file" ] && diagnostic_hash="$(sha256_file "$diagnostic_file")"
+    [ -n "$corrected_proposal_file" ] && [ -f "$corrected_proposal_file" ] && corrected_proposal_hash="$(sha256_file "$corrected_proposal_file")"
+    [ -n "$agent_failure_file" ] && [ -f "$agent_failure_file" ] && agent_failure_hash="$(sha256_file "$agent_failure_file")"
+    [ -n "$raw_response_file" ] && [ -f "$raw_response_file" ] && raw_response_hash="$(sha256_file "$raw_response_file")"
+    [ -n "$context_proposal_file" ] && [ -f "$context_proposal_file" ] && context_proposal_hash="$(sha256_file "$context_proposal_file")"
+    [ -n "$context_review_file" ] && [ -f "$context_review_file" ] && context_review_hash="$(sha256_file "$context_review_file")"
+    [ -n "$revision_file" ] && [ -f "$revision_file" ] && revision_hash="$(sha256_file "$revision_file")"
+    [ -n "$invalid_review_file" ] && [ -f "$invalid_review_file" ] && invalid_review_hash="$(sha256_file "$invalid_review_file")"
+    [ -n "$review_diagnostic_file" ] && [ -f "$review_diagnostic_file" ] && review_diagnostic_hash="$(sha256_file "$review_diagnostic_file")"
+    [ -n "$corrected_review_file" ] && [ -f "$corrected_review_file" ] && corrected_review_hash="$(sha256_file "$corrected_review_file")"
+    [ -n "$review_agent_failure_file" ] && [ -f "$review_agent_failure_file" ] && review_agent_failure_hash="$(sha256_file "$review_agent_failure_file")"
+    [ -n "$review_raw_response_file" ] && [ -f "$review_raw_response_file" ] && review_raw_response_hash="$(sha256_file "$review_raw_response_file")"
+    [ -n "$review_context_proposal_file" ] && [ -f "$review_context_proposal_file" ] && review_context_proposal_hash="$(sha256_file "$review_context_proposal_file")"
+    [ -n "$review_context_prior_review_file" ] && [ -f "$review_context_prior_review_file" ] && review_context_prior_review_hash="$(sha256_file "$review_context_prior_review_file")"
     tmp="$(mktemp "$DECOMPOSITION_ROOT/state.XXXXXX")"
     jq -n --arg status "$status" --argjson round "$round" --arg sourceKind "$SOURCE_KIND" \
       --arg sourceHash "$(sha256_file "$SOURCE_FILE")" --arg originalPath "$SOURCE_INPUT" \
       --arg proposalFile "$proposal_file" --arg reviewFile "$review_file" --arg terminalReason "$reason" \
       --arg proposalHash "$proposal_hash" --arg reviewHash "$review_hash" \
+      --argjson repairAttempt "$repair_attempt" \
+      --arg invalidProposalFile "$invalid_proposal_file" --arg invalidProposalHash "$invalid_proposal_hash" \
+      --arg diagnosticFile "$diagnostic_file" --arg diagnosticHash "$diagnostic_hash" \
+      --arg correctedProposalFile "$corrected_proposal_file" --arg correctedProposalHash "$corrected_proposal_hash" \
+      --argjson timeoutAttempt "$timeout_attempt" \
+      --arg agentFailureFile "$agent_failure_file" --arg agentFailureHash "$agent_failure_hash" \
+      --arg rawResponseFile "$raw_response_file" --arg rawResponseHash "$raw_response_hash" \
+      --arg contextProposalFile "$context_proposal_file" --arg contextProposalHash "$context_proposal_hash" \
+      --arg contextReviewFile "$context_review_file" --arg contextReviewHash "$context_review_hash" \
+      --arg revisionFile "$revision_file" --arg revisionHash "$revision_hash" --argjson revisionAttempt "$revision_attempt" \
+      --argjson outstandingFindingIds "$outstanding_finding_ids" \
+      --argjson reviewRepairAttempt "$review_repair_attempt" \
+      --arg invalidReviewFile "$invalid_review_file" --arg invalidReviewHash "$invalid_review_hash" \
+      --arg reviewDiagnosticFile "$review_diagnostic_file" --arg reviewDiagnosticHash "$review_diagnostic_hash" \
+      --arg correctedReviewFile "$corrected_review_file" --arg correctedReviewHash "$corrected_review_hash" \
+      --argjson reviewTimeoutAttempt "$review_timeout_attempt" \
+      --arg reviewAgentFailureFile "$review_agent_failure_file" --arg reviewAgentFailureHash "$review_agent_failure_hash" \
+      --arg reviewRawResponseFile "$review_raw_response_file" --arg reviewRawResponseHash "$review_raw_response_hash" \
+      --arg reviewContextProposalFile "$review_context_proposal_file" --arg reviewContextProposalHash "$review_context_proposal_hash" \
+      --arg reviewContextPriorReviewFile "$review_context_prior_review_file" --arg reviewContextPriorReviewHash "$review_context_prior_review_hash" \
+      --argjson reviewOutstandingFindingIds "$review_outstanding_finding_ids" \
       --arg authorAgent "$IMPLEMENTATION_AGENT" --arg authorModel "$IMPLEMENTATION_MODEL" \
       --arg reviewerAgent "$REVIEW_AGENT" --arg reviewerModel "$REVIEW_MODEL" \
       --arg updatedAt "$(utc_timestamp)" \
-      '{status:$status,round:$round,sourceKind:$sourceKind,sourceHash:$sourceHash,originalPath:$originalPath,
+      --arg runtimeManifestHash "$(sha256_file "$RUNTIME_MANIFEST_FILE")" \
+      '{status:$status,round:$round,sourceKind:$sourceKind,sourceHash:$sourceHash,originalPath:$originalPath,runtimeManifestHash:$runtimeManifestHash,
         proposalFile:$proposalFile,reviewFile:$reviewFile,proposalHash:$proposalHash,reviewHash:$reviewHash,
+        repairAttempt:$repairAttempt,invalidProposalFile:$invalidProposalFile,invalidProposalHash:$invalidProposalHash,
+        diagnosticFile:$diagnosticFile,diagnosticHash:$diagnosticHash,
+        correctedProposalFile:$correctedProposalFile,correctedProposalHash:$correctedProposalHash,
+        timeoutAttempt:$timeoutAttempt,agentFailureFile:$agentFailureFile,agentFailureHash:$agentFailureHash,
+        rawResponseFile:$rawResponseFile,rawResponseHash:$rawResponseHash,
+        contextProposalFile:$contextProposalFile,contextProposalHash:$contextProposalHash,
+        contextReviewFile:$contextReviewFile,contextReviewHash:$contextReviewHash,
+        revisionFile:$revisionFile,revisionHash:$revisionHash,revisionAttempt:$revisionAttempt,outstandingFindingIds:$outstandingFindingIds,
+        reviewRepairAttempt:$reviewRepairAttempt,invalidReviewFile:$invalidReviewFile,invalidReviewHash:$invalidReviewHash,
+        reviewDiagnosticFile:$reviewDiagnosticFile,reviewDiagnosticHash:$reviewDiagnosticHash,
+        correctedReviewFile:$correctedReviewFile,correctedReviewHash:$correctedReviewHash,
+        reviewTimeoutAttempt:$reviewTimeoutAttempt,reviewAgentFailureFile:$reviewAgentFailureFile,reviewAgentFailureHash:$reviewAgentFailureHash,
+        reviewRawResponseFile:$reviewRawResponseFile,reviewRawResponseHash:$reviewRawResponseHash,
+        reviewContextProposalFile:$reviewContextProposalFile,reviewContextProposalHash:$reviewContextProposalHash,
+        reviewContextPriorReviewFile:$reviewContextPriorReviewFile,reviewContextPriorReviewHash:$reviewContextPriorReviewHash,
+        reviewOutstandingFindingIds:$reviewOutstandingFindingIds,
         author:{agent:$authorAgent,model:$authorModel},reviewer:{agent:$reviewerAgent,model:$reviewerModel},
         terminalReason:$terminalReason,updatedAt:$updatedAt}' > "$tmp"
+    mv "$tmp" "$DECOMPOSITION_STATE_FILE"
+}
+
+record_decomposition_context() {
+    local proposal="$1" review="$2" tmp
+    [ -f "$proposal" ] && [ -f "$review" ] || { echo -e "${RED}Error: reviewed decomposition context artifacts are missing.${NC}"; exit 1; }
+    tmp="$(mktemp "$DECOMPOSITION_ROOT/context-state.XXXXXX")"
+    jq --arg proposal "$proposal" --arg proposalHash "$(sha256_file "$proposal")" \
+      --arg review "$review" --arg reviewHash "$(sha256_file "$review")" --slurpfile reviewData "$review" \
+      '.contextProposalFile=$proposal | .contextProposalHash=$proposalHash
+       | .contextReviewFile=$review | .contextReviewHash=$reviewHash
+       | .outstandingFindingIds=[$reviewData[0].findings[].id]' "$DECOMPOSITION_STATE_FILE" > "$tmp"
+    mv "$tmp" "$DECOMPOSITION_STATE_FILE"
+}
+
+record_decomposition_revision() {
+    local revision="$1" revision_attempt="$2" tmp
+    [ -f "$revision" ] || { echo -e "${RED}Error: decomposition revision artifact is missing.${NC}"; exit 1; }
+    tmp="$(mktemp "$DECOMPOSITION_ROOT/revision-state.XXXXXX")"
+    jq --arg revision "$revision" --arg revisionHash "$(sha256_file "$revision")" --argjson revisionAttempt "$revision_attempt" \
+      '.revisionFile=$revision | .revisionHash=$revisionHash | .revisionAttempt=$revisionAttempt' "$DECOMPOSITION_STATE_FILE" > "$tmp"
+    mv "$tmp" "$DECOMPOSITION_STATE_FILE"
+}
+
+record_decomposition_agent_failure() {
+    local diagnostic="$1" raw_response="$2" timeout_attempt="$3" tmp
+    [ -f "$diagnostic" ] && [ -f "$raw_response" ] || { echo -e "${RED}Error: decomposition agent failure artifacts are missing.${NC}"; exit 1; }
+    tmp="$(mktemp "$DECOMPOSITION_ROOT/agent-failure-state.XXXXXX")"
+    jq --arg diagnostic "$diagnostic" --arg diagnosticHash "$(sha256_file "$diagnostic")" \
+      --arg raw "$raw_response" --arg rawHash "$(sha256_file "$raw_response")" --argjson timeoutAttempt "$timeout_attempt" \
+      '.agentFailureFile=$diagnostic | .agentFailureHash=$diagnosticHash
+       | .rawResponseFile=$raw | .rawResponseHash=$rawHash | .timeoutAttempt=$timeoutAttempt' \
+      "$DECOMPOSITION_STATE_FILE" > "$tmp"
+    mv "$tmp" "$DECOMPOSITION_STATE_FILE"
+}
+
+record_decomposition_review_repair() {
+    local proposal="$1" prior_review="$2" invalid_review="$3" diagnostic="$4" repair_attempt="$5" corrected_review="${6:-}" raw_response="${7:-}" tmp prior_findings='[]'
+    [ -f "$proposal" ] && [ -f "$invalid_review" ] && [ -f "$diagnostic" ] \
+      || { echo -e "${RED}Error: reviewer-output repair artifacts are incomplete.${NC}"; exit 1; }
+    [ -z "$prior_review" ] || prior_findings="$(jq -c '[.findings[].id]' "$prior_review")"
+    tmp="$(mktemp "$DECOMPOSITION_ROOT/reviewer-repair-state.XXXXXX")"
+    jq --arg proposal "$proposal" --arg proposalHash "$(sha256_file "$proposal")" \
+      --arg priorReview "$prior_review" --arg priorReviewHash "$([ -n "$prior_review" ] && sha256_file "$prior_review" || true)" \
+      --arg invalid "$invalid_review" --arg invalidHash "$(sha256_file "$invalid_review")" \
+      --arg diagnostic "$diagnostic" --arg diagnosticHash "$(sha256_file "$diagnostic")" \
+      --arg corrected "$corrected_review" --arg correctedHash "$([ -n "$corrected_review" ] && sha256_file "$corrected_review" || true)" \
+      --arg raw "$raw_response" --arg rawHash "$([ -n "$raw_response" ] && sha256_file "$raw_response" || true)" \
+      --argjson attempt "$repair_attempt" --argjson priorFindings "$prior_findings" \
+      '.reviewContextProposalFile=$proposal | .reviewContextProposalHash=$proposalHash
+       | .reviewContextPriorReviewFile=$priorReview | .reviewContextPriorReviewHash=$priorReviewHash
+       | .reviewOutstandingFindingIds=$priorFindings
+       | .invalidReviewFile=$invalid | .invalidReviewHash=$invalidHash
+       | .reviewDiagnosticFile=$diagnostic | .reviewDiagnosticHash=$diagnosticHash
+       | .correctedReviewFile=$corrected | .correctedReviewHash=$correctedHash
+       | .reviewRawResponseFile=$raw | .reviewRawResponseHash=$rawHash
+       | .reviewRepairAttempt=$attempt' "$DECOMPOSITION_STATE_FILE" > "$tmp"
+    mv "$tmp" "$DECOMPOSITION_STATE_FILE"
+}
+
+record_decomposition_review_agent_failure() {
+    local proposal="$1" prior_review="$2" diagnostic="$3" raw_response="$4" timeout_attempt="$5" tmp prior_findings='[]'
+    [ -f "$proposal" ] && [ -f "$diagnostic" ] && [ -f "$raw_response" ] \
+      || { echo -e "${RED}Error: reviewer agent failure artifacts are incomplete.${NC}"; exit 1; }
+    [ -z "$prior_review" ] || prior_findings="$(jq -c '[.findings[].id]' "$prior_review")"
+    tmp="$(mktemp "$DECOMPOSITION_ROOT/reviewer-agent-state.XXXXXX")"
+    jq --arg proposal "$proposal" --arg proposalHash "$(sha256_file "$proposal")" \
+      --arg priorReview "$prior_review" --arg priorReviewHash "$([ -n "$prior_review" ] && sha256_file "$prior_review" || true)" \
+      --arg diagnostic "$diagnostic" --arg diagnosticHash "$(sha256_file "$diagnostic")" \
+      --arg raw "$raw_response" --arg rawHash "$(sha256_file "$raw_response")" --argjson timeoutAttempt "$timeout_attempt" --argjson priorFindings "$prior_findings" \
+      '.reviewContextProposalFile=$proposal | .reviewContextProposalHash=$proposalHash
+       | .reviewContextPriorReviewFile=$priorReview | .reviewContextPriorReviewHash=$priorReviewHash
+       | .reviewOutstandingFindingIds=$priorFindings
+       | .reviewAgentFailureFile=$diagnostic | .reviewAgentFailureHash=$diagnosticHash
+       | .reviewRawResponseFile=$raw | .reviewRawResponseHash=$rawHash | .reviewTimeoutAttempt=$timeoutAttempt' \
+      "$DECOMPOSITION_STATE_FILE" > "$tmp"
     mv "$tmp" "$DECOMPOSITION_STATE_FILE"
 }
 
@@ -1614,7 +1969,7 @@ verify_authoritative_source() {
 }
 
 verify_approved_decomposition_chain() {
-    local proposal review approved proposal_hash review_hash source_hash
+    local proposal review approved proposal_hash review_hash source_hash invalid diagnostic corrected expected revision revision_hash
     [ -f "$DECOMPOSITION_STATE_FILE" ] && [ -f "$STORIES_FILE" ] || { echo -e "${RED}Error: approved decomposition artifacts are incomplete.${NC}"; exit 1; }
     [ "$(jq -r '.status // empty' "$DECOMPOSITION_STATE_FILE")" = "APPROVED" ] || { echo -e "${RED}Error: decomposition state is not APPROVED.${NC}"; exit 1; }
     proposal="$(jq -r '.proposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
@@ -1622,6 +1977,7 @@ verify_approved_decomposition_chain() {
     approved="$DECOMPOSITION_ROOT/approved.json"
     [ -f "$proposal" ] && [ -f "$review" ] && [ -f "$approved" ] || { echo -e "${RED}Error: approved decomposition proposal, review, or approval artifact is missing.${NC}"; exit 1; }
     proposal_hash="$(sha256_file "$proposal")"; review_hash="$(sha256_file "$review")"; source_hash="$(sha256_file "$SOURCE_FILE")"
+    revision="$(jq -r '.revisionFile // empty' "$DECOMPOSITION_STATE_FILE")"; revision_hash="$(jq -r '.revisionHash // empty' "$DECOMPOSITION_STATE_FILE")"
     if ! jq -e --arg sh "$source_hash" --arg ph "$proposal_hash" --arg rh "$review_hash" \
       --slurpfile state "$DECOMPOSITION_STATE_FILE" --slurpfile stories "$STORIES_FILE" --slurpfile approved "$approved" '
       .sourceHash==$sh and .disposition=="PROPOSED"
@@ -1633,6 +1989,9 @@ verify_approved_decomposition_chain() {
       and ($state[0].round==$stories[0].decomposition.round and $state[0].round==$approved[0].round)
       and ($state[0].author==$stories[0].decomposition.author and $state[0].author==$approved[0].author)
       and ($state[0].reviewer==$stories[0].decomposition.reviewer and $state[0].reviewer==$approved[0].reviewer)
+      and (if ($state[0].revisionHash // "")!="" then
+             $stories[0].decomposition.revisionHash==$state[0].revisionHash and $approved[0].revisionHash==$state[0].revisionHash
+           else (($stories[0].decomposition|has("revisionHash"))|not) and (($approved[0]|has("revisionHash"))|not) end)
     ' "$proposal" >/dev/null; then
         echo -e "${RED}Error: approved decomposition artifact hashes or provenance do not form a valid chain.${NC}"
         exit 1
@@ -1640,6 +1999,76 @@ verify_approved_decomposition_chain() {
     if ! jq -e --arg sh "$source_hash" --arg ph "$proposal_hash" '.sourceHash==$sh and .proposalHash==$ph and .verdict=="APPROVED"' "$review" >/dev/null; then
         echo -e "${RED}Error: approved decomposition review identity does not match its source and proposal.${NC}"
         exit 1
+    fi
+    invalid="$(jq -r '.invalidProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    diagnostic="$(jq -r '.diagnosticFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    corrected="$(jq -r '.correctedProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    if [ -n "$invalid" ] || [ -n "$diagnostic" ]; then
+        [ -f "$invalid" ] && [ -f "$diagnostic" ] || { echo -e "${RED}Error: approved decomposition is missing author-output repair audit artifacts.${NC}"; exit 1; }
+        expected="$(jq -r '.invalidProposalHash' "$DECOMPOSITION_STATE_FILE")"
+        [ "$(sha256_file "$invalid")" = "$expected" ] || { echo -e "${RED}Error: approved invalid-proposal audit hash mismatch.${NC}"; exit 1; }
+        expected="$(jq -r '.diagnosticHash' "$DECOMPOSITION_STATE_FILE")"
+        [ "$(sha256_file "$diagnostic")" = "$expected" ] || { echo -e "${RED}Error: approved diagnostic audit hash mismatch.${NC}"; exit 1; }
+    fi
+    if [ -n "$corrected" ]; then
+        [ -f "$corrected" ] || { echo -e "${RED}Error: corrected proposal audit artifact is missing.${NC}"; exit 1; }
+        expected="$(jq -r '.correctedProposalHash' "$DECOMPOSITION_STATE_FILE")"
+        [ "$(sha256_file "$corrected")" = "$expected" ] && [ "$expected" = "$proposal_hash" ] || { echo -e "${RED}Error: corrected proposal does not match the reviewed canonical proposal.${NC}"; exit 1; }
+    fi
+    if [ -n "$revision" ] || [ -n "$revision_hash" ]; then
+        [ -f "$revision" ] && [ "$(sha256_file "$revision")" = "$revision_hash" ] || { echo -e "${RED}Error: approved decomposition revision provenance is invalid.${NC}"; exit 1; }
+        verify_decomposition_revision_state
+    fi
+    if [ -n "$(jq -r '.agentFailureFile // empty' "$DECOMPOSITION_STATE_FILE")" ]; then
+        verify_decomposition_agent_failure_state
+    fi
+    if [ -n "$(jq -r '.contextProposalFile // empty' "$DECOMPOSITION_STATE_FILE")" ]; then
+        verify_decomposition_context "$(jq -r '.contextProposalFile' "$DECOMPOSITION_STATE_FILE")" "$(jq -r '.contextReviewFile' "$DECOMPOSITION_STATE_FILE")"
+    fi
+    if [ -n "$(jq -r '.invalidReviewFile // empty' "$DECOMPOSITION_STATE_FILE")" ]; then
+        verify_decomposition_review_repair_state
+        corrected="$(jq -r '.correctedReviewFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        [ -f "$corrected" ] && [ "$(sha256_file "$corrected")" = "$review_hash" ] \
+          || { echo -e "${RED}Error: corrected reviewer audit artifact does not match the approved review.${NC}"; exit 1; }
+    fi
+    if [ -n "$(jq -r '.reviewAgentFailureFile // empty' "$DECOMPOSITION_STATE_FILE")" ]; then
+        verify_decomposition_review_agent_failure_state
+    fi
+}
+
+verify_decomposition_context() {
+    local proposal="${1:-}" review="${2:-}" expected_proposal_hash expected_review_hash expected_findings source_hash
+    if [ -z "$proposal" ] && [ -z "$review" ]; then return 0; fi
+    [ -f "$proposal" ] && [ -f "$review" ] || { echo -e "${RED}Error: prior reviewed decomposition context is incomplete.${NC}"; exit 1; }
+    expected_proposal_hash="$(jq -r '.contextProposalHash // empty' "$DECOMPOSITION_STATE_FILE")"
+    expected_review_hash="$(jq -r '.contextReviewHash // empty' "$DECOMPOSITION_STATE_FILE")"
+    if [ -n "$expected_proposal_hash" ]; then
+        [ "$(sha256_file "$proposal")" = "$expected_proposal_hash" ] || { echo -e "${RED}Error: prior decomposition proposal context hash changed.${NC}"; exit 1; }
+    fi
+    if [ -n "$expected_review_hash" ]; then
+        [ "$(sha256_file "$review")" = "$expected_review_hash" ] || { echo -e "${RED}Error: prior decomposition review context hash changed.${NC}"; exit 1; }
+    fi
+    source_hash="$(sha256_file "$SOURCE_FILE")"
+    jq -e --arg sourceHash "$source_hash" '.sourceHash==$sourceHash and .disposition=="PROPOSED"' "$proposal" >/dev/null \
+      || { echo -e "${RED}Error: prior decomposition proposal context has invalid source identity.${NC}"; exit 1; }
+    jq -e --arg sourceHash "$source_hash" --arg proposalHash "$(sha256_file "$proposal")" \
+      '.sourceHash==$sourceHash and .proposalHash==$proposalHash and .verdict=="CHANGES_REQUESTED" and .correctionClass=="MECHANICAL"' "$review" >/dev/null \
+      || { echo -e "${RED}Error: prior decomposition review context identity or correction class is invalid.${NC}"; exit 1; }
+    expected_findings="$(jq -c '.outstandingFindingIds // []' "$DECOMPOSITION_STATE_FILE")"
+    if [ "$expected_findings" != "[]" ]; then
+        [ "$expected_findings" = "$(jq -c '[.findings[].id]' "$review")" ] || { echo -e "${RED}Error: outstanding decomposition finding IDs changed during resume.${NC}"; exit 1; }
+    fi
+}
+
+append_reviewed_decomposition_context() {
+    local proposal="${1:-}" review="${2:-}"
+    if [ -n "$proposal" ] || [ -n "$review" ]; then
+        verify_decomposition_context "$proposal" "$review"
+        printf '\n## Last Valid Proposal\n```json\n'; cat "$proposal"; printf '\n```\n'
+        printf '\n## Associated Adversarial Review\n```json\n'; cat "$review"; printf '\n```\n'
+        printf '\nPreserve all previously accepted content. Change only what is necessary to resolve every outstanding review finding and any current output-validation error; do not independently redecompose the source.\n'
+    else
+        printf '\n## Prior Reviewed Correction Context\nNo valid previous proposal/review exists for this round. Build from the immutable source without inventing review findings.\n'
     fi
 }
 
@@ -1650,98 +2079,785 @@ build_decomposer_input() {
       "$SOURCE_KIND" "$(sha256_file "$SOURCE_FILE")" "$round" "$DECOMPOSITION_REVIEW_MAX_ROUNDS" "$PROJECT_DIR"
     cat "$SOURCE_FILE"
     printf '\n```\n'
-    if [ -n "$previous_proposal" ] && [ -f "$previous_proposal" ]; then
-        printf '\n## Previous Proposal\n```json\n'; cat "$previous_proposal"; printf '\n```\n'
+    append_reviewed_decomposition_context "$previous_proposal" "$previous_review"
+}
+
+build_decomposition_revision_input() {
+    local round="$1" revision_attempt="$2" base_proposal="$3" prior_review="$4"
+    verify_decomposition_context "$base_proposal" "$prior_review"
+    cat "$DECOMPOSITION_REVISER_PROMPT_FILE"
+    printf '\n## Runtime Context\n- Source kind: %s\n- Source hash: %s\n- Base proposal hash: %s\n- Prior review hash: %s\n- Decomposition round: %s of %s\n- Revision attempt: %s\n- Repository root: %s\n- Outstanding finding IDs: %s\n\n## Immutable Authoritative Source\n```markdown\n' \
+      "$SOURCE_KIND" "$(sha256_file "$SOURCE_FILE")" "$(sha256_file "$base_proposal")" "$(sha256_file "$prior_review")" \
+      "$round" "$DECOMPOSITION_REVIEW_MAX_ROUNDS" "$revision_attempt" "$PROJECT_DIR" "$(jq -c '[.findings[].id]' "$prior_review")"
+    cat "$SOURCE_FILE"
+    printf '\n```\n\n## Immutable Base Proposal\n```json\n'; cat "$base_proposal"; printf '\n```\n'
+    printf '\n## Prior Adversarial Review\n```json\n'; cat "$prior_review"; printf '\n```\n'
+    printf '\nReturn only the focused revision operations. Do not return or rewrite the complete proposal.\n'
+}
+
+build_decomposition_revision_repair_input() {
+    local round="$1" revision_attempt="$2" base_proposal="$3" prior_review="$4" invalid_revision="$5" diagnostic="$6"
+    build_decomposition_revision_input "$round" "$revision_attempt" "$base_proposal" "$prior_review"
+    printf '\n## Invalid Revision Output\n```text\n'; if [ -s "$invalid_revision" ]; then cat "$invalid_revision"; else printf '[empty revision output]\n'; fi; printf '\n```\n'
+    printf '\n## Machine-readable Revision Diagnostic\n```json\n'; cat "$diagnostic"; printf '\n```\n'
+    printf '\nRepair only the revision operations for this same base and finding set. Preserve the immutable base; do not return a full proposal.\n'
+}
+
+validate_and_apply_decomposition_revision() {
+    local revision="$1" diagnostic="$2" materialized="$3" round="$4" revision_attempt="$5" base_proposal="$6" prior_review="$7"
+    local errors_tmp full_diagnostic revision_hash base_hash review_hash error_count
+    revision_hash="$(sha256_file "$revision")"; base_hash="$(sha256_file "$base_proposal")"; review_hash="$(sha256_file "$prior_review")"
+    errors_tmp="$(mktemp "$DECOMPOSITION_ROOT/revision-errors.XXXXXX")"
+    if ! jq -e . "$revision" >/dev/null 2>&1; then
+        jq -n '[{code:"INVALID_JSON",path:"$",message:"decomposition revision is not valid JSON",values:{}}]' > "$errors_tmp"
+    else
+        jq --arg sourceHash "$(sha256_file "$SOURCE_FILE")" --arg baseHash "$base_hash" --arg reviewHash "$review_hash" \
+          --argjson expectedAttempt "$revision_attempt" --slurpfile base "$base_proposal" --slurpfile review "$prior_review" '
+          def arr($v): if ($v|type)=="array" then $v else [] end;
+          def opid($v;$field): if ($v|type)=="object" then $v[$field] else null end;
+          def err($code;$path;$message;$values): {code:$code,path:$path,message:$message,values:$values};
+          . as $raw | (if ($raw|type)=="object" then $raw else {} end) as $r | $base[0] as $b | $review[0] as $v
+          | [$b.sourceInventory[].id] as $sourceIds | [$b.stories[].id] as $storyIds | [$b.coverage[].sourceId] as $coverageIds
+          | arr($r.addSourceItems) as $addSource | arr($r.replaceSourceItems) as $replaceSource | arr($r.removeSourceItemIds) as $removeSource
+          | arr($r.addStories) as $addStories | arr($r.replaceStories) as $replaceStories | arr($r.removeStoryIds) as $removeStories
+          | arr($r.addCoverage) as $addCoverage | arr($r.replaceCoverage) as $replaceCoverage | arr($r.removeCoverageSourceIds) as $removeCoverage
+          | [
+              if ($raw|type)!="object" then err("REVISION_ROOT_NOT_OBJECT";"$";"revision output must be an object";{}) else empty end,
+              (($r|keys_unsorted[]) as $key | select(["sourceHash","baseProposalHash","priorReviewHash","findingIds","revisionAttempt","summary","topLevelReplacements","addSourceItems","replaceSourceItems","removeSourceItemIds","addStories","replaceStories","removeStoryIds","addCoverage","replaceCoverage","removeCoverageSourceIds"]|index($key)|not)
+                | err("REVISION_UNEXPECTED_FIELD";("$."+$key);("unexpected revision field " + $key);{field:$key})),
+              if $r.sourceHash!=$sourceHash then err("REVISION_SOURCE_HASH_MISMATCH";"$.sourceHash";"revision source hash does not match the immutable source";{expected:$sourceHash,received:$r.sourceHash}) else empty end,
+              if $r.baseProposalHash!=$baseHash then err("REVISION_BASE_HASH_MISMATCH";"$.baseProposalHash";"revision base proposal hash does not match";{expected:$baseHash,received:$r.baseProposalHash}) else empty end,
+              if $r.priorReviewHash!=$reviewHash then err("REVISION_REVIEW_HASH_MISMATCH";"$.priorReviewHash";"revision prior review hash does not match";{expected:$reviewHash,received:$r.priorReviewHash}) else empty end,
+              if $r.revisionAttempt!=$expectedAttempt then err("REVISION_ATTEMPT_MISMATCH";"$.revisionAttempt";"revision attempt identifier does not match runtime context";{expected:$expectedAttempt,received:$r.revisionAttempt}) else empty end,
+              if (($r.summary|type)!="string" or ($r.summary|length)==0) then err("INVALID_REVISION_SUMMARY";"$.summary";"revision summary must be non-empty";{}) else empty end,
+              if (($r.findingIds|type)!="array" or (($r.findingIds|sort)!=([$v.findings[].id]|sort))) then err("REVISION_FINDINGS_MISMATCH";"$.findingIds";"revision finding IDs must exactly match the outstanding review findings";{expected:[$v.findings[].id],received:$r.findingIds}) else empty end,
+              if (($r.findingIds|type)=="array" and ($r.findingIds|length)!=($r.findingIds|unique|length)) then err("DUPLICATE_REVISION_FINDING";"$.findingIds";"revision finding IDs must be unique";{received:$r.findingIds}) else empty end,
+              if ($r.topLevelReplacements|type)!="object" then err("INVALID_TOP_LEVEL_REPLACEMENTS";"$.topLevelReplacements";"topLevelReplacements must be an object";{}) else empty end,
+              (["addSourceItems","replaceSourceItems","removeSourceItemIds","addStories","replaceStories","removeStoryIds","addCoverage","replaceCoverage","removeCoverageSourceIds"][] as $field
+                | select(($r[$field]|type)!="array") | err("INVALID_REVISION_OPERATION_COLLECTION";("$."+$field);("revision field " + $field + " must be an array");{field:$field,receivedType:($r[$field]|type)})),
+              (($r.topLevelReplacements // {} | keys_unsorted[]) as $key | select(["project","description","disposition","unresolvedQuestions","terminalReason"]|index($key)|not)
+                | err("REVISION_TOP_LEVEL_FIELD_FORBIDDEN";("$.topLevelReplacements."+$key);("top-level field " + $key + " cannot be revised");{field:$key})),
+              ([($addSource[]|opid(.;"id")),($replaceSource[]|opid(.;"id")),$removeSource[]]|group_by(.)[]|select(.[0]!=null and length>1)|err("CONFLICTING_SOURCE_OPERATION";"$.sourceOperations";("multiple source operations target " + (.[0]|tostring));{id:.[0]})),
+              ([($addStories[]|opid(.;"id")),($replaceStories[]|opid(.;"id")),$removeStories[]]|group_by(.)[]|select(.[0]!=null and length>1)|err("CONFLICTING_STORY_OPERATION";"$.storyOperations";("multiple story operations target " + (.[0]|tostring));{id:.[0]})),
+              ([($addCoverage[]|opid(.;"sourceId")),($replaceCoverage[]|opid(.;"sourceId")),$removeCoverage[]]|group_by(.)[]|select(.[0]!=null and length>1)|err("CONFLICTING_COVERAGE_OPERATION";"$.coverageOperations";("multiple coverage operations target " + (.[0]|tostring));{sourceId:.[0]})),
+              ($addSource[] as $item | opid($item;"id") as $id | if $id!=null and ($sourceIds|index($id))!=null then err("ADD_SOURCE_ALREADY_EXISTS";"$.addSourceItems";("source item " + ($id|tostring) + " already exists");{id:$id}) else empty end),
+              ($replaceSource[] as $item | opid($item;"id") as $id | if $id!=null and ($sourceIds|index($id))==null then err("REPLACE_SOURCE_UNKNOWN";"$.replaceSourceItems";("source item " + ($id|tostring) + " does not exist");{id:$id}) else empty end),
+              ($removeSource[] as $id | if ($sourceIds|index($id))==null then err("REMOVE_SOURCE_UNKNOWN";"$.removeSourceItemIds";("source item " + ($id|tostring) + " does not exist");{id:$id}) else empty end),
+              ($addStories[] as $item | opid($item;"id") as $id | if $id!=null and ($storyIds|index($id))!=null then err("ADD_STORY_ALREADY_EXISTS";"$.addStories";("story " + ($id|tostring) + " already exists");{id:$id}) else empty end),
+              ($replaceStories[] as $item | opid($item;"id") as $id | if $id!=null and ($storyIds|index($id))==null then err("REPLACE_STORY_UNKNOWN";"$.replaceStories";("story " + ($id|tostring) + " does not exist");{id:$id}) else empty end),
+              ($removeStories[] as $id | if ($storyIds|index($id))==null then err("REMOVE_STORY_UNKNOWN";"$.removeStoryIds";("story " + ($id|tostring) + " does not exist");{id:$id}) else empty end),
+              ($addCoverage[] as $item | opid($item;"sourceId") as $id | if $id!=null and ($coverageIds|index($id))!=null then err("ADD_COVERAGE_ALREADY_EXISTS";"$.addCoverage";("coverage " + ($id|tostring) + " already exists");{sourceId:$id}) else empty end),
+              ($replaceCoverage[] as $item | opid($item;"sourceId") as $id | if $id!=null and ($coverageIds|index($id))==null then err("REPLACE_COVERAGE_UNKNOWN";"$.replaceCoverage";("coverage " + ($id|tostring) + " does not exist");{sourceId:$id}) else empty end),
+              ($removeCoverage[] as $id | if ($coverageIds|index($id))==null then err("REMOVE_COVERAGE_UNKNOWN";"$.removeCoverageSourceIds";("coverage " + ($id|tostring) + " does not exist");{sourceId:$id}) else empty end),
+              ((($addSource[]),($replaceSource[])) as $item | opid($item;"id") as $id | select(($item|type)!="object" or ($id|type)!="string" or ($id|length)==0) | err("INVALID_SOURCE_OPERATION_ID";"$.sourceOperations";"source operation requires an object with a non-empty stable ID";{received:$item})),
+              ((($addStories[]),($replaceStories[])) as $item | opid($item;"id") as $id | select(($item|type)!="object" or ($id|type)!="string" or ($id|length)==0) | err("INVALID_STORY_OPERATION_ID";"$.storyOperations";"story operation requires an object with a non-empty stable ID";{received:$item})),
+              ((($addCoverage[]),($replaceCoverage[])) as $item | opid($item;"sourceId") as $id | select(($item|type)!="object" or ($id|type)!="string" or ($id|length)==0) | err("INVALID_COVERAGE_OPERATION_ID";"$.coverageOperations";"coverage operation requires an object with a non-empty source ID";{received:$item})),
+              ($removeSource[] | select(type!="string" or length==0) | err("INVALID_SOURCE_OPERATION_ID";"$.removeSourceItemIds";"source removal requires a non-empty stable ID";{received:.})),
+              ($removeStories[] | select(type!="string" or length==0) | err("INVALID_STORY_OPERATION_ID";"$.removeStoryIds";"story removal requires a non-empty stable ID";{received:.})),
+              ($removeCoverage[] | select(type!="string" or length==0) | err("INVALID_COVERAGE_OPERATION_ID";"$.removeCoverageSourceIds";"coverage removal requires a non-empty source ID";{received:.})),
+              if (($r.topLevelReplacements // {}|length) + ($addSource|length)+($replaceSource|length)+($removeSource|length)+($addStories|length)+($replaceStories|length)+($removeStories|length)+($addCoverage|length)+($replaceCoverage|length)+($removeCoverage|length))==0
+                then err("EMPTY_REVISION";"$";"revision must contain at least one focused operation";{}) else empty end
+            ] | flatten
+        ' "$revision" > "$errors_tmp"
     fi
-    if [ -n "$previous_review" ] && [ -f "$previous_review" ]; then
-        printf '\n## Previous Adversarial Review\n```json\n'; cat "$previous_review"; printf '\n```\nResolve every material finding without expanding the source.\n'
+    error_count="$(jq 'length' "$errors_tmp")"
+    if [ "$error_count" -eq 0 ]; then
+        jq --slurpfile r "$revision" '
+          $r[0] as $r
+          | reduce ($r.topLevelReplacements|to_entries[]) as $entry (. ; .[$entry.key]=$entry.value)
+          | .sourceInventory |= map(. as $item | select(($r.removeSourceItemIds|index($item.id))==null) | (first($r.replaceSourceItems[]?|select(.id==$item.id)) // $item))
+          | .sourceInventory += $r.addSourceItems
+          | .stories |= map(. as $item | select(($r.removeStoryIds|index($item.id))==null) | (first($r.replaceStories[]?|select(.id==$item.id)) // $item))
+          | .stories += $r.addStories
+          | .coverage |= map(. as $item | select(($r.removeCoverageSourceIds|index($item.sourceId))==null) | (first($r.replaceCoverage[]?|select(.sourceId==$item.sourceId)) // $item))
+          | .coverage += $r.addCoverage
+        ' "$base_proposal" > "$materialized"
+        if [ "$(sha256_file "$materialized")" = "$base_hash" ]; then
+            jq -n '[{code:"NO_EFFECT_REVISION",path:"$",message:"revision operations do not change the base proposal",values:{}}]' > "$errors_tmp"
+        else
+            full_diagnostic="$DECOMPOSITION_ROOT/revision-${round}-materialized-${revision_attempt}-diagnostic.json"
+            if validate_decomposition_proposal "$materialized" "$full_diagnostic" "$round" "$revision_attempt"; then
+                rm -f "$errors_tmp" "$diagnostic" "$full_diagnostic"
+                return 0
+            fi
+            jq '.errors' "$full_diagnostic" > "$errors_tmp"
+            rm -f "$full_diagnostic"
+        fi
     fi
+    jq -n --arg kind "decomposition_revision_validation" --arg failureType "$(if [ "$(jq -r '.[0].code' "$errors_tmp")" = INVALID_JSON ]; then printf INVALID_JSON; else printf SEMANTIC_VALIDATION_FAILED; fi)" \
+      --arg sourceHash "$(sha256_file "$SOURCE_FILE")" --arg baseProposalPath "$base_proposal" --arg baseProposalHash "$base_hash" \
+      --arg priorReviewPath "$prior_review" --arg priorReviewHash "$review_hash" --arg revisionPath "$revision" --arg revisionHash "$revision_hash" \
+      --arg materializedProposalPath "$materialized" --arg materializedProposalHash "$([ -f "$materialized" ] && sha256_file "$materialized" || true)" \
+      --argjson round "$round" --argjson revisionAttempt "$revision_attempt" --arg generatedAt "$(utc_timestamp)" --slurpfile errors "$errors_tmp" \
+      '{kind:$kind,valid:false,failureType:$failureType,sourceHash:$sourceHash,round:$round,revisionAttempt:$revisionAttempt,
+        baseProposalPath:$baseProposalPath,baseProposalHash:$baseProposalHash,priorReviewPath:$priorReviewPath,priorReviewHash:$priorReviewHash,
+        revisionPath:$revisionPath,revisionHash:$revisionHash,materializedProposalPath:$materializedProposalPath,
+        materializedProposalHash:$materializedProposalHash,generatedAt:$generatedAt,errors:$errors[0]}' > "$diagnostic"
+    rm -f "$errors_tmp"
+    return 1
+}
+
+verify_decomposition_revision_state() {
+    local revision base review canonical expected_revision_hash revision_attempt diagnostic materialized
+    revision="$(jq -r '.revisionFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    [ -n "$revision" ] || return 0
+    base="$(jq -r '.contextProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    review="$(jq -r '.contextReviewFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    canonical="$(jq -r '.proposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    expected_revision_hash="$(jq -r '.revisionHash // empty' "$DECOMPOSITION_STATE_FILE")"
+    revision_attempt="$(jq -r '.revisionAttempt // 0' "$DECOMPOSITION_STATE_FILE")"
+    [ -f "$revision" ] && [ "$(sha256_file "$revision")" = "$expected_revision_hash" ] || { echo -e "${RED}Error: decomposition revision hash changed during resume.${NC}"; exit 1; }
+    [ -f "$canonical" ] || { echo -e "${RED}Error: materialized decomposition proposal is missing during revision resume.${NC}"; exit 1; }
+    verify_decomposition_context "$base" "$review"
+    jq -e --arg sourceHash "$(sha256_file "$SOURCE_FILE")" --arg baseHash "$(sha256_file "$base")" --arg reviewHash "$(sha256_file "$review")" \
+      --argjson revisionAttempt "$revision_attempt" --argjson findingIds "$(jq -c '.outstandingFindingIds' "$DECOMPOSITION_STATE_FILE")" \
+      '.sourceHash==$sourceHash and .baseProposalHash==$baseHash and .priorReviewHash==$reviewHash
+       and .revisionAttempt==$revisionAttempt and .findingIds==$findingIds' "$revision" >/dev/null \
+      || { echo -e "${RED}Error: decomposition revision identity or finding set changed during resume.${NC}"; exit 1; }
+    diagnostic="$(mktemp "$DECOMPOSITION_ROOT/revision-resume-diagnostic.XXXXXX")"
+    materialized="$(mktemp "$DECOMPOSITION_ROOT/revision-resume-proposal.XXXXXX")"
+    if ! validate_and_apply_decomposition_revision "$revision" "$diagnostic" "$materialized" "$(jq -r '.round' "$DECOMPOSITION_STATE_FILE")" "$revision_attempt" "$base" "$review"; then
+        echo -e "${RED}Error: persisted decomposition revision no longer validates. See $(display_path "$diagnostic").${NC}"
+        exit 1
+    fi
+    if [ "$(sha256_file "$materialized")" != "$(sha256_file "$canonical")" ]; then
+        echo -e "${RED}Error: persisted decomposition revision does not reconstruct the reviewed canonical proposal.${NC}"
+        exit 1
+    fi
+    rm -f "$diagnostic" "$materialized"
+}
+
+build_decomposer_repair_input() {
+    local round="$1" repair_attempt="$2" invalid_proposal="$3" diagnostic="$4" previous_proposal="${5:-}" previous_review="${6:-}"
+    cat "$DECOMPOSER_PROMPT_FILE"
+    printf '\n## Runtime Context\n- Source kind: %s\n- Source hash: %s\n- Decomposition round: %s of %s\n- Author-output repair attempt: %s of %s\n- Repository root: %s\n\n## Authoritative Source\n```markdown\n' \
+      "$SOURCE_KIND" "$(sha256_file "$SOURCE_FILE")" "$round" "$DECOMPOSITION_REVIEW_MAX_ROUNDS" \
+      "$repair_attempt" "$DECOMPOSITION_OUTPUT_REPAIR_MAX_ATTEMPTS" "$PROJECT_DIR"
+    cat "$SOURCE_FILE"
+    printf '\n```\n'
+    append_reviewed_decomposition_context "$previous_proposal" "$previous_review"
+    printf '\n## Invalid Author Output\n```text\n'
+    if [ -s "$invalid_proposal" ]; then cat "$invalid_proposal"; else printf '[empty candidate output]\n'; fi
+    printf '\n```\n\n## Machine-readable Validation Diagnostic\n```json\n'
+    cat "$diagnostic"
+    printf '\n```\n\nReturn one complete corrected proposal for this same decomposition round. Preserve accepted content and resolve the outstanding review findings plus every current diagnostic; do not implement and do not convert correctable output defects into NEEDS_HUMAN.\n'
+}
+
+build_decomposer_timeout_retry_input() {
+    local round="$1" repair_attempt="$2" timeout_attempt="$3" agent_diagnostic="$4" previous_proposal="${5:-}" previous_review="${6:-}"
+    local invalid_proposal diagnostic
+    if [ "$round" -gt 1 ]; then
+        build_decomposition_revision_input "$round" "$repair_attempt" "$previous_proposal" "$previous_review"
+        printf '\n## Timeout Retry Context\n- Timeout retry: %s of %s\n' "$timeout_attempt" "$DECOMPOSITION_TIMEOUT_MAX_RETRIES"
+        invalid_proposal="$(jq -r '.invalidProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        diagnostic="$(jq -r '.diagnosticFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        if [ -n "$invalid_proposal" ] && [ -n "$diagnostic" ]; then
+            printf '\n## Last Invalid Revision Output\n```text\n'; if [ -s "$invalid_proposal" ]; then cat "$invalid_proposal"; else printf '[empty revision output]\n'; fi; printf '\n```\n'
+            printf '\n## Outstanding Revision Diagnostic\n```json\n'; cat "$diagnostic"; printf '\n```\n'
+        fi
+        printf '\n## Timed-out Invocation Diagnostic\n```json\n'; cat "$agent_diagnostic"; printf '\n```\n'
+        printf '\nRetry the same focused stable-ID revision with the increased timeout. Do not return a complete proposal.\n'
+        return 0
+    fi
+    cat "$DECOMPOSER_PROMPT_FILE"
+    printf '\n## Runtime Context\n- Source kind: %s\n- Source hash: %s\n- Decomposition round: %s of %s\n- Author-output repair attempt: %s of %s\n- Timeout retry: %s of %s\n- Repository root: %s\n\n## Authoritative Source\n```markdown\n' \
+      "$SOURCE_KIND" "$(sha256_file "$SOURCE_FILE")" "$round" "$DECOMPOSITION_REVIEW_MAX_ROUNDS" \
+      "$repair_attempt" "$DECOMPOSITION_OUTPUT_REPAIR_MAX_ATTEMPTS" "$timeout_attempt" "$DECOMPOSITION_TIMEOUT_MAX_RETRIES" "$PROJECT_DIR"
+    cat "$SOURCE_FILE"; printf '\n```\n'
+    append_reviewed_decomposition_context "$previous_proposal" "$previous_review"
+    invalid_proposal="$(jq -r '.invalidProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    diagnostic="$(jq -r '.diagnosticFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    if [ -n "$invalid_proposal" ] && [ -n "$diagnostic" ]; then
+        printf '\n## Last Invalid Author Output\n```text\n'; if [ -s "$invalid_proposal" ]; then cat "$invalid_proposal"; else printf '[empty candidate output]\n'; fi; printf '\n```\n'
+        printf '\n## Outstanding Output-validation Diagnostic\n```json\n'; cat "$diagnostic"; printf '\n```\n'
+    fi
+    printf '\n## Timed-out Invocation Diagnostic\n```json\n'; cat "$agent_diagnostic"; printf '\n```\n'
+    printf '\nRetry the same focused correction with the increased timeout. Preserve all accepted content and resolve the exact outstanding findings and validation errors.\n'
+}
+
+verify_decomposition_repair_state() {
+    local invalid diagnostic expected_invalid_hash expected_diagnostic_hash
+    invalid="$(jq -r '.invalidProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    diagnostic="$(jq -r '.diagnosticFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    expected_invalid_hash="$(jq -r '.invalidProposalHash // empty' "$DECOMPOSITION_STATE_FILE")"
+    expected_diagnostic_hash="$(jq -r '.diagnosticHash // empty' "$DECOMPOSITION_STATE_FILE")"
+    [ -f "$invalid" ] && [ -f "$diagnostic" ] || { echo -e "${RED}Error: author-output repair artifacts are missing.${NC}"; exit 1; }
+    [ "$(sha256_file "$invalid")" = "$expected_invalid_hash" ] || { echo -e "${RED}Error: invalid proposal artifact hash changed during repair resume.${NC}"; exit 1; }
+    [ "$(sha256_file "$diagnostic")" = "$expected_diagnostic_hash" ] || { echo -e "${RED}Error: decomposition diagnostic hash changed during repair resume.${NC}"; exit 1; }
+    jq -e --arg sourceHash "$(sha256_file "$SOURCE_FILE")" --arg invalidHash "$expected_invalid_hash" \
+      --argjson round "$(jq -r '.round' "$DECOMPOSITION_STATE_FILE")" \
+      '.valid==false and (.failureType|IN("INVALID_JSON","SEMANTIC_VALIDATION_FAILED")) and .sourceHash==$sourceHash and .round==$round and (.errors|length)>0
+       and ((.kind=="decomposition_output_validation" and .proposalHash==$invalidHash)
+         or (.kind=="decomposition_revision_validation" and .revisionHash==$invalidHash))' \
+      "$diagnostic" >/dev/null || { echo -e "${RED}Error: decomposition repair diagnostic identity is invalid.${NC}"; exit 1; }
+    if [ "$(jq -r '.kind' "$diagnostic")" = "decomposition_revision_validation" ]; then
+        verify_decomposition_context "$(jq -r '.contextProposalFile' "$DECOMPOSITION_STATE_FILE")" "$(jq -r '.contextReviewFile' "$DECOMPOSITION_STATE_FILE")"
+    fi
+}
+
+verify_decomposition_agent_failure_state() {
+    local diagnostic raw expected_diagnostic_hash expected_raw_hash
+    diagnostic="$(jq -r '.agentFailureFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    raw="$(jq -r '.rawResponseFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    expected_diagnostic_hash="$(jq -r '.agentFailureHash // empty' "$DECOMPOSITION_STATE_FILE")"
+    expected_raw_hash="$(jq -r '.rawResponseHash // empty' "$DECOMPOSITION_STATE_FILE")"
+    [ -f "$diagnostic" ] && [ -f "$raw" ] || { echo -e "${RED}Error: persisted decomposition agent failure artifacts are missing.${NC}"; exit 1; }
+    [ "$(sha256_file "$diagnostic")" = "$expected_diagnostic_hash" ] || { echo -e "${RED}Error: decomposition agent diagnostic hash changed.${NC}"; exit 1; }
+    [ "$(sha256_file "$raw")" = "$expected_raw_hash" ] || { echo -e "${RED}Error: decomposition raw response hash changed.${NC}"; exit 1; }
+    jq -e --arg sourceHash "$(sha256_file "$SOURCE_FILE")" --arg rawHash "$expected_raw_hash" \
+      '.kind=="decomposition_agent_failure" and .sourceHash==$sourceHash and .rawResponseHash==$rawHash
+       and (.failureType|IN("AGENT_TIMEOUT","AGENT_API_ERROR","AGENT_TRANSPORT_ERROR","EMPTY_AGENT_OUTPUT","INVALID_JSON"))' "$diagnostic" >/dev/null \
+      || { echo -e "${RED}Error: persisted decomposition agent diagnostic identity is invalid.${NC}"; exit 1; }
+}
+
+verify_decomposition_review_context() {
+    local proposal prior_review expected
+    proposal="$(jq -r '.reviewContextProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    prior_review="$(jq -r '.reviewContextPriorReviewFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    [ -f "$proposal" ] || { echo -e "${RED}Error: immutable reviewer proposal context is missing.${NC}"; exit 1; }
+    expected="$(jq -r '.reviewContextProposalHash // empty' "$DECOMPOSITION_STATE_FILE")"
+    [ "$(sha256_file "$proposal")" = "$expected" ] || { echo -e "${RED}Error: immutable reviewer proposal context hash changed.${NC}"; exit 1; }
+    jq -e --arg sourceHash "$(sha256_file "$SOURCE_FILE")" '.sourceHash==$sourceHash and .disposition=="PROPOSED"' "$proposal" >/dev/null \
+      || { echo -e "${RED}Error: immutable reviewer proposal identity is invalid.${NC}"; exit 1; }
+    if [ -n "$prior_review" ]; then
+        [ -f "$prior_review" ] || { echo -e "${RED}Error: reviewer prior-review context is missing.${NC}"; exit 1; }
+        expected="$(jq -r '.reviewContextPriorReviewHash // empty' "$DECOMPOSITION_STATE_FILE")"
+        [ "$(sha256_file "$prior_review")" = "$expected" ] || { echo -e "${RED}Error: reviewer prior-review context hash changed.${NC}"; exit 1; }
+        expected="$(jq -c '.reviewOutstandingFindingIds // []' "$DECOMPOSITION_STATE_FILE")"
+        [ "$expected" = "$(jq -c '[.findings[].id]' "$prior_review")" ] \
+          || { echo -e "${RED}Error: reviewer outstanding finding IDs changed during resume.${NC}"; exit 1; }
+    fi
+}
+
+verify_decomposition_review_repair_state() {
+    local invalid diagnostic expected
+    verify_decomposition_review_context
+    invalid="$(jq -r '.invalidReviewFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    diagnostic="$(jq -r '.reviewDiagnosticFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    [ -f "$invalid" ] && [ -f "$diagnostic" ] || { echo -e "${RED}Error: reviewer-output repair artifacts are missing.${NC}"; exit 1; }
+    expected="$(jq -r '.invalidReviewHash // empty' "$DECOMPOSITION_STATE_FILE")"
+    [ "$(sha256_file "$invalid")" = "$expected" ] || { echo -e "${RED}Error: invalid reviewer output hash changed during repair resume.${NC}"; exit 1; }
+    expected="$(jq -r '.reviewDiagnosticHash // empty' "$DECOMPOSITION_STATE_FILE")"
+    [ "$(sha256_file "$diagnostic")" = "$expected" ] || { echo -e "${RED}Error: reviewer diagnostic hash changed during repair resume.${NC}"; exit 1; }
+    jq -e --arg sourceHash "$(sha256_file "$SOURCE_FILE")" --arg proposalHash "$(jq -r '.reviewContextProposalHash' "$DECOMPOSITION_STATE_FILE")" \
+      --arg reviewHash "$(jq -r '.invalidReviewHash' "$DECOMPOSITION_STATE_FILE")" \
+      '.kind=="decomposition_review_validation" and .valid==false and .sourceHash==$sourceHash
+       and .proposalHash==$proposalHash and .reviewHash==$reviewHash and (.errors|length)>0
+       and (.failureType|IN("INVALID_JSON","SEMANTIC_VALIDATION_FAILED"))' "$diagnostic" >/dev/null \
+      || { echo -e "${RED}Error: reviewer repair diagnostic identity is invalid.${NC}"; exit 1; }
+}
+
+verify_decomposition_review_agent_failure_state() {
+    local diagnostic raw expected
+    verify_decomposition_review_context
+    diagnostic="$(jq -r '.reviewAgentFailureFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    raw="$(jq -r '.reviewRawResponseFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    [ -f "$diagnostic" ] && [ -f "$raw" ] || { echo -e "${RED}Error: reviewer agent failure artifacts are missing.${NC}"; exit 1; }
+    expected="$(jq -r '.reviewAgentFailureHash // empty' "$DECOMPOSITION_STATE_FILE")"
+    [ "$(sha256_file "$diagnostic")" = "$expected" ] || { echo -e "${RED}Error: reviewer agent diagnostic hash changed.${NC}"; exit 1; }
+    expected="$(jq -r '.reviewRawResponseHash // empty' "$DECOMPOSITION_STATE_FILE")"
+    [ "$(sha256_file "$raw")" = "$expected" ] || { echo -e "${RED}Error: reviewer raw response hash changed.${NC}"; exit 1; }
+    jq -e --arg sourceHash "$(sha256_file "$SOURCE_FILE")" --arg rawHash "$expected" \
+      '.kind=="decomposition_agent_failure" and .sourceHash==$sourceHash and .rawResponseHash==$rawHash
+       and (.failureType|IN("AGENT_TIMEOUT","AGENT_API_ERROR","AGENT_TRANSPORT_ERROR","EMPTY_AGENT_OUTPUT"))' "$diagnostic" >/dev/null \
+      || { echo -e "${RED}Error: reviewer agent diagnostic identity is invalid.${NC}"; exit 1; }
 }
 
 validate_decomposition_proposal() {
-    local proposal="$1" expected_hash inventory_ids coverage_ids story_ids coverage_story_ids ac_ids coverage_ac_ids
+    local proposal="$1" diagnostic="$2" round="$3" repair_attempt="$4"
+    local expected_hash proposal_hash errors_tmp error_count
     expected_hash="$(sha256_file "$SOURCE_FILE")"
-    if ! jq -e --arg kind "$SOURCE_KIND" --arg hash "$expected_hash" '
-      .sourceKind==$kind and .sourceHash==$hash
-      and (.disposition|IN("PROPOSED","NEEDS_HUMAN"))
-      and (.project|type=="string") and (.description|type=="string")
-      and (.sourceInventory|type=="array") and (.coverage|type=="array") and (.stories|type=="array")
-      and (.unresolvedQuestions|type=="array") and (.terminalReason|type=="string")
-      and all(.sourceInventory[]; (.id|length)>0 and (.kind|IN("requirement","constraint","non_goal")) and (.text|length)>0 and (.location|length)>0)
-      and all(.stories[]; (.id|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and (.sourceRefs|length)>0 and (.acceptanceCriteria|length)>0
-          and all(.proofExpectations[]; (.id|length)>0 and (.text|length)>0 and ((has("command")|not) or (.command|length)>0)))
-      and (if .disposition=="PROPOSED" then (.sourceInventory|length)>0 and (.stories|length)>0 and (.unresolvedQuestions|length)==0 and .terminalReason==""
-           else (.terminalReason|length)>0 and (.unresolvedQuestions|length)>0 end)
-    ' "$proposal" >/dev/null; then
-        echo -e "${RED}Error: decomposer output violates the source identity or output contract.${NC}"
-        exit 1
+    proposal_hash="$(sha256_file "$proposal")"
+    errors_tmp="$(mktemp "$DECOMPOSITION_ROOT/errors.XXXXXX")"
+
+    if ! jq -e . "$proposal" >/dev/null 2>&1; then
+        jq -n --arg code "INVALID_JSON" --arg message "decomposer output is not a valid JSON object" \
+          '[{code:$code,path:"$",message:$message,values:{}}]' > "$errors_tmp"
+    else
+        jq --arg expectedKind "$SOURCE_KIND" --arg expectedHash "$expected_hash" '
+          def arr($v): if ($v|type)=="array" then $v else [] end;
+          def sid($v): if ($v|type)=="string" then $v else ($v|tojson) end;
+          def err($code;$path;$message;$values): {code:$code,path:$path,message:$message,values:$values};
+          def unexpected($object;$allowed;$path):
+            $object | select(type=="object") | keys_unsorted[] as $key
+            | select(($allowed|index($key))==null)
+            | err("UNEXPECTED_FIELD";($path+"."+$key);("unexpected field " + $path + "." + $key);{field:$key});
+          . as $raw
+          | (if ($raw|type)=="object" then $raw else {} end) as $root
+          | arr($root.sourceInventory) as $inventory
+          | arr($root.coverage) as $coverage
+          | arr($root.stories) as $stories
+          | [$inventory[] | try .id catch null] as $inventoryIds
+          | [$coverage[] | try .sourceId catch null] as $coverageIds
+          | [$stories[] | try .id catch null] as $storyIds
+          | [$stories[] | arr(try .acceptanceCriteria catch null)[] | try .id catch null] as $acIds
+          | [
+              if ($raw|type)!="object" then err("ROOT_NOT_OBJECT";"$";"decomposer output must be a JSON object";{receivedType:($raw|type)}) else empty end,
+              unexpected($root;["sourceKind","sourceHash","disposition","project","description","sourceInventory","coverage","stories","unresolvedQuestions","terminalReason"];"$"),
+              if $root.sourceKind!=$expectedKind then err("SOURCE_KIND_MISMATCH";"$.sourceKind";"sourceKind must match the unchanged authoritative source";{expected:$expectedKind,received:$root.sourceKind}) else empty end,
+              if $root.sourceHash!=$expectedHash then err("SOURCE_HASH_MISMATCH";"$.sourceHash";"sourceHash must match the unchanged immutable source";{expected:$expectedHash,received:$root.sourceHash}) else empty end,
+              if (($root.disposition|type)!="string" or ($root.disposition|IN("PROPOSED","NEEDS_HUMAN")|not)) then err("INVALID_DISPOSITION";"$.disposition";"disposition must be PROPOSED or NEEDS_HUMAN";{received:$root.disposition}) else empty end,
+              if (($root.project|type)!="string" or ($root.project|length)==0) then err("INVALID_PROJECT";"$.project";"project must be a non-empty string";{received:$root.project}) else empty end,
+              if ($root.description|type)!="string" then err("INVALID_DESCRIPTION";"$.description";"description must be a string";{received:$root.description}) else empty end,
+              if ($root.sourceInventory|type)!="array" then err("INVALID_SOURCE_INVENTORY";"$.sourceInventory";"sourceInventory must be an array";{receivedType:($root.sourceInventory|type)}) else empty end,
+              if ($root.coverage|type)!="array" then err("INVALID_COVERAGE";"$.coverage";"coverage must be an array";{receivedType:($root.coverage|type)}) else empty end,
+              if ($root.stories|type)!="array" then err("INVALID_STORIES";"$.stories";"stories must be an array";{receivedType:($root.stories|type)}) else empty end,
+              if ($root.unresolvedQuestions|type)!="array" then err("INVALID_UNRESOLVED_QUESTIONS";"$.unresolvedQuestions";"unresolvedQuestions must be an array";{receivedType:($root.unresolvedQuestions|type)}) else empty end,
+              if ($root.terminalReason|type)!="string" then err("INVALID_TERMINAL_REASON";"$.terminalReason";"terminalReason must be a string";{received:$root.terminalReason}) else empty end,
+              if (($root.disposition=="PROPOSED") and ((arr($root.unresolvedQuestions)|length)>0)) then err("PROPOSED_HAS_UNRESOLVED_QUESTIONS";"$.unresolvedQuestions";"PROPOSED requires unresolvedQuestions=[]";{received:$root.unresolvedQuestions}) else empty end,
+              if (($root.disposition=="PROPOSED") and ($root.terminalReason!="")) then err("PROPOSED_HAS_TERMINAL_REASON";"$.terminalReason";("PROPOSED requires terminalReason=\"\" but received " + ($root.terminalReason|tojson));{received:$root.terminalReason}) else empty end,
+              if (($root.disposition=="NEEDS_HUMAN") and ((arr($root.unresolvedQuestions)|length)==0)) then err("NEEDS_HUMAN_MISSING_QUESTION";"$.unresolvedQuestions";"NEEDS_HUMAN requires at least one unresolved human decision";{received:$root.unresolvedQuestions}) else empty end,
+              if (($root.disposition=="NEEDS_HUMAN") and ((($root.terminalReason|type)!="string") or (($root.terminalReason|length)==0))) then err("NEEDS_HUMAN_MISSING_REASON";"$.terminalReason";"NEEDS_HUMAN requires a non-empty terminal reason describing the human decision";{received:$root.terminalReason}) else empty end,
+              if (($root.disposition=="PROPOSED") and (($inventory|length)==0)) then err("EMPTY_SOURCE_INVENTORY";"$.sourceInventory";"PROPOSED requires at least one source inventory item";{}) else empty end,
+              if (($root.disposition=="PROPOSED") and (($stories|length)==0)) then err("EMPTY_STORIES";"$.stories";"PROPOSED requires at least one story";{}) else empty end,
+              ($inventory|to_entries[] | .key as $i | .value as $item
+                | if ($item|type)!="object" then err("INVALID_SOURCE_ITEM";("$.sourceInventory["+($i|tostring)+"]");"source inventory item must be an object";{received:$item})
+                  elif (($item.id|type)!="string" or ($item.id|length)==0) then err("INVALID_SOURCE_ID";("$.sourceInventory["+($i|tostring)+"].id");"source inventory ID must be a non-empty string";{received:$item.id})
+                  elif ($item.kind|IN("requirement","constraint","non_goal")|not) then err("INVALID_SOURCE_KIND";("$.sourceInventory["+($i|tostring)+"].kind");"source item kind must be requirement, constraint, or non_goal";{sourceId:$item.id,received:$item.kind})
+                  elif (($item.text|type)!="string" or ($item.text|length)==0 or ($item.location|type)!="string" or ($item.location|length)==0) then err("INVALID_SOURCE_ITEM_CONTENT";("$.sourceInventory["+($i|tostring)+"]");"source item text and location must be non-empty strings";{sourceId:$item.id})
+                  else empty end),
+              ($inventory|to_entries[] | .key as $i | .value as $item
+                | unexpected($item;["id","kind","text","location"];("$.sourceInventory["+($i|tostring)+"]"))),
+              ($inventoryIds|group_by(.)[]|select((.[0]!=null) and ((length)>1))|err("DUPLICATE_SOURCE_ID";"$.sourceInventory";("duplicate source inventory ID " + (.[0]|tostring));{sourceId:.[0],count:length})),
+              ($storyIds|group_by(.)[]|select((.[0]!=null) and ((length)>1))|err("DUPLICATE_STORY_ID";"$.stories";("duplicate story ID " + (.[0]|tostring));{storyId:.[0],count:length})),
+              ($acIds|group_by(.)[]|select((.[0]!=null) and ((length)>1))|err("DUPLICATE_ACCEPTANCE_ID";"$.stories[].acceptanceCriteria";("duplicate acceptance criterion ID " + (.[0]|tostring));{acceptanceCriterionId:.[0],count:length})),
+              ($inventoryIds[]|select(.!=null) as $sourceId
+                | ([$coverageIds[]|select(.==$sourceId)]|length) as $count
+                | if $count==0 then err("COVERAGE_MISSING_SOURCE";"$.coverage";("coverage is missing source item " + $sourceId);{sourceId:$sourceId})
+                  elif $count>1 then err("DUPLICATE_SOURCE_COVERAGE";"$.coverage";("coverage contains source item " + $sourceId + " more than once");{sourceId:$sourceId,count:$count})
+                  else empty end),
+              ($coverage|to_entries[] | .key as $i | .value as $c
+                | if ($c|type)!="object" then err("INVALID_COVERAGE_ITEM";("$.coverage["+($i|tostring)+"]");"coverage item must be an object";{received:$c})
+                  elif (($c.sourceId|type)!="string" or ($inventoryIds|index($c.sourceId))==null) then err("COVERAGE_UNKNOWN_SOURCE";("$.coverage["+($i|tostring)+"].sourceId");("coverage references unknown source item " + sid($c.sourceId));{sourceId:$c.sourceId})
+                  elif (($c.storyIds|type)!="array" or ($c.storyIds|length)==0) then err("COVERAGE_MISSING_STORY";("$.coverage["+($i|tostring)+"].storyIds");("coverage " + $c.sourceId + " must include at least one story");{sourceId:$c.sourceId})
+                  elif ($c.acceptanceCriteriaIds|type)!="array" then err("INVALID_ACCEPTANCE_COVERAGE";("$.coverage["+($i|tostring)+"].acceptanceCriteriaIds");"acceptanceCriteriaIds must be an array";{sourceId:$c.sourceId})
+                  elif (([$inventory[]|select((try .id catch null)==$c.sourceId)|(try .kind catch null)][0]) as $sourceItemKind
+                    | (($sourceItemKind=="requirement" or $sourceItemKind=="constraint") and (arr($c.acceptanceCriteriaIds)|length)==0))
+                    then err("COVERAGE_MISSING_ACCEPTANCE";("$.coverage["+($i|tostring)+"].acceptanceCriteriaIds");("coverage " + $c.sourceId + " requires at least one acceptance criterion");{sourceId:$c.sourceId})
+                  else empty end),
+              ($coverage|to_entries[] | .key as $i | .value as $c
+                | unexpected($c;["sourceId","storyIds","acceptanceCriteriaIds"];("$.coverage["+($i|tostring)+"]"))),
+              ($coverage|to_entries[] | .key as $i | .value as $c | select(($c|type)=="object")
+                | if ((arr($c.storyIds)|length)!=(arr($c.storyIds)|unique|length)) then err("DUPLICATE_COVERAGE_STORY";("$.coverage["+($i|tostring)+"].storyIds");("coverage " + sid($c.sourceId) + " contains duplicate story IDs");{sourceId:$c.sourceId,storyIds:arr($c.storyIds)}) else empty end,
+                  if ((arr($c.acceptanceCriteriaIds)|length)!=(arr($c.acceptanceCriteriaIds)|unique|length)) then err("DUPLICATE_COVERAGE_ACCEPTANCE";("$.coverage["+($i|tostring)+"].acceptanceCriteriaIds");("coverage " + sid($c.sourceId) + " contains duplicate acceptance criterion IDs");{sourceId:$c.sourceId,acceptanceCriteriaIds:arr($c.acceptanceCriteriaIds)}) else empty end,
+                  (arr($c.storyIds)[] | select((type)!="string" or length==0) | err("INVALID_COVERAGE_STORY_ID";("$.coverage["+($i|tostring)+"].storyIds");("coverage " + sid($c.sourceId) + " contains an invalid story ID");{sourceId:$c.sourceId,received:.})),
+                  (arr($c.acceptanceCriteriaIds)[] | select((type)!="string" or length==0) | err("INVALID_COVERAGE_ACCEPTANCE_ID";("$.coverage["+($i|tostring)+"].acceptanceCriteriaIds");("coverage " + sid($c.sourceId) + " contains an invalid acceptance criterion ID");{sourceId:$c.sourceId,received:.}))),
+              ($coverage[]|select(type=="object") as $c | arr($c.storyIds)[] as $storyId
+                | if ($storyIds|index($storyId))==null then err("COVERAGE_UNKNOWN_STORY";"$.coverage[].storyIds";("coverage " + sid($c.sourceId) + " references unknown story " + sid($storyId));{sourceId:$c.sourceId,storyId:$storyId}) else empty end),
+              ($coverage[]|select(type=="object") as $c
+                | [$inventory[]|select((try .id catch null)==$c.sourceId)|(try .kind catch null)][0] as $sourceItemKind
+                | select($sourceItemKind=="non_goal")
+                | arr($c.storyIds)[] as $storyId
+                | [$stories[]|select((try .id catch null)==$storyId)][0] as $story
+                | if (($story|type)=="object" and (arr($story.nonGoals)|length)==0) then err("NON_GOAL_NOT_PRESERVED";"$.coverage[].storyIds";("non-goal " + sid($c.sourceId) + " maps to story " + sid($storyId) + " without an explicit non-goal");{sourceId:$c.sourceId,storyId:$storyId}) else empty end),
+              ($stories|to_entries[] | .key as $i | .value as $story
+                | if ($story|type)!="object" then err("INVALID_STORY";("$.stories["+($i|tostring)+"]");"story must be an object";{received:$story})
+                  elif (($story.id|type)!="string" or ($story.id|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")|not)) then err("INVALID_STORY_ID";("$.stories["+($i|tostring)+"].id");"story ID contains unsupported characters";{received:$story.id})
+                  elif (($story.sourceRefs|type)!="array" or ($story.sourceRefs|length)==0) then err("INVALID_STORY_SOURCE_REFS";("$.stories["+($i|tostring)+"].sourceRefs");("story " + sid($story.id) + " requires non-empty sourceRefs");{storyId:$story.id})
+                  elif (($story.acceptanceCriteria|type)!="array" or ($story.acceptanceCriteria|length)==0) then err("INVALID_ACCEPTANCE_CRITERIA";("$.stories["+($i|tostring)+"].acceptanceCriteria");("story " + sid($story.id) + " requires acceptance criteria");{storyId:$story.id})
+                  elif ($story.dependsOn|type)!="array" then err("INVALID_DEPENDENCIES";("$.stories["+($i|tostring)+"].dependsOn");("story " + sid($story.id) + " dependsOn must be an array");{storyId:$story.id})
+                  elif (($story.priority|type)!="number" or ($story.priority|floor)!=$story.priority or $story.priority<1) then err("INVALID_PRIORITY";("$.stories["+($i|tostring)+"].priority");("story " + sid($story.id) + " priority must be a positive integer");{storyId:$story.id,received:$story.priority})
+                  else empty end),
+              ($stories|to_entries[] | .key as $i | .value as $story
+                | unexpected($story;["id","title","description","sourceRefs","scope","nonGoals","acceptanceCriteria","proofExpectations","disappointmentCheck","dependsOn","replaces","priority"];("$.stories["+($i|tostring)+"]"))),
+              ($stories|to_entries[] | .key as $i | .value as $story | select(($story|type)=="object")
+                | if (($story.title|type)!="string" or ($story.title|length)==0) then err("INVALID_STORY_TITLE";("$.stories["+($i|tostring)+"].title");("story " + sid($story.id) + " title must be a non-empty string");{storyId:$story.id,received:$story.title}) else empty end,
+                  if (($story.description|type)!="string" or ($story.description|length)==0) then err("INVALID_STORY_DESCRIPTION";("$.stories["+($i|tostring)+"].description");("story " + sid($story.id) + " description must be a non-empty string");{storyId:$story.id,received:$story.description}) else empty end,
+                  if ((arr($story.sourceRefs)|length)!=(arr($story.sourceRefs)|unique|length)) then err("DUPLICATE_STORY_SOURCE_REF";("$.stories["+($i|tostring)+"].sourceRefs");("story " + sid($story.id) + " contains duplicate sourceRefs");{storyId:$story.id,sourceRefs:arr($story.sourceRefs)}) else empty end,
+                  (arr($story.sourceRefs)[] | select((type)!="string" or length==0) | err("INVALID_STORY_SOURCE_REF";("$.stories["+($i|tostring)+"].sourceRefs");("story " + sid($story.id) + " contains an invalid sourceRef");{storyId:$story.id,received:.})),
+                  if ($story.scope|type)!="array" then err("INVALID_STORY_SCOPE";("$.stories["+($i|tostring)+"].scope");("story " + sid($story.id) + " scope must be an array");{storyId:$story.id,received:$story.scope}) else empty end,
+                  if ($story.nonGoals|type)!="array" then err("INVALID_STORY_NON_GOALS";("$.stories["+($i|tostring)+"].nonGoals");("story " + sid($story.id) + " nonGoals must be an array");{storyId:$story.id,received:$story.nonGoals}) else empty end,
+                  if ($story.proofExpectations|type)!="array" then err("INVALID_PROOF_EXPECTATIONS";("$.stories["+($i|tostring)+"].proofExpectations");("story " + sid($story.id) + " proofExpectations must be an array");{storyId:$story.id,received:$story.proofExpectations}) else empty end,
+                  if ($story.disappointmentCheck|type)!="string" then err("INVALID_DISAPPOINTMENT_CHECK";("$.stories["+($i|tostring)+"].disappointmentCheck");("story " + sid($story.id) + " disappointmentCheck must be a string");{storyId:$story.id,received:$story.disappointmentCheck}) else empty end,
+                  if ($story.replaces|type)!="array" then err("INVALID_REPLACES";("$.stories["+($i|tostring)+"].replaces");("story " + sid($story.id) + " replaces must be an array");{storyId:$story.id,received:$story.replaces}) else empty end,
+                  (arr($story.scope)[] | select((type)!="string" or length==0) | err("INVALID_SCOPE_ITEM";("$.stories["+($i|tostring)+"].scope");("story " + sid($story.id) + " contains an invalid scope item");{storyId:$story.id,received:.})),
+                  (arr($story.nonGoals)[] | select((type)!="string" or length==0) | err("INVALID_NON_GOAL_ITEM";("$.stories["+($i|tostring)+"].nonGoals");("story " + sid($story.id) + " contains an invalid non-goal item");{storyId:$story.id,received:.})),
+                  (arr($story.dependsOn)[] | select((type)!="string" or length==0) | err("INVALID_DEPENDENCY_ID";("$.stories["+($i|tostring)+"].dependsOn");("story " + sid($story.id) + " contains an invalid dependency ID");{storyId:$story.id,received:.})),
+                  (arr($story.replaces)[] | select((type)!="string" or length==0) | err("INVALID_REPLACEMENT_ID";("$.stories["+($i|tostring)+"].replaces");("story " + sid($story.id) + " contains an invalid replacement ID");{storyId:$story.id,received:.})),
+                  if ((arr($story.dependsOn)|length)!=(arr($story.dependsOn)|unique|length)) then err("DUPLICATE_DEPENDENCY";("$.stories["+($i|tostring)+"].dependsOn");("story " + sid($story.id) + " contains duplicate dependencies");{storyId:$story.id,dependsOn:arr($story.dependsOn)}) else empty end,
+                  if ((arr($story.replaces)|length)!=(arr($story.replaces)|unique|length)) then err("DUPLICATE_REPLACEMENT";("$.stories["+($i|tostring)+"].replaces");("story " + sid($story.id) + " contains duplicate replacement IDs");{storyId:$story.id,replaces:arr($story.replaces)}) else empty end,
+                  (arr($story.acceptanceCriteria)|to_entries[] | .key as $acIndex | .value as $ac
+                    | if ($ac|type)!="object" then err("INVALID_ACCEPTANCE_CRITERION";("$.stories["+($i|tostring)+"].acceptanceCriteria["+($acIndex|tostring)+"]");("story " + sid($story.id) + " acceptance criterion must be an object");{storyId:$story.id,received:$ac})
+                      elif (($ac.id|type)!="string" or ($ac.id|length)==0) then err("INVALID_ACCEPTANCE_ID";("$.stories["+($i|tostring)+"].acceptanceCriteria["+($acIndex|tostring)+"].id");("story " + sid($story.id) + " acceptance criterion ID must be a non-empty string");{storyId:$story.id,received:$ac.id})
+                      elif (($ac.text|type)!="string" or ($ac.text|length)==0) then err("INVALID_ACCEPTANCE_TEXT";("$.stories["+($i|tostring)+"].acceptanceCriteria["+($acIndex|tostring)+"].text");("acceptance criterion " + sid($ac.id) + " text must be a non-empty string");{storyId:$story.id,acceptanceCriterionId:$ac.id,received:$ac.text})
+                      else empty end,
+                      unexpected($ac;["id","text"];("$.stories["+($i|tostring)+"].acceptanceCriteria["+($acIndex|tostring)+"]")))),
+              ($stories[]|select(type=="object" and (.id|type)=="string") as $story
+                | (arr($story.sourceRefs)|unique|sort) as $refs
+                | ([$coverage[]|select(type=="object" and (arr(.storyIds)|index($story.id))!=null)|.sourceId]|unique|sort) as $mapped
+                | if $refs!=$mapped then
+                    (($mapped-$refs) as $omitted | ($refs-$mapped) as $extra
+                    | err("STORY_SOURCE_REFS_MISMATCH";"$.stories[].sourceRefs";
+                        ("story " + $story.id + " sourceRefs do not match coverage; omitted=" + ($omitted|join(",")) + ", extra=" + ($extra|join(",")));
+                        {storyId:$story.id,omittedSourceIds:$omitted,extraSourceIds:$extra,sourceRefs:$refs,coverageSourceIds:$mapped}))
+                  else empty end),
+              ($coverage[]|select(type=="object") as $c | arr($c.acceptanceCriteriaIds)[] as $acId
+                | ([$stories[]|select(type=="object" and (arr(.acceptanceCriteria)|map(try .id catch null)|index($acId))!=null)|.id]) as $owners
+                | if ($owners|length)==0 then err("COVERAGE_UNKNOWN_ACCEPTANCE";"$.coverage[].acceptanceCriteriaIds";("coverage " + sid($c.sourceId) + " references unknown acceptance criterion " + sid($acId));{sourceId:$c.sourceId,acceptanceCriterionId:$acId})
+                  elif ([$owners[] as $owner | arr($c.storyIds)[] | select(.==$owner)]|length)==0 then err("ACCEPTANCE_OWNERSHIP_MISMATCH";"$.coverage[].acceptanceCriteriaIds";("acceptance criterion " + sid($acId) + " is mapped to stories that do not own it");{sourceId:$c.sourceId,acceptanceCriterionId:$acId,mappedStoryIds:arr($c.storyIds),ownerStoryIds:$owners})
+                  else empty end),
+              ($acIds[]|select(.!=null) as $acId
+                | if ([ $coverage[]|select(type=="object")|arr(.acceptanceCriteriaIds)[]|select(.==$acId) ]|length)==0 then err("ACCEPTANCE_COVERAGE_MISSING";"$.coverage";("acceptance criterion " + $acId + " is not mapped by coverage");{acceptanceCriterionId:$acId}) else empty end),
+              ($stories|to_entries[] | .key as $i | .value as $story | select(($story|type)=="object")
+                | arr($story.dependsOn)[] as $dependency
+                | ($storyIds|index($dependency)) as $dependencyIndex
+                | if $dependencyIndex==null then err("DEPENDENCY_UNKNOWN";("$.stories["+($i|tostring)+"].dependsOn");("story " + sid($story.id) + " depends on unknown story " + sid($dependency));{storyId:$story.id,dependencyId:$dependency})
+                  elif $dependencyIndex >= $i then err("DEPENDENCY_NOT_EARLIER";("$.stories["+($i|tostring)+"].dependsOn");("story " + sid($story.id) + " depends on unknown or non-earlier story " + sid($dependency));{storyId:$story.id,dependencyId:$dependency,storyIndex:$i,dependencyIndex:$dependencyIndex})
+                  else empty end),
+              ($stories[]|select(type=="object") as $story | arr($story.proofExpectations)[] as $proof
+                | if (($proof|type)!="object" or ($proof.id|type)!="string" or ($proof.id|length)==0 or ($proof.text|type)!="string" or ($proof.text|length)==0 or (($proof|has("command")) and (($proof.command|type)!="string" or ($proof.command|length)==0)))
+                  then err("INVALID_PROOF_EXPECTATION";"$.stories[].proofExpectations";("story " + sid($story.id) + " has an invalid proof expectation");{storyId:$story.id,proof:$proof}) else empty end,
+                  unexpected($proof;["id","text","command"];"$.stories[].proofExpectations")),
+              (arr($root.unresolvedQuestions)[] | select((type)!="string" or length==0) | err("INVALID_UNRESOLVED_QUESTION";"$.unresolvedQuestions";"unresolved questions must be non-empty strings";{received:.}))
+            ] | flatten
+              | if $root.disposition=="NEEDS_HUMAN" then
+                  map(select(.code | IN(
+                    "ROOT_NOT_OBJECT","SOURCE_KIND_MISMATCH","SOURCE_HASH_MISMATCH","INVALID_DISPOSITION",
+                    "INVALID_PROJECT","INVALID_DESCRIPTION","INVALID_SOURCE_INVENTORY","INVALID_COVERAGE","INVALID_STORIES",
+                    "INVALID_UNRESOLVED_QUESTIONS","INVALID_TERMINAL_REASON","NEEDS_HUMAN_MISSING_QUESTION","NEEDS_HUMAN_MISSING_REASON"
+                  )))
+                else . end
+        ' "$proposal" > "$errors_tmp"
     fi
-    [ "$(jq -r '.disposition' "$proposal")" = "PROPOSED" ] || return 0
-    inventory_ids="$(jq -c '[.sourceInventory[].id]|sort' "$proposal")"
-    coverage_ids="$(jq -c '[.coverage[].sourceId]|sort' "$proposal")"
-    story_ids="$(jq -c '[.stories[].id]|sort' "$proposal")"
-    coverage_story_ids="$(jq -c '[.coverage[].storyIds[]]|unique|sort' "$proposal")"
-    ac_ids="$(jq -c '[.stories[].acceptanceCriteria[].id]|sort' "$proposal")"
-    coverage_ac_ids="$(jq -c '[.coverage[].acceptanceCriteriaIds[]]|unique|sort' "$proposal")"
-    [ "$(jq '[.sourceInventory[].id]|length' "$proposal")" = "$(jq '[.sourceInventory[].id]|unique|length' "$proposal")" ] || { echo -e "${RED}Error: source inventory IDs must be unique.${NC}"; exit 1; }
-    [ "$(jq '[.stories[].id]|length' "$proposal")" = "$(jq '[.stories[].id]|unique|length' "$proposal")" ] || { echo -e "${RED}Error: story IDs must be unique.${NC}"; exit 1; }
-    [ "$(jq '[.stories[].acceptanceCriteria[].id]|length' "$proposal")" = "$(jq '[.stories[].acceptanceCriteria[].id]|unique|length' "$proposal")" ] || { echo -e "${RED}Error: acceptance criterion IDs must be unique.${NC}"; exit 1; }
-    [ "$inventory_ids" = "$coverage_ids" ] || { echo -e "${RED}Error: coverage must map every source inventory item exactly once.${NC}"; exit 1; }
-    if ! jq -e '
-      . as $root | [.sourceInventory[].id] as $inventory | [.stories[].id] as $storyIds | [.stories[].acceptanceCriteria[].id] as $acIds
-      | all(.stories[]; . as $s | all(.sourceRefs[]; . as $r | $inventory|index($r)!=null)
-          and (($s.sourceRefs|sort) == ([$root.coverage[]|select(.storyIds|index($s.id))|.sourceId]|sort)))
-      and all(.coverage[]; . as $c | (.storyIds|length)>0
-          and all(.storyIds[]; . as $r | $storyIds|index($r)!=null)
-          and all(.acceptanceCriteriaIds[]; . as $ac | $acIds|index($ac)!=null
-              and any($root.stories[]; (.id as $sid | $c.storyIds|index($sid)) and any(.acceptanceCriteria[];.id==$ac)))
-          and (($root.sourceInventory[]|select(.id==$c.sourceId)|.kind) as $kind
-              | if $kind=="non_goal" then all($c.storyIds[]; . as $sid | ($root.stories[]|select(.id==$sid)|.nonGoals|length)>0)
-                else (.acceptanceCriteriaIds|length)>0 end))
-      and ([.stories[].id] as $ids | all(.stories|to_entries[]; .key as $i | all((.value.dependsOn//[])[]; . as $d | ($ids|index($d)) < $i)))
-    ' "$proposal" >/dev/null; then
-        echo -e "${RED}Error: decomposition references or dependency order are invalid.${NC}"
-        exit 1
+
+    error_count="$(jq 'length' "$errors_tmp")"
+    if [ "$error_count" -eq 0 ]; then
+        rm -f "$errors_tmp" "$diagnostic"
+        return 0
     fi
-    [ "$coverage_story_ids" = "$story_ids" ] || { echo -e "${RED}Error: every story must participate in source coverage.${NC}"; exit 1; }
-    [ "$coverage_ac_ids" = "$ac_ids" ] || { echo -e "${RED}Error: every acceptance criterion must participate in source coverage.${NC}"; exit 1; }
+
+    jq -n --arg kind "decomposition_output_validation" --arg sourceKind "$SOURCE_KIND" --arg sourceHash "$expected_hash" \
+      --arg proposalPath "$proposal" --arg proposalHash "$proposal_hash" --argjson round "$round" \
+      --argjson repairAttempt "$repair_attempt" --arg generatedAt "$(utc_timestamp)" --slurpfile errors "$errors_tmp" \
+      '{kind:$kind,valid:false,failureType:(if $errors[0][0].code=="INVALID_JSON" then "INVALID_JSON" else "SEMANTIC_VALIDATION_FAILED" end),sourceKind:$sourceKind,sourceHash:$sourceHash,round:$round,repairAttempt:$repairAttempt,
+        proposalPath:$proposalPath,proposalHash:$proposalHash,generatedAt:$generatedAt,errors:$errors[0]}' > "$diagnostic"
+    rm -f "$errors_tmp"
+    return 1
+}
+
+run_decomposition_author_attempt() {
+    local round="$1" repair_attempt="$2" previous_proposal="${3:-}" previous_review="${4:-}"
+    local timeout_attempt="${5:-0}" candidate diagnostic canonical prompt invalid_prior="" diagnostic_prior="" corrected="" disposition reason next_attempt
+    local agent_diagnostic raw_response agent_status failure_type timeout_seconds message schema materialized revision_mode=0
+    if [ "$round" -gt 1 ]; then
+        revision_mode=1
+        candidate="$DECOMPOSITION_ROOT/revision-${round}-attempt-${repair_attempt}.json"
+        diagnostic="$DECOMPOSITION_ROOT/revision-${round}-diagnostic-${repair_attempt}.json"
+        materialized="$DECOMPOSITION_ROOT/proposal-${round}-attempt-${repair_attempt}.json"
+        schema="$DECOMPOSITION_REVISION_SCHEMA_FILE"
+    else
+        candidate="$DECOMPOSITION_ROOT/proposal-${round}-attempt-${repair_attempt}.json"
+        diagnostic="$DECOMPOSITION_ROOT/proposal-${round}-diagnostic-${repair_attempt}.json"
+        materialized="$candidate"
+        schema="$DECOMPOSITION_SCHEMA_FILE"
+    fi
+    canonical="$DECOMPOSITION_ROOT/proposal-${round}.json"
+    prompt="$RUN_DIR/decomposition-${round}-attempt-${repair_attempt}-timeout-${timeout_attempt}.prompt.txt"
+    agent_diagnostic="$DECOMPOSITION_ROOT/proposal-${round}-attempt-${repair_attempt}-agent-${timeout_attempt}.json"
+    raw_response="$DECOMPOSITION_ROOT/proposal-${round}-attempt-${repair_attempt}-raw-${timeout_attempt}.log"
+
+    if [ -z "$previous_proposal" ] && [ -z "$previous_review" ]; then
+        previous_proposal="$(jq -r '.contextProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        previous_review="$(jq -r '.contextReviewFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    fi
+    verify_decomposition_context "$previous_proposal" "$previous_review"
+
+    if [ "$timeout_attempt" -gt 0 ]; then
+        verify_decomposition_agent_failure_state
+        build_decomposer_timeout_retry_input "$round" "$repair_attempt" "$timeout_attempt" \
+          "$(jq -r '.agentFailureFile' "$DECOMPOSITION_STATE_FILE")" "$previous_proposal" "$previous_review" > "$prompt"
+    elif [ "$repair_attempt" -eq 0 ]; then
+        if [ "$revision_mode" -eq 1 ]; then
+            build_decomposition_revision_input "$round" "$repair_attempt" "$previous_proposal" "$previous_review" > "$prompt"
+        else
+            build_decomposer_input "$round" "$previous_proposal" "$previous_review" > "$prompt"
+        fi
+    else
+        verify_decomposition_repair_state
+        invalid_prior="$(jq -r '.invalidProposalFile' "$DECOMPOSITION_STATE_FILE")"
+        diagnostic_prior="$(jq -r '.diagnosticFile' "$DECOMPOSITION_STATE_FILE")"
+        if [ "$revision_mode" -eq 1 ]; then
+            build_decomposition_revision_repair_input "$round" "$repair_attempt" "$previous_proposal" "$previous_review" "$invalid_prior" "$diagnostic_prior" > "$prompt"
+        else
+            build_decomposer_repair_input "$round" "$repair_attempt" "$invalid_prior" "$diagnostic_prior" "$previous_proposal" "$previous_review" > "$prompt"
+        fi
+    fi
+
+    rm -f "$candidate" "$diagnostic" "$agent_diagnostic" "$raw_response"
+    timeout_seconds=$((DECOMPOSITION_AGENT_TIMEOUT_SECONDS * (timeout_attempt + 1)))
+    set +e
+    run_structured_readonly_agent "$IMPLEMENTATION_AGENT" "$IMPLEMENTATION_MODEL" "$schema" \
+      "$prompt" "$candidate" "SOURCE" "decomposition-${round}-attempt-${repair_attempt}" 1 "$timeout_seconds" "$agent_diagnostic" "$raw_response"
+    agent_status=$?
+    set -e
+    if [ "$agent_status" -ne 0 ]; then
+        [ -f "$agent_diagnostic" ] || { echo -e "${RED}Error: decomposer failure lacked its invocation diagnostic.${NC}"; return "$agent_status"; }
+        failure_type="$(jq -r '.failureType' "$agent_diagnostic")"
+        message="$(jq -r '.message' "$agent_diagnostic")"
+        if [ "$failure_type" = "AGENT_TIMEOUT" ] && [ "$timeout_attempt" -lt "$DECOMPOSITION_TIMEOUT_MAX_RETRIES" ]; then
+            next_attempt=$((timeout_attempt + 1))
+            write_decomposition_state "AGENT_TIMEOUT_RETRY_REQUIRED" "$round" "" "" \
+              "Decomposer timed out; retry $next_attempt will use an increased timeout without consuming a review round." "$repair_attempt"
+            record_decomposition_agent_failure "$agent_diagnostic" "$raw_response" "$next_attempt"
+            return 0
+        fi
+        reason="$failure_type: $message"
+        write_decomposition_state "DECOMPOSITION_AGENT_FAILED" "$round" "" "" "$reason" "$repair_attempt"
+        record_decomposition_agent_failure "$agent_diagnostic" "$raw_response" "$timeout_attempt"
+        echo -e "${RED}Decomposition agent stopped with $failure_type. See $(display_path "$agent_diagnostic").${NC}"
+        return 2
+    fi
+
+    if { [ "$revision_mode" -eq 0 ] && validate_decomposition_proposal "$candidate" "$diagnostic" "$round" "$repair_attempt"; } \
+      || { [ "$revision_mode" -eq 1 ] && validate_and_apply_decomposition_revision "$candidate" "$diagnostic" "$materialized" "$round" "$repair_attempt" "$previous_proposal" "$previous_review"; }; then
+        cp "$materialized" "$canonical"
+        if [ "$repair_attempt" -gt 0 ]; then corrected="$materialized"; fi
+        disposition="$(jq -r '.disposition' "$canonical")"
+        if [ "$disposition" = "NEEDS_HUMAN" ]; then
+            reason="$(jq -r '.terminalReason' "$canonical")"
+            write_decomposition_state "NEEDS_HUMAN" "$round" "$canonical" "" "$reason" "$repair_attempt" "" "" "$corrected"
+            [ "$revision_mode" -eq 0 ] || record_decomposition_revision "$candidate" "$repair_attempt"
+            echo -e "${YELLOW}Decomposition requires a human product decision: $reason${NC}"
+            return 2
+        fi
+        write_decomposition_state "REVIEW_REQUIRED" "$round" "$canonical" "" "" "$repair_attempt" "" "" "$corrected"
+        [ "$revision_mode" -eq 0 ] || record_decomposition_revision "$candidate" "$repair_attempt"
+        return 0
+    fi
+
+    echo -e "${YELLOW}Decomposer output failed validation in round $round, author attempt $repair_attempt:${NC}"
+    jq -r '.errors[] | "  [\(.code)] \(.message)"' "$diagnostic"
+    if [ "$repair_attempt" -ge "$DECOMPOSITION_OUTPUT_REPAIR_MAX_ATTEMPTS" ]; then
+        reason="Decomposer output remained invalid after $DECOMPOSITION_OUTPUT_REPAIR_MAX_ATTEMPTS same-round repair attempts."
+        write_decomposition_state "DECOMPOSITION_OUTPUT_INVALID" "$round" "" "" "$reason" "$repair_attempt" "$candidate" "$diagnostic"
+        [ "$revision_mode" -eq 0 ] || record_decomposition_revision "$candidate" "$repair_attempt"
+        echo -e "${RED}$reason See $(display_path "$diagnostic").${NC}"
+        return 2
+    fi
+
+    next_attempt=$((repair_attempt + 1))
+    write_decomposition_state "OUTPUT_REPAIR_REQUIRED" "$round" "" "" \
+      "Correctable decomposer-output validation failed; same-round repair required." "$next_attempt" "$candidate" "$diagnostic"
+    [ "$revision_mode" -eq 0 ] || record_decomposition_revision "$candidate" "$repair_attempt"
+    return 0
 }
 
 build_decomposition_review_input() {
-    local round="$1" proposal="$2" proposal_hash
+    local round="$1" proposal="$2" previous_proposal="${3:-}" previous_review="${4:-}" proposal_hash revision
     proposal_hash="$(sha256_file "$proposal")"
     cat "$DECOMPOSITION_REVIEW_PROMPT_FILE"
     printf '\n## Runtime Context\n- Source kind: %s\n- Source hash: %s\n- Proposal hash: %s\n- Review round: %s of %s\n\n## Authoritative Source\n```markdown\n' \
       "$SOURCE_KIND" "$(sha256_file "$SOURCE_FILE")" "$proposal_hash" "$round" "$DECOMPOSITION_REVIEW_MAX_ROUNDS"
     cat "$SOURCE_FILE"
     printf '\n```\n\n## Proposed Decomposition\n```json\n'; cat "$proposal"; printf '\n```\n'
+    if [ -n "$previous_proposal" ] || [ -n "$previous_review" ]; then
+        verify_decomposition_context "$previous_proposal" "$previous_review"
+        printf '\n## Prior Valid Proposal\n```json\n'; cat "$previous_proposal"; printf '\n```\n'
+        printf '\n## Outstanding Prior Review\n```json\n'; cat "$previous_review"; printf '\n```\n'
+        revision="$(jq -r '.revisionFile // empty' "$DECOMPOSITION_STATE_FILE")"
+        if [ -n "$revision" ] && [ -f "$revision" ]; then
+            printf '\n## Applied Stable-ID Revision\n```json\n'; cat "$revision"; printf '\n```\n'
+        fi
+        printf '\nVerify every outstanding finding, source/hash identity, coverage and dependency integrity, and regressions introduced by the focused changes. Do not restart broad architectural review unless scope expanded or a previously accepted decision changed.\n'
+    else
+        printf '\n## Prior Review Context\nNo prior reviewed proposal exists; perform the complete first-round review.\n'
+    fi
 }
 
 validate_decomposition_review() {
-    local proposal="$1" review="$2" expected_source expected_proposal expected_inventory actual_inventory expected_stories actual_stories
-    expected_source="$(sha256_file "$SOURCE_FILE")"; expected_proposal="$(sha256_file "$proposal")"
-    if ! jq -e --arg sh "$expected_source" --arg ph "$expected_proposal" '
-      .sourceHash==$sh and .proposalHash==$ph and (.verdict|IN("APPROVED","CHANGES_REQUESTED","NEEDS_HUMAN"))
-      and (.summary|type=="string" and length>0) and (.findings|type=="array")
-      and (.sourceCoverage|type=="array") and (.storyEvaluation|type=="array") and (.terminalReason|type=="string")
-      and (if .verdict=="APPROVED" then (.findings|length)==0 and .terminalReason==""
-           and all(.sourceCoverage[];.status=="pass") and all(.storyEvaluation[];.status=="pass")
-           elif .verdict=="NEEDS_HUMAN" then (.terminalReason|length)>0 else (.findings|length)>0 end)
-    ' "$review" >/dev/null; then
-        echo -e "${RED}Error: decomposition review violates identity or approval invariants.${NC}"
-        exit 1
+    local proposal="$1" review="$2" diagnostic="$3" round="$4" repair_attempt="$5"
+    local expected_source expected_proposal review_hash errors_tmp error_count
+    expected_source="$(sha256_file "$SOURCE_FILE")"; expected_proposal="$(sha256_file "$proposal")"; review_hash="$(sha256_file "$review")"
+    errors_tmp="$(mktemp "$DECOMPOSITION_ROOT/review-errors.XXXXXX")"
+    if ! jq -e . "$review" >/dev/null 2>&1; then
+        jq -n '[{code:"INVALID_JSON",path:"$",message:"reviewer output is not valid JSON",values:{}}]' > "$errors_tmp"
+    else
+        jq --arg sourceHash "$expected_source" --arg proposalHash "$expected_proposal" --slurpfile proposal "$proposal" '
+          def arr($v): if ($v|type)=="array" then $v else [] end;
+          def err($code;$path;$message;$values): {code:$code,path:$path,message:$message,values:$values};
+          . as $r | $proposal[0] as $p
+          | [$p.sourceInventory[].id] as $sourceIds | [$p.stories[].id] as $storyIds
+          | arr($r.sourceCoverage) as $coverage | arr($r.storyEvaluation) as $stories | arr($r.findings) as $findings
+          | [
+              if ($r|type)!="object" then err("ROOT_NOT_OBJECT";"$";"reviewer output must be an object";{receivedType:($r|type)}) else empty end,
+              if $r.sourceHash!=$sourceHash then err("SOURCE_HASH_MISMATCH";"$.sourceHash";"review source hash does not match immutable source";{expected:$sourceHash,received:$r.sourceHash}) else empty end,
+              if $r.proposalHash!=$proposalHash then err("PROPOSAL_HASH_MISMATCH";"$.proposalHash";"review proposal hash does not match immutable proposal";{expected:$proposalHash,received:$r.proposalHash}) else empty end,
+              if (($r.verdict|type)!="string" or ($r.verdict|IN("APPROVED","CHANGES_REQUESTED","NEEDS_HUMAN")|not)) then err("INVALID_VERDICT";"$.verdict";"verdict must be APPROVED, CHANGES_REQUESTED, or NEEDS_HUMAN";{received:$r.verdict}) else empty end,
+              if (($r.correctionClass|type)!="string" or ($r.correctionClass|IN("NONE","MECHANICAL","HUMAN_DECISION")|not)) then err("INVALID_CORRECTION_CLASS";"$.correctionClass";"correctionClass must be NONE, MECHANICAL, or HUMAN_DECISION";{received:$r.correctionClass}) else empty end,
+              if ($r.summary|type)!="string" or ($r.summary|length)==0 then err("INVALID_SUMMARY";"$.summary";"summary must be a non-empty string";{received:$r.summary}) else empty end,
+              if ($r.findings|type)!="array" then err("INVALID_FINDINGS";"$.findings";"findings must be an array";{received:$r.findings}) else empty end,
+              if (($findings|map(.id)|length)!=($findings|map(.id)|unique|length)) then err("DUPLICATE_FINDING_ID";"$.findings";"finding IDs must be unique";{ids:($findings|map(.id))}) else empty end,
+              if ($r.sourceCoverage|type)!="array" then err("INVALID_SOURCE_COVERAGE";"$.sourceCoverage";"sourceCoverage must be an array";{received:$r.sourceCoverage}) else empty end,
+              if ($r.storyEvaluation|type)!="array" then err("INVALID_STORY_EVALUATION";"$.storyEvaluation";"storyEvaluation must be an array";{received:$r.storyEvaluation}) else empty end,
+              if ($r.terminalReason|type)!="string" then err("INVALID_TERMINAL_REASON";"$.terminalReason";"terminalReason must be a string";{received:$r.terminalReason}) else empty end,
+              if $r.verdict=="APPROVED" and $r.correctionClass!="NONE" then err("VERDICT_CORRECTION_CLASS_MISMATCH";"$.correctionClass";"APPROVED requires correctionClass=NONE";{verdict:$r.verdict,received:$r.correctionClass})
+              elif $r.verdict=="CHANGES_REQUESTED" and $r.correctionClass!="MECHANICAL" then err("VERDICT_CORRECTION_CLASS_MISMATCH";"$.correctionClass";"CHANGES_REQUESTED requires correctionClass=MECHANICAL";{verdict:$r.verdict,received:$r.correctionClass})
+              elif $r.verdict=="NEEDS_HUMAN" and $r.correctionClass!="HUMAN_DECISION" then err("VERDICT_CORRECTION_CLASS_MISMATCH";"$.correctionClass";"NEEDS_HUMAN requires correctionClass=HUMAN_DECISION";{verdict:$r.verdict,received:$r.correctionClass}) else empty end,
+              if $r.verdict=="APPROVED" and ($findings|length)>0 then err("APPROVAL_FORBIDS_FINDINGS";"$.findings";"APPROVED requires findings=[]";{findingIds:($findings|map(.id))})
+              elif $r.verdict=="CHANGES_REQUESTED" and ($findings|length)==0 then err("CHANGES_REQUESTED_MISSING_FINDINGS";"$.findings";"CHANGES_REQUESTED requires at least one finding";{}) else empty end,
+              if ($r.verdict|IN("APPROVED","CHANGES_REQUESTED")) and $r.terminalReason!="" then err("TERMINAL_REASON_FORBIDDEN";"$.terminalReason";($r.verdict + " requires terminalReason=\"\"");{received:$r.terminalReason})
+              elif $r.verdict=="NEEDS_HUMAN" and (($r.terminalReason|type)!="string" or ($r.terminalReason|length)==0) then err("NEEDS_HUMAN_MISSING_TERMINAL_REASON";"$.terminalReason";"NEEDS_HUMAN requires a non-empty terminalReason naming the human decision";{received:$r.terminalReason}) else empty end,
+              if ($coverage|map(.sourceId)|sort)!=(($sourceIds)|sort) then err("INCOMPLETE_OR_DUPLICATE_SOURCE_COVERAGE";"$.sourceCoverage";"review must evaluate every source item exactly once";{expected:($sourceIds|sort),received:($coverage|map(.sourceId)|sort)}) else empty end,
+              if ($stories|map(.storyId)|sort)!=(($storyIds)|sort) then err("INCOMPLETE_OR_DUPLICATE_STORY_EVALUATION";"$.storyEvaluation";"review must evaluate every story exactly once";{expected:($storyIds|sort),received:($stories|map(.storyId)|sort)}) else empty end,
+              if $r.verdict=="APPROVED" and ([$coverage[]|select(.status!="pass")]|length)>0 then err("APPROVAL_HAS_FAILED_SOURCE_EVALUATION";"$.sourceCoverage";"APPROVED requires every source evaluation to pass";{failedSourceIds:[$coverage[]|select(.status!="pass")|.sourceId]}) else empty end,
+              if $r.verdict=="APPROVED" and ([$stories[]|select(.status!="pass")]|length)>0 then err("APPROVAL_HAS_FAILED_STORY_EVALUATION";"$.storyEvaluation";"APPROVED requires every story evaluation to pass";{failedStoryIds:[$stories[]|select(.status!="pass")|.storyId]}) else empty end
+            ] | flatten' "$review" > "$errors_tmp"
     fi
-    expected_inventory="$(jq -c '[.sourceInventory[].id]|sort' "$proposal")"; actual_inventory="$(jq -c '[.sourceCoverage[].sourceId]|sort' "$review")"
-    expected_stories="$(jq -c '[.stories[].id]|sort' "$proposal")"; actual_stories="$(jq -c '[.storyEvaluation[].storyId]|sort' "$review")"
-    [ "$expected_inventory" = "$actual_inventory" ] && [ "$expected_stories" = "$actual_stories" ] || { echo -e "${RED}Error: decomposition review must evaluate every source item and story exactly once.${NC}"; exit 1; }
+    error_count="$(jq 'length' "$errors_tmp")"
+    if [ "$error_count" -eq 0 ]; then rm -f "$errors_tmp" "$diagnostic"; return 0; fi
+    jq -n --arg sourceHash "$expected_source" --arg proposalHash "$expected_proposal" --arg reviewPath "$review" --arg reviewHash "$review_hash" \
+      --argjson round "$round" --argjson repairAttempt "$repair_attempt" --arg generatedAt "$(utc_timestamp)" --slurpfile errors "$errors_tmp" \
+      '{kind:"decomposition_review_validation",valid:false,failureType:(if $errors[0][0].code=="INVALID_JSON" then "INVALID_JSON" else "SEMANTIC_VALIDATION_FAILED" end),
+        sourceHash:$sourceHash,proposalHash:$proposalHash,reviewPath:$reviewPath,reviewHash:$reviewHash,round:$round,repairAttempt:$repairAttempt,
+        generatedAt:$generatedAt,errors:$errors[0]}' > "$diagnostic"
+    rm -f "$errors_tmp"
+    return 1
+}
+
+build_decomposition_review_repair_input() {
+    local round="$1" proposal="$2" previous_proposal="$3" previous_review="$4" invalid_review="$5" diagnostic="$6" repair_attempt="$7"
+    build_decomposition_review_input "$round" "$proposal" "$previous_proposal" "$previous_review"
+    printf '\n## Reviewer-output Repair Context\n- Review round: %s\n- Reviewer repair attempt: %s\n- Immutable proposal hash: %s\n- Associated prior review hash: %s\n- Outstanding finding IDs: %s\n' \
+      "$round" "$repair_attempt" "$(sha256_file "$proposal")" \
+      "$([ -n "$previous_review" ] && sha256_file "$previous_review" || printf 'none')" \
+      "$([ -n "$previous_review" ] && jq -c '[.findings[].id]' "$previous_review" || printf '[]')"
+    printf '\n## Invalid Reviewer Output\n```text\n'; if [ -s "$invalid_review" ]; then cat "$invalid_review"; else printf '[empty reviewer output]\n'; fi; printf '\n```\n'
+    printf '\n## Machine-readable Reviewer Diagnostic\n```json\n'; cat "$diagnostic"; printf '\n```\n'
+    printf '\nRepair this reviewer output in the same round. Preserve every substantive finding from the parseable invalid review unless the diagnostic proves that finding is contract-forbidden. Correct only the reported output defects; do not ask the author to revise and do not convert a correctable contract defect into NEEDS_HUMAN. Return a complete corrected review.\n'
+}
+
+build_decomposition_review_timeout_retry_input() {
+    local round="$1" proposal="$2" previous_proposal="$3" previous_review="$4" diagnostic="$5" timeout_attempt="$6" repair_attempt="$7"
+    if [ "$repair_attempt" -gt 0 ]; then
+        build_decomposition_review_repair_input "$round" "$proposal" "$previous_proposal" "$previous_review" \
+          "$(jq -r '.invalidReviewFile' "$DECOMPOSITION_STATE_FILE")" "$(jq -r '.reviewDiagnosticFile' "$DECOMPOSITION_STATE_FILE")" "$repair_attempt"
+    else
+        build_decomposition_review_input "$round" "$proposal" "$previous_proposal" "$previous_review"
+    fi
+    printf '\n## Timed-out Reviewer Invocation Diagnostic\n- Timeout retry attempt: %s\n- Reviewer repair attempt remains: %s\n```json\n' "$timeout_attempt" "$repair_attempt"
+    cat "$diagnostic"
+    printf '\n```\nRetry the same reviewer task against the identical immutable proposal and prior-review context. Do not change the verdict merely because the earlier transport attempt timed out.\n'
+}
+
+review_repair_preserves_findings() {
+    local invalid="$1" corrected="$2" diagnostic="$3" round="$4" attempt="$5" missing prior_diagnostic
+    jq -e '.findings|type=="array"' "$invalid" >/dev/null 2>&1 || return 0
+    prior_diagnostic="$(jq -r '.reviewDiagnosticFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    if [ -f "$prior_diagnostic" ] && jq -e 'any(.errors[]; .code=="APPROVAL_FORBIDS_FINDINGS")' "$prior_diagnostic" >/dev/null; then
+        return 0
+    fi
+    missing="$(jq -n --slurpfile invalid "$invalid" --slurpfile corrected "$corrected" '
+      [ $invalid[0].findings[]? as $finding
+        | select(([ $corrected[0].findings[]? | select(. == $finding) ] | length)==0)
+        | $finding.id ]')"
+    [ "$missing" = "[]" ] && return 0
+    jq -n --arg sourceHash "$(sha256_file "$SOURCE_FILE")" --arg proposalHash "$(jq -r '.proposalHash' "$corrected")" \
+      --arg reviewPath "$corrected" --arg reviewHash "$(sha256_file "$corrected")" --argjson round "$round" --argjson repairAttempt "$attempt" \
+      --argjson missing "$missing" --arg generatedAt "$(utc_timestamp)" \
+      '{kind:"decomposition_review_validation",valid:false,failureType:"SEMANTIC_VALIDATION_FAILED",sourceHash:$sourceHash,
+        proposalHash:$proposalHash,reviewPath:$reviewPath,reviewHash:$reviewHash,round:$round,repairAttempt:$repairAttempt,generatedAt:$generatedAt,
+        errors:[{code:"REVIEW_REPAIR_DROPPED_FINDINGS",path:"$.findings",message:"reviewer repair dropped substantive findings from the parseable invalid review",values:{missingFindingIds:$missing}}]}' > "$diagnostic"
+    return 1
+}
+
+run_decomposition_reviewer_attempt() {
+    local round="$1" repair_attempt="${2:-0}" timeout_attempt="${3:-0}"
+    local proposal previous_proposal previous_review candidate canonical diagnostic prompt agent_diagnostic raw_response
+    local agent_status failure_type message next_attempt timeout_seconds verdict invalid_prior diagnostic_prior
+    proposal="$DECOMPOSITION_ROOT/proposal-${round}.json"
+    previous_proposal="$(jq -r '.contextProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    previous_review="$(jq -r '.contextReviewFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    [ -f "$proposal" ] || { echo -e "${RED}Error: reviewer is missing proposal $round.${NC}"; exit 1; }
+    verify_decomposition_revision_state
+    if ! validate_decomposition_proposal "$proposal" "$DECOMPOSITION_ROOT/proposal-${round}-resume-diagnostic.json" "$round" "$(jq -r '.repairAttempt // 0' "$DECOMPOSITION_STATE_FILE")"; then
+        echo -e "${RED}Error: validated proposal changed before adversarial review.${NC}"; exit 1
+    fi
+    verify_decomposition_context "$previous_proposal" "$previous_review"
+    candidate="$DECOMPOSITION_ROOT/review-${round}-attempt-${repair_attempt}.json"
+    canonical="$DECOMPOSITION_ROOT/review-${round}.json"
+    diagnostic="$DECOMPOSITION_ROOT/review-${round}-diagnostic-${repair_attempt}.json"
+    prompt="$RUN_DIR/decomposition-review-${round}-attempt-${repair_attempt}-timeout-${timeout_attempt}.prompt.txt"
+    agent_diagnostic="$DECOMPOSITION_ROOT/review-${round}-attempt-${repair_attempt}-agent-${timeout_attempt}.json"
+    raw_response="$DECOMPOSITION_ROOT/review-${round}-attempt-${repair_attempt}-raw-${timeout_attempt}.log"
+    if [ "$timeout_attempt" -gt 0 ]; then
+        verify_decomposition_review_agent_failure_state
+        build_decomposition_review_timeout_retry_input "$round" "$proposal" "$previous_proposal" "$previous_review" \
+          "$(jq -r '.reviewAgentFailureFile' "$DECOMPOSITION_STATE_FILE")" "$timeout_attempt" "$repair_attempt" > "$prompt"
+    elif [ "$repair_attempt" -gt 0 ]; then
+        verify_decomposition_review_repair_state
+        invalid_prior="$(jq -r '.invalidReviewFile' "$DECOMPOSITION_STATE_FILE")"
+        diagnostic_prior="$(jq -r '.reviewDiagnosticFile' "$DECOMPOSITION_STATE_FILE")"
+        build_decomposition_review_repair_input "$round" "$proposal" "$previous_proposal" "$previous_review" \
+          "$invalid_prior" "$diagnostic_prior" "$repair_attempt" > "$prompt"
+    else
+        build_decomposition_review_input "$round" "$proposal" "$previous_proposal" "$previous_review" > "$prompt"
+    fi
+    rm -f "$candidate" "$diagnostic" "$agent_diagnostic" "$raw_response"
+    timeout_seconds=$((DECOMPOSITION_AGENT_TIMEOUT_SECONDS * (timeout_attempt + 1)))
+    set +e
+    run_structured_readonly_agent "$REVIEW_AGENT" "$REVIEW_MODEL" "$DECOMPOSITION_REVIEW_SCHEMA_FILE" "$prompt" "$candidate" \
+      "SOURCE" "decomposition-review-${round}-attempt-${repair_attempt}" 1 "$timeout_seconds" "$agent_diagnostic" "$raw_response"
+    agent_status=$?
+    set -e
+    if [ "$agent_status" -ne 0 ]; then
+        failure_type="$(jq -r '.failureType' "$agent_diagnostic")"; message="$(jq -r '.message' "$agent_diagnostic")"
+        if [ "$failure_type" = "AGENT_TIMEOUT" ] && [ "$timeout_attempt" -lt "$DECOMPOSITION_TIMEOUT_MAX_RETRIES" ]; then
+            next_attempt=$((timeout_attempt + 1))
+            write_decomposition_state "REVIEW_AGENT_TIMEOUT_RETRY_REQUIRED" "$round" "$proposal" "" \
+              "Reviewer timed out; retry $next_attempt preserves the same round and semantic repair attempt."
+            record_decomposition_review_agent_failure "$proposal" "$previous_review" "$agent_diagnostic" "$raw_response" "$next_attempt"
+            atomic_jq_replace "$DECOMPOSITION_STATE_FILE" --argjson repair "$repair_attempt" '.reviewRepairAttempt=$repair'
+            return 0
+        fi
+        write_decomposition_state "DECOMPOSITION_REVIEW_AGENT_FAILED" "$round" "$proposal" "" "$failure_type: $message"
+        record_decomposition_review_agent_failure "$proposal" "$previous_review" "$agent_diagnostic" "$raw_response" "$timeout_attempt"
+        return 2
+    fi
+    if validate_decomposition_review "$proposal" "$candidate" "$diagnostic" "$round" "$repair_attempt" \
+      && { [ "$repair_attempt" -eq 0 ] || review_repair_preserves_findings "$(jq -r '.invalidReviewFile' "$DECOMPOSITION_STATE_FILE")" "$candidate" "$diagnostic" "$round" "$repair_attempt"; }; then
+        cp "$candidate" "$canonical"
+        if [ "$repair_attempt" -gt 0 ]; then
+            record_decomposition_review_repair "$proposal" "$previous_review" "$(jq -r '.invalidReviewFile' "$DECOMPOSITION_STATE_FILE")" \
+              "$(jq -r '.reviewDiagnosticFile' "$DECOMPOSITION_STATE_FILE")" "$repair_attempt" "$candidate" "$raw_response"
+        fi
+        verdict="$(jq -r '.verdict' "$canonical")"
+        if [ "$verdict" = "APPROVED" ]; then
+            publish_approved_decomposition "$round" "$proposal" "$canonical"
+            write_decomposition_state "APPROVED" "$round" "$proposal" "$canonical"
+            verify_approved_decomposition_chain
+            echo -e "${GREEN}Source decomposition approved and published to $STORIES_FILE.${NC}"; return 0
+        elif [ "$verdict" = "NEEDS_HUMAN" ]; then
+            write_decomposition_state "NEEDS_HUMAN" "$round" "$proposal" "$canonical" "$(jq -r '.terminalReason' "$canonical")"; return 2
+        elif [ "$round" -ge "$DECOMPOSITION_REVIEW_MAX_ROUNDS" ]; then
+            write_decomposition_state "CORRECTABLE_REVIEW_LIMIT" "$((round+1))" "" "" "Mechanically correctable decomposition findings remain after the configured review limit."
+            record_decomposition_context "$proposal" "$canonical"; return 2
+        else
+            write_decomposition_state "CHANGES_REQUESTED" "$((round+1))"
+            record_decomposition_context "$proposal" "$canonical"; return 0
+        fi
+    fi
+    echo -e "${YELLOW}Reviewer output failed validation in round $round, repair attempt $repair_attempt:${NC}"
+    jq -r '.errors[] | "  [\(.code)] \(.message)"' "$diagnostic"
+    if [ "$repair_attempt" -ge "$DECOMPOSITION_REVIEW_OUTPUT_REPAIR_MAX_ATTEMPTS" ]; then
+        write_decomposition_state "DECOMPOSITION_REVIEW_OUTPUT_INVALID" "$round" "$proposal" "" \
+          "Reviewer output remained invalid after $DECOMPOSITION_REVIEW_OUTPUT_REPAIR_MAX_ATTEMPTS same-round repair attempts."
+        record_decomposition_review_repair "$proposal" "$previous_review" "$candidate" "$diagnostic" "$repair_attempt" "" "$raw_response"
+        return 2
+    fi
+    next_attempt=$((repair_attempt + 1))
+    write_decomposition_state "REVIEW_OUTPUT_REPAIR_REQUIRED" "$round" "$proposal" "" \
+      "Correctable reviewer-output validation failed; same-round reviewer repair required."
+    record_decomposition_review_repair "$proposal" "$previous_review" "$candidate" "$diagnostic" "$next_attempt" "" "$raw_response"
+    return 0
 }
 
 publish_approved_decomposition() {
-    local round="$1" proposal="$2" review="$3" tmp approved_tmp proposal_hash review_hash
+    local round="$1" proposal="$2" review="$3" tmp approved_tmp proposal_hash review_hash revision_hash
     proposal_hash="$(sha256_file "$proposal")"; review_hash="$(sha256_file "$review")"
+    revision_hash="$(jq -r '.revisionHash // empty' "$DECOMPOSITION_STATE_FILE")"
     tmp="$(mktemp "$STATE_DIR/stories.XXXXXX")"
     jq --arg branchName "$CURRENT_GIT_BRANCH_RAW" --arg originalPath "$SOURCE_INPUT" \
-      --arg proposalHash "$proposal_hash" --arg reviewHash "$review_hash" --arg approvedAt "$(utc_timestamp)" --argjson round "$round" \
+      --arg proposalHash "$proposal_hash" --arg reviewHash "$review_hash" --arg revisionHash "$revision_hash" --arg approvedAt "$(utc_timestamp)" --argjson round "$round" \
       --arg authorAgent "$IMPLEMENTATION_AGENT" --arg authorModel "$IMPLEMENTATION_MODEL" \
       --arg reviewerAgent "$REVIEW_AGENT" --arg reviewerModel "$REVIEW_MODEL" '
       {schemaVersion:3,project,branchName:$branchName,description,
@@ -1750,6 +2866,7 @@ publish_approved_decomposition() {
          proposalHash:$proposalHash,reviewHash:$reviewHash,
          author:{agent:$authorAgent,model:$authorModel},reviewer:{agent:$reviewerAgent,model:$reviewerModel},approvedAt:$approvedAt},
        stories:(.stories|map(. + {status:"APPROVED",passes:false,notes:"",execution:{status:"PENDING"}}))}
+       | if $revisionHash!="" then .decomposition.revisionHash=$revisionHash else . end
     ' "$proposal" > "$tmp"
     if ! validate_stories_candidate "$tmp"; then
         rm -f "$tmp"
@@ -1758,18 +2875,20 @@ publish_approved_decomposition() {
     fi
     approved_tmp="$(mktemp "$DECOMPOSITION_ROOT/approved.XXXXXX")"
     jq -n --arg sourceHash "$(sha256_file "$SOURCE_FILE")" --arg proposalHash "$proposal_hash" --arg reviewHash "$review_hash" \
-      --argjson round "$round" --arg approvedAt "$(utc_timestamp)" \
+      --argjson round "$round" --arg approvedAt "$(utc_timestamp)" --arg revisionHash "$revision_hash" \
       --arg authorAgent "$IMPLEMENTATION_AGENT" --arg authorModel "$IMPLEMENTATION_MODEL" \
       --arg reviewerAgent "$REVIEW_AGENT" --arg reviewerModel "$REVIEW_MODEL" \
       '{kind:"adversarial_decomposition_review",status:"APPROVED",sourceHash:$sourceHash,proposalHash:$proposalHash,reviewHash:$reviewHash,
-        round:$round,author:{agent:$authorAgent,model:$authorModel},reviewer:{agent:$reviewerAgent,model:$reviewerModel},approvedAt:$approvedAt}' > "$approved_tmp"
+        round:$round,author:{agent:$authorAgent,model:$authorModel},reviewer:{agent:$reviewerAgent,model:$reviewerModel},approvedAt:$approvedAt}
+       | if $revisionHash!="" then .revisionHash=$revisionHash else . end' > "$approved_tmp"
     mv "$approved_tmp" "$DECOMPOSITION_ROOT/approved.json"
     mv "$tmp" "$STORIES_FILE"
     validate_story_contracts
 }
 
 ensure_approved_decomposition() {
-    local status round proposal review prompt previous_proposal previous_review verdict disposition
+    local status round proposal review prompt previous_proposal previous_review verdict repair_attempt timeout_attempt author_status
+    local review_repair_attempt review_timeout_attempt
     while :; do
         status="$(jq -r '.status' "$DECOMPOSITION_STATE_FILE")"; round="$(jq -r '.round' "$DECOMPOSITION_STATE_FILE")"
         proposal="$DECOMPOSITION_ROOT/proposal-${round}.json"; review="$DECOMPOSITION_ROOT/review-${round}.json"
@@ -1777,35 +2896,80 @@ ensure_approved_decomposition() {
           APPROVED)
             [ -f "$STORIES_FILE" ] || { echo -e "${RED}Error: approved decomposition is missing stories.json.${NC}"; exit 1; }
             verify_authoritative_source; validate_story_contracts; verify_approved_decomposition_chain; return 0 ;;
-          NEEDS_HUMAN|REVIEW_LIMIT)
+          NEEDS_HUMAN|REVIEW_LIMIT|DECOMPOSITION_OUTPUT_INVALID|DECOMPOSITION_AGENT_FAILED|DECOMPOSITION_REVIEW_OUTPUT_INVALID|DECOMPOSITION_REVIEW_AGENT_FAILED)
             echo -e "${YELLOW}Decomposition stopped in $status: $(jq -r '.terminalReason' "$DECOMPOSITION_STATE_FILE")${NC}"; return 2 ;;
+          CORRECTABLE_REVIEW_LIMIT)
+            if [ "$round" -gt "$DECOMPOSITION_REVIEW_MAX_ROUNDS" ]; then
+                echo -e "${YELLOW}Decomposition has mechanically correctable findings. Raise LOOPER_DECOMPOSITION_REVIEW_MAX_ROUNDS to at least $round to resume from the preserved boundary.${NC}"
+                return 2
+            fi
+            previous_proposal="$(jq -r '.contextProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+            previous_review="$(jq -r '.contextReviewFile // empty' "$DECOMPOSITION_STATE_FILE")"
+            verify_decomposition_context "$previous_proposal" "$previous_review"
+            set +e
+            run_decomposition_author_attempt "$round" 0 "$previous_proposal" "$previous_review" 0
+            author_status=$?
+            set -e
+            [ "$author_status" -eq 0 ] || return "$author_status"
+            ;;
           DECOMPOSING|CHANGES_REQUESTED)
             previous_proposal=""; previous_review=""
-            if [ "$round" -gt 1 ]; then previous_proposal="$DECOMPOSITION_ROOT/proposal-$((round-1)).json"; previous_review="$DECOMPOSITION_ROOT/review-$((round-1)).json"; fi
-            prompt="$RUN_DIR/decomposition-${round}.prompt.txt"; build_decomposer_input "$round" "$previous_proposal" "$previous_review" > "$prompt"
-            run_structured_readonly_agent "$IMPLEMENTATION_AGENT" "$IMPLEMENTATION_MODEL" "$DECOMPOSITION_SCHEMA_FILE" "$prompt" "$proposal" "SOURCE" "decomposition-$round"
-            validate_decomposition_proposal "$proposal"; disposition="$(jq -r '.disposition' "$proposal")"
-            if [ "$disposition" = "NEEDS_HUMAN" ]; then write_decomposition_state "NEEDS_HUMAN" "$round" "$proposal" "" "$(jq -r '.terminalReason' "$proposal")"; return 2; fi
-            write_decomposition_state "REVIEW_REQUIRED" "$round" "$proposal"
+            if [ "$round" -gt 1 ]; then
+                previous_proposal="$(jq -r '.contextProposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+                previous_review="$(jq -r '.contextReviewFile // empty' "$DECOMPOSITION_STATE_FILE")"
+                [ -n "$previous_proposal" ] || previous_proposal="$DECOMPOSITION_ROOT/proposal-$((round-1)).json"
+                [ -n "$previous_review" ] || previous_review="$DECOMPOSITION_ROOT/review-$((round-1)).json"
+            fi
+            set +e
+            run_decomposition_author_attempt "$round" 0 "$previous_proposal" "$previous_review" 0
+            author_status=$?
+            set -e
+            [ "$author_status" -eq 0 ] || return "$author_status"
+            ;;
+          OUTPUT_REPAIR_REQUIRED)
+            repair_attempt="$(jq -r '.repairAttempt // 0' "$DECOMPOSITION_STATE_FILE")"
+            if ! [[ "$repair_attempt" =~ ^[0-9]+$ ]] || [ "$repair_attempt" -lt 1 ] || [ "$repair_attempt" -gt "$DECOMPOSITION_OUTPUT_REPAIR_MAX_ATTEMPTS" ]; then
+                echo -e "${RED}Error: persisted decomposition repair attempt is invalid: $repair_attempt.${NC}"
+                exit 1
+            fi
+            set +e
+            run_decomposition_author_attempt "$round" "$repair_attempt" "" "" 0
+            author_status=$?
+            set -e
+            [ "$author_status" -eq 0 ] || return "$author_status"
+            ;;
+          AGENT_TIMEOUT_RETRY_REQUIRED)
+            verify_decomposition_agent_failure_state
+            repair_attempt="$(jq -r '.repairAttempt // 0' "$DECOMPOSITION_STATE_FILE")"
+            timeout_attempt="$(jq -r '.timeoutAttempt // 0' "$DECOMPOSITION_STATE_FILE")"
+            if ! [[ "$timeout_attempt" =~ ^[0-9]+$ ]] || [ "$timeout_attempt" -lt 1 ] || [ "$timeout_attempt" -gt "$DECOMPOSITION_TIMEOUT_MAX_RETRIES" ]; then
+                echo -e "${RED}Error: persisted decomposition timeout retry is invalid: $timeout_attempt.${NC}"
+                exit 1
+            fi
+            set +e
+            run_decomposition_author_attempt "$round" "$repair_attempt" "" "" "$timeout_attempt"
+            author_status=$?
+            set -e
+            [ "$author_status" -eq 0 ] || return "$author_status"
+            ;;
+          REVIEW_OUTPUT_REPAIR_REQUIRED)
+            review_repair_attempt="$(jq -r '.reviewRepairAttempt // 0' "$DECOMPOSITION_STATE_FILE")"
+            if ! [[ "$review_repair_attempt" =~ ^[0-9]+$ ]] || [ "$review_repair_attempt" -lt 1 ] || [ "$review_repair_attempt" -gt "$DECOMPOSITION_REVIEW_OUTPUT_REPAIR_MAX_ATTEMPTS" ]; then
+                echo -e "${RED}Error: persisted reviewer repair attempt is invalid: $review_repair_attempt.${NC}"; exit 1
+            fi
+            run_decomposition_reviewer_attempt "$round" "$review_repair_attempt" 0 || return $?
+            ;;
+          REVIEW_AGENT_TIMEOUT_RETRY_REQUIRED)
+            verify_decomposition_review_agent_failure_state
+            review_repair_attempt="$(jq -r '.reviewRepairAttempt // 0' "$DECOMPOSITION_STATE_FILE")"
+            review_timeout_attempt="$(jq -r '.reviewTimeoutAttempt // 0' "$DECOMPOSITION_STATE_FILE")"
+            if ! [[ "$review_timeout_attempt" =~ ^[0-9]+$ ]] || [ "$review_timeout_attempt" -lt 1 ] || [ "$review_timeout_attempt" -gt "$DECOMPOSITION_TIMEOUT_MAX_RETRIES" ]; then
+                echo -e "${RED}Error: persisted reviewer timeout retry is invalid: $review_timeout_attempt.${NC}"; exit 1
+            fi
+            run_decomposition_reviewer_attempt "$round" "$review_repair_attempt" "$review_timeout_attempt" || return $?
             ;;
           REVIEW_REQUIRED)
-            [ -f "$proposal" ] || { echo -e "${RED}Error: REVIEW_REQUIRED is missing proposal $round.${NC}"; exit 1; }
-            validate_decomposition_proposal "$proposal"
-            prompt="$RUN_DIR/decomposition-review-${round}.prompt.txt"; build_decomposition_review_input "$round" "$proposal" > "$prompt"
-            run_structured_readonly_agent "$REVIEW_AGENT" "$REVIEW_MODEL" "$DECOMPOSITION_REVIEW_SCHEMA_FILE" "$prompt" "$review" "SOURCE" "decomposition-review-$round"
-            validate_decomposition_review "$proposal" "$review"; verdict="$(jq -r '.verdict' "$review")"
-            if [ "$verdict" = "APPROVED" ]; then
-                publish_approved_decomposition "$round" "$proposal" "$review"
-                write_decomposition_state "APPROVED" "$round" "$proposal" "$review"
-                verify_approved_decomposition_chain
-                echo -e "${GREEN}Source decomposition approved and published to $STORIES_FILE.${NC}"; return 0
-            elif [ "$verdict" = "NEEDS_HUMAN" ]; then
-                write_decomposition_state "NEEDS_HUMAN" "$round" "$proposal" "$review" "$(jq -r '.terminalReason' "$review")"; return 2
-            elif [ "$round" -ge "$DECOMPOSITION_REVIEW_MAX_ROUNDS" ]; then
-                write_decomposition_state "REVIEW_LIMIT" "$round" "$proposal" "$review" "Decomposition review limit reached without approval."; return 2
-            else
-                write_decomposition_state "CHANGES_REQUESTED" "$((round+1))" "$proposal" "$review"
-            fi
+            run_decomposition_reviewer_attempt "$round" 0 0 || return $?
             ;;
           *) echo -e "${RED}Error: unknown decomposition state: $status.${NC}"; exit 1 ;;
         esac
@@ -2015,19 +3179,63 @@ extract_first_json_object() {
     ' | jq '.' > "$out_file" 2>/dev/null
 }
 
+persist_structured_agent_failure() {
+    local diagnostic="$1" raw_response="$2" log="$3" output="$4" agent="$5" label="$6" failure_type="$7" exit_status="$8"
+    local api_status="" message="" structured_present=false raw_hash="" output_hash=""
+    [ -n "$diagnostic" ] && [ -n "$raw_response" ] || return 0
+    mkdir -p "$(dirname "$diagnostic")" "$(dirname "$raw_response")"
+    cp "$log" "$raw_response"
+    raw_hash="$(sha256_file "$raw_response")"
+    if [ -s "$output" ]; then structured_present=true; output_hash="$(sha256_file "$output")"; fi
+    api_status="$(grep -Eio '(HTTP|status)[^0-9]*[45][0-9]{2}' "$log" 2>/dev/null | grep -Eo '[45][0-9]{2}' | head -1 || true)"
+    message="$(sed '/^[[:space:]]*$/d' "$log" | tail -n 20)"
+    [ -n "$message" ] || message="$failure_type while running $label"
+    jq -n --arg kind "decomposition_agent_failure" --arg failureType "$failure_type" \
+      --arg sourceHash "$(sha256_file "$SOURCE_FILE")" --arg agent "$agent" --arg label "$label" \
+      --argjson processExitStatus "$exit_status" --argjson timedOut "$([ "$failure_type" = "AGENT_TIMEOUT" ] && printf true || printf false)" \
+      --arg apiStatus "$api_status" --arg message "$message" --arg rawResponsePath "$raw_response" --arg rawResponseHash "$raw_hash" \
+      --arg structuredOutputPath "$output" --arg structuredOutputHash "$output_hash" --argjson structuredOutputPresent "$structured_present" \
+      --arg generatedAt "$(utc_timestamp)" \
+      '{kind:$kind,failureType:$failureType,sourceHash:$sourceHash,agent:$agent,label:$label,
+        processExitStatus:$processExitStatus,timedOut:$timedOut,apiStatus:$apiStatus,message:$message,
+        rawResponsePath:$rawResponsePath,rawResponseHash:$rawResponseHash,
+        structuredOutputPath:$structuredOutputPath,structuredOutputHash:$structuredOutputHash,
+        structuredOutputPresent:$structuredOutputPresent,generatedAt:$generatedAt}' > "$diagnostic"
+}
+
 run_structured_readonly_agent() {
     local agent="$1" model="$2" schema="$3" prompt="$4" output="$5" story_id="$6" label="$7"
-    local log="$RUN_DIR/${story_id}-${label}.log" schema_json before after
+    local allow_invalid="${8:-0}" timeout_seconds="${9:-0}"
+    local failure_diagnostic="${10:-}" raw_response="${11:-}"
+    local log="$RUN_DIR/${story_id}-${label}.log" schema_json before after agent_status=0 response_file failure_type
     before="$(git -C "$PROJECT_DIR" rev-parse HEAD)|$(worktree_snapshot_outside_state)"
     schema_json="$(cat "$schema")"
+    set +e
     case "$agent" in
       claude)
-        run_with_log "$story_id" "$ACTIVE_STORY_TITLE" "planning" "$label" "$log" "plain" \
-          bash -lc 'cat "$1" | claude -p --permission-mode plan --output-format json --json-schema "$2" | jq ".structured_output // (.result | fromjson? // {})" > "$3"; cat "$3"' -- "$prompt" "$schema_json" "$output"
+        response_file="$RUN_DIR/${story_id}-${label}.claude-response.json"
+        rm -f "$response_file" "$output"
+        if [ "$timeout_seconds" -gt 0 ]; then
+            run_with_log_bounded "$timeout_seconds" "$story_id" "$ACTIVE_STORY_TITLE" "planning" "$label" "$log" "plain" \
+              bash -c 'cd "$4" || exit; claude -p --permission-mode plan --output-format json --json-schema "$2" < "$1" > "$3"; status=$?; cat "$3"; exit "$status"' -- "$prompt" "$schema_json" "$response_file" "$PROJECT_DIR"
+        else
+            run_with_log "$story_id" "$ACTIVE_STORY_TITLE" "planning" "$label" "$log" "plain" \
+              bash -c 'cd "$4" || exit; claude -p --permission-mode plan --output-format json --json-schema "$2" < "$1" > "$3"; status=$?; cat "$3"; exit "$status"' -- "$prompt" "$schema_json" "$response_file" "$PROJECT_DIR"
+        fi
+        agent_status=$?
+        if [ "$agent_status" -eq 0 ] && [ -s "$response_file" ]; then
+            jq -e '.structured_output // (if (.result|type)=="string" then (.result|fromjson?) else empty end)' "$response_file" > "$output" 2>/dev/null
+        fi
         ;;
       codex)
-        run_with_log "$story_id" "$ACTIVE_STORY_TITLE" "planning" "$label" "$log" "codex-jsonl" \
-          bash -c 'cat "$1" | "$4" -a never -s read-only exec --ephemeral --json --output-schema "$2" -o "$3" -' -- "$prompt" "$schema" "$output" "$CODEX_BIN"
+        if [ "$timeout_seconds" -gt 0 ]; then
+            run_with_log_bounded "$timeout_seconds" "$story_id" "$ACTIVE_STORY_TITLE" "planning" "$label" "$log" "codex-jsonl" \
+              bash -c 'cd "$5" && cat "$1" | "$4" -C "$5" -a never -s read-only exec --ephemeral --json --output-schema "$2" -o "$3" -' -- "$prompt" "$schema" "$output" "$CODEX_BIN" "$PROJECT_DIR"
+        else
+            run_with_log "$story_id" "$ACTIVE_STORY_TITLE" "planning" "$label" "$log" "codex-jsonl" \
+              bash -c 'cd "$5" && cat "$1" | "$4" -C "$5" -a never -s read-only exec --ephemeral --json --output-schema "$2" -o "$3" -' -- "$prompt" "$schema" "$output" "$CODEX_BIN" "$PROJECT_DIR"
+        fi
+        agent_status=$?
         ;;
       opencode)
         {
@@ -2035,20 +3243,53 @@ run_structured_readonly_agent() {
             cat "$schema"
             printf '\n```\n'
         } >> "$prompt"
-        run_with_log "$story_id" "$ACTIVE_STORY_TITLE" "planning" "$label" "$log" "opencode-jsonl" \
-          opencode_run_stdin "$prompt" "$model" "$PROJECT_DIR" "readonly"
-        if ! extract_first_json_object "$log" "$output"; then
-            echo -e "${RED}Error: opencode did not return valid structured JSON for $label.${NC}"
-            exit 1
+        if [ "$timeout_seconds" -gt 0 ]; then
+            run_with_log_bounded "$timeout_seconds" "$story_id" "$ACTIVE_STORY_TITLE" "planning" "$label" "$log" "opencode-jsonl" \
+              opencode_run_stdin "$prompt" "$model" "$PROJECT_DIR" "readonly"
+        else
+            run_with_log "$story_id" "$ACTIVE_STORY_TITLE" "planning" "$label" "$log" "opencode-jsonl" \
+              opencode_run_stdin "$prompt" "$model" "$PROJECT_DIR" "readonly"
         fi
+        agent_status=$?
+        if [ "$agent_status" -eq 0 ]; then extract_first_json_object "$log" "$output" || true; fi
         ;;
     esac
+    set -e
     after="$(git -C "$PROJECT_DIR" rev-parse HEAD)|$(worktree_snapshot_outside_state)"
     if [ "$before" != "$after" ]; then
         echo -e "${RED}Error: read-only planning phase changed the worktree. Looper will not continue or discard those changes.${NC}"
         exit 1
     fi
-    jq -e . "$output" >/dev/null || { echo -e "${RED}Error: $label returned invalid JSON.${NC}"; exit 1; }
+    if [ "$agent_status" -eq 0 ] && [ -n "$raw_response" ]; then
+        mkdir -p "$(dirname "$raw_response")"
+        cp "$log" "$raw_response"
+    fi
+    if [ "$agent_status" -ne 0 ]; then
+        if [ "$agent_status" -eq 124 ]; then
+            failure_type="AGENT_TIMEOUT"
+        elif grep -Eqi '(HTTP|status)[^0-9]*[45][0-9]{2}|API[ _-]*error|invalid_request_error' "$log"; then
+            failure_type="AGENT_API_ERROR"
+        else
+            failure_type="AGENT_TRANSPORT_ERROR"
+        fi
+        persist_structured_agent_failure "$failure_diagnostic" "$raw_response" "$log" "$output" "$agent" "$label" "$failure_type" "$agent_status"
+        echo -e "${RED}Error: $label failed with $failure_type (exit $agent_status).${NC}"
+        if [ -n "$failure_diagnostic" ]; then jq -r '.message' "$failure_diagnostic"; fi
+        return "$agent_status"
+    fi
+    if [ ! -s "$output" ]; then
+        : > "$output"
+        failure_type="EMPTY_AGENT_OUTPUT"
+        persist_structured_agent_failure "$failure_diagnostic" "$raw_response" "$log" "$output" "$agent" "$label" "$failure_type" 0
+        echo -e "${RED}Error: $label completed without structured output.${NC}"
+        return 65
+    fi
+    if ! jq -e . "$output" >/dev/null 2>&1; then
+        if [ "$allow_invalid" = "1" ]; then return 0; fi
+        persist_structured_agent_failure "$failure_diagnostic" "$raw_response" "$log" "$output" "$agent" "$label" "INVALID_JSON" 0
+        echo -e "${RED}Error: $label returned invalid JSON.${NC}"
+        return 66
+    fi
 }
 
 build_planner_input() {
@@ -2954,6 +4195,22 @@ if ! [[ "$DECOMPOSITION_REVIEW_MAX_ROUNDS" =~ ^[0-9]+$ ]] || [ "$DECOMPOSITION_R
     echo -e "${RED}Error: LOOPER_DECOMPOSITION_REVIEW_MAX_ROUNDS must be a positive integer.${NC}"
     exit 1
 fi
+if ! [[ "$DECOMPOSITION_OUTPUT_REPAIR_MAX_ATTEMPTS" =~ ^[0-9]+$ ]] || [ "$DECOMPOSITION_OUTPUT_REPAIR_MAX_ATTEMPTS" -lt 1 ]; then
+    echo -e "${RED}Error: LOOPER_DECOMPOSITION_OUTPUT_REPAIR_MAX_ATTEMPTS must be a positive integer.${NC}"
+    exit 1
+fi
+if ! [[ "$DECOMPOSITION_REVIEW_OUTPUT_REPAIR_MAX_ATTEMPTS" =~ ^[0-9]+$ ]] || [ "$DECOMPOSITION_REVIEW_OUTPUT_REPAIR_MAX_ATTEMPTS" -lt 1 ]; then
+    echo -e "${RED}Error: LOOPER_DECOMPOSITION_REVIEW_OUTPUT_REPAIR_MAX_ATTEMPTS must be a positive integer.${NC}"
+    exit 1
+fi
+if ! [[ "$DECOMPOSITION_AGENT_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || [ "$DECOMPOSITION_AGENT_TIMEOUT_SECONDS" -lt 1 ]; then
+    echo -e "${RED}Error: LOOPER_DECOMPOSITION_AGENT_TIMEOUT_SECONDS must be a positive integer.${NC}"
+    exit 1
+fi
+if ! [[ "$DECOMPOSITION_TIMEOUT_MAX_RETRIES" =~ ^[0-9]+$ ]]; then
+    echo -e "${RED}Error: LOOPER_DECOMPOSITION_TIMEOUT_MAX_RETRIES must be a non-negative integer.${NC}"
+    exit 1
+fi
 if ! [[ "$KEEP_LOGS" =~ ^[01]$ ]]; then
     echo -e "${RED}Error: LOOPER_KEEP_LOGS must be 0 or 1.${NC}"
     exit 1
@@ -2979,6 +4236,11 @@ fi
 if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo -e "${RED}Error: Looper must run inside a git repository.${NC}"
     exit 1
+fi
+
+pin_runtime_and_reexec
+if [ "$MODE" != "watch" ]; then
+    apply_pinned_runtime_paths
 fi
 
 if [ "$MODE" = "run" ] && [ ! -d "$STATE_DIR" ]; then
@@ -3020,7 +4282,8 @@ if [ ! -f "$REVIEW_SCHEMA_FILE" ]; then
     exit 1
 fi
 for required_file in "$STORIES_SCHEMA_FILE" "$PLANNER_PROMPT_FILE" "$PLAN_REVIEW_PROMPT_FILE" "$PLAN_SCHEMA_FILE" "$PLAN_REVIEW_SCHEMA_FILE" \
-  "$DECOMPOSER_PROMPT_FILE" "$DECOMPOSITION_REVIEW_PROMPT_FILE" "$DECOMPOSITION_SCHEMA_FILE" "$DECOMPOSITION_REVIEW_SCHEMA_FILE"; do
+  "$DECOMPOSER_PROMPT_FILE" "$DECOMPOSITION_REVISER_PROMPT_FILE" "$DECOMPOSITION_REVIEW_PROMPT_FILE" \
+  "$DECOMPOSITION_SCHEMA_FILE" "$DECOMPOSITION_REVISION_SCHEMA_FILE" "$DECOMPOSITION_REVIEW_SCHEMA_FILE"; do
     if [ ! -f "$required_file" ]; then
         echo -e "${RED}Error: required Looper planning asset not found at $required_file${NC}"
         exit 1
