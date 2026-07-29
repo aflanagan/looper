@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sourceKind", "sourceHash", "disposition", "project", "description", "sourceInventory", "coverage", "stories", "unresolvedQuestions", "terminalReason"],
+  "properties": {
+    "sourceKind": { "enum": ["prd", "spec"] },
+    "sourceHash": { "type": "string" },
+    "disposition": { "enum": ["PROPOSED", "NEEDS_HUMAN"] },
+    "project": { "type": "string" },
+    "description": { "type": "string" },
+    "sourceInventory": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "kind", "text", "location"],
+        "properties": { "id": {"type":"string"}, "kind": {"enum":["requirement","constraint","non_goal"]}, "text": {"type":"string"}, "location": {"type":"string"} }
+      }
+    },
+    "coverage": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["sourceId", "storyIds", "acceptanceCriteriaIds"],
+        "properties": {
+          "sourceId": {"type":"string"},
+          "storyIds": {"type":"array", "items":{"type":"string"}},
+          "acceptanceCriteriaIds": {"type":"array", "items":{"type":"string"}}
+        }
+      }
+    },
+    "stories": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "title", "description", "sourceRefs", "scope", "nonGoals", "acceptanceCriteria", "proofExpectations", "disappointmentCheck", "dependsOn", "replaces", "priority"],
+        "properties": {
+          "id": {"type":"string"}, "title": {"type":"string"}, "description": {"type":"string"},
+          "sourceRefs": {"type":"array", "items":{"type":"string"}},
+          "scope": {"type":"array", "items":{"type":"string"}},
+          "nonGoals": {"type":"array", "items":{"type":"string"}},
+          "acceptanceCriteria": {"type":"array", "items":{"type":"object", "additionalProperties":false, "required":["id","text"], "properties":{"id":{"type":"string"},"text":{"type":"string"}}}},
+          "proofExpectations": {"type":"array", "items":{"type":"object", "additionalProperties":false, "required":["id","text"], "properties":{"id":{"type":"string"},"text":{"type":"string"},"command":{"type":"string","minLength":1}}}},
+          "disappointmentCheck": {"type":"string"},
+          "dependsOn": {"type":"array", "items":{"type":"string"}},
+          "replaces": {"type":"array", "items":{"type":"string"}},
+          "priority": {"type":"integer", "minimum":1}
+        }
+      }
+    },
+    "unresolvedQuestions": { "type": "array", "items": {"type":"string"} },
+    "terminalReason": { "type": "string" }
+  }
+}

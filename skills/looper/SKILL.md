@@ -1,92 +1,76 @@
-# Looper PRD-to-Story-Contract Skill
+---
+name: looper
+description: Prepare an authoritative PRD or bounded spec into adversarially reviewed story contracts, then run Looper's per-story planning, implementation, validation, and review workflow.
+---
 
-## Trigger
-Use this skill when the user asks to convert a PRD to Looper format or create `prd.json`.
+# Looper Source-to-Execution Workflow
 
-## Purpose
+Use this skill when the user asks to prepare, decompose, or execute a PRD or bounded task/spec with Looper.
 
-This conversion is decomposition layer one: preserve approved product intent as small, dependency-aware story contracts. Do not produce implementation tasks or file-by-file steps here. At runtime Looper locks one story, generates a codebase-grounded execution plan, adversarially reviews it, and only then implements it.
+## Choose the source contract
 
-## Process
+- Use `--prd` for a whole product/feature document. Decomposition preserves useful boundaries, splits oversized work, and covers all in-scope requirements.
+- Use `--spec` for a bounded end-to-end task. The spec is a hard scope ceiling; Looper must not pull in neighboring roadmap work.
 
-### 1. Validate the approved PRD
+The workflow is generic. Do not add repository-specific paths, queue naming, heading conventions, or tool assumptions to the source.
 
-Do not silently repair or reinterpret an approved contract. Report problems and obtain approval before material changes.
+## Commands
 
-Check that:
-
-- every converted story is explicitly `APPROVED`;
-- IDs and acceptance-criterion IDs are unique and stable;
-- each story is one independently reviewable outcome small enough for one coding context;
-- acceptance criteria are observable and verifiable;
-- `sourceRefs` trace each story to goals or requirements and all in-scope requirements are covered;
-- `dependsOn` references exist, point to earlier stories, and are acyclic;
-- scope, non-goals, proof expectations, and a disappointment check are present;
-- replacement stories name the superseded story in `replaces` and preserve its uncovered source refs/criteria.
-
-If a story is too large, propose revised `DRAFT` story blocks and ask for approval. Never split an approved story invisibly during JSON conversion.
-
-### 2. Determine the state directory
-
-Derive `<branch-name>` from the current Git branch: drop an initial `codex/` or `looper/`, replace characters outside `[A-Za-z0-9._-]` with `-`, and use `unknown-branch` if empty. Write under `.looper/<branch-name>/`.
-
-### 3. Emit canonical JSON
-
-Use `schemaVersion: 2` and preserve approved wording exactly:
-
-```json
-{
-  "schemaVersion": 2,
-  "project": "ProjectName",
-  "branchName": "looper/feature-name",
-  "description": "Brief feature description",
-  "userStories": [
-    {
-      "id": "ABC-001",
-      "status": "APPROVED",
-      "title": "Short outcome title",
-      "description": "As a user, I want an outcome so that I receive value.",
-      "sourceRefs": ["Goal-1", "FR-2"],
-      "scope": ["Explicitly included outcome"],
-      "nonGoals": ["Explicitly excluded adjacent behavior"],
-      "acceptanceCriteria": [
-        {"id": "ABC-001-AC-001", "text": "Observable criterion."}
-      ],
-      "proofExpectations": [
-        {"id": "ABC-001-PROOF-001", "text": "How the outcome should be proved.", "command": "optional safe deterministic command"}
-      ],
-      "disappointmentCheck": "A reasonable expectation that must not be missed.",
-      "dependsOn": [],
-      "replaces": [],
-      "priority": 1,
-      "passes": false,
-      "notes": ""
-    }
-  ]
-}
+```bash
+looper prepare --prd path/to/prd.md
+looper prepare --spec path/to/task.md
+looper start --prd path/to/prd.md [max_iterations]
+looper start --spec path/to/task.md [max_iterations]
+looper run [max_iterations]
+looper [max_iterations]
+looper watch [--verbose|--raw]
 ```
 
-Choose one semantic 2–3 letter uppercase prefix based on the branch or dominant feature area. IDs must match `<PREFIX>-001`; do not emit generic `US-*` IDs. Assign numeric priority as a readable tie-breaker, not as the dependency model.
+`prepare` performs source capture, decomposition, and adversarial decomposition review without implementing. `start` performs the same preparation and then enters the ordinary story execution engine. `run` and bare `looper` resume an already prepared state.
 
-### 4. Material-change rules
+The prepare/start invocation is the authority boundary. Looper snapshots the input byte-for-byte as immutable `source.md`, records its kind, original path, and SHA-256 hash, and refuses a different kind or content for the same state directory.
 
-When updating an existing `prd.json`:
+## Decomposition contract
 
-- Preserve story and AC IDs and all approved material wording.
-- New or materially changed contracts must be `DRAFT` until explicitly approved.
-- Once Looper has locked a story ID, never reuse that ID for a materially different contract; create a new approved ID and use `replaces` when it supersedes the old work.
-- Removing or weakening an approved AC, changing scope/non-goals, changing dependencies, or changing proof/disappointment expectations is material.
-- Replacing a terminal story requires new approved stories whose `replaces` arrays name it. Do not delete the terminal story; lineage is part of the audit trail.
-- `passes`, `notes`, and runtime `execution` fields are Looper-owned state. Preserve them unless the user explicitly requests a state reset.
+The read-only decomposition agent must inventory every in-scope source item, produce dependency-ordered story contracts, and map each source item to stories and acceptance criteria. Stories are product outcomes, not implementation plans. Each requires:
 
-### 5. Legacy normalization
+- a stable ID and independent outcome;
+- source references, explicit scope, and non-goals;
+- stable observable acceptance-criterion IDs;
+- proof expectations and a disappointment check;
+- backward-only explicit dependencies and replacement lineage where relevant.
 
-Legacy files with string acceptance criteria remain runnable. During explicit conversion, normalize each string to `{ "id": "<STORY-ID>-AC-NNN", "text": "..." }` in existing order and add conservative defaults for absent contract fields. Runtime Looper leaves the legacy PRD unchanged and canonicalizes only its frozen selected-story contract. Never renumber an already-object criterion.
+A separate read-only reviewer evaluates every inventory item and every story for omissions, invented scope, weak proof, oversized boundaries, hidden dependencies, and “could pass but disappoint” failures. It returns:
 
-### 6. Scaffold addenda
+- `APPROVED`: Looper injects harness-owned status/provenance and atomically publishes schema-v3 `stories.json`;
+- `CHANGES_REQUESTED`: the author revises within the bounded review rounds;
+- `NEEDS_HUMAN`: a contradiction or material product choice requires human input;
+- `REVIEW_LIMIT`: bounded review ended without approval.
 
-If absent, create short project-specific `prompt.shared.md`, `prompt.implementer.md`, and `prompt.reviewer.md` files beside `prd.json`. Do not copy Looper defaults and do not overwrite existing addenda without explicit permission.
+Do not manually write runtime fields (`status`, `passes`, `notes`, `execution`) into an author proposal. Do not publish or replace `stories.json` unless the reviewer approves.
 
-## Output
+## State and resume behavior
 
-Confirm the chosen prefix, output path, story count, dependency validation, any legacy normalization, and which addenda were created or preserved.
+The state directory contains:
+
+```text
+source.md
+stories.json
+decomposition/
+  state.json
+  proposal-N.json
+  review-N.json
+  approved.json
+stories/
+  <story-id>.contract.json
+  <story-id>.planning.json
+  <story-id>.plan-N.json
+  <story-id>.plan-review-N.json
+  <story-id>.approved-plan.json
+```
+
+Source decomposition resumes at persisted author/reviewer boundaries. The same approved source is idempotent. A source hash mismatch, malformed output, unauthorized read-only side effect, `NEEDS_HUMAN`, or review limit stops without publishing partial stories.
+
+After preparation, all inputs converge on one engine: lock one story, generate a codebase-grounded read-only plan, adversarially review it, implement only an approved `PLAN_READY` plan, run harness-owned validation, adversarially review the diff, remediate if needed, and commit once on approval.
+
+Project prompt addenda remain optional beside `stories.json`: `prompt.shared.md`, `prompt.implementer.md`, and `prompt.reviewer.md`. Preserve existing files; do not overwrite them without explicit permission.

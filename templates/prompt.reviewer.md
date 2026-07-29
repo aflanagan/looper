@@ -7,7 +7,7 @@ Review only the uncommitted changes in the current repository for the active sto
 - Start with the shared Looper project model and file contract above, then use the `## Runtime Context` block at the end of the fully rendered prompt to identify this run's exact paths, active story title, and review round.
 - Read any project shared or reviewer addenda included before runtime context. They define the codebase's contract and maturity (see "Codebase maturity" below).
 - Load the immutable contract and approved plan from runtime context first. The frozen contract is the exclusive product truth; verify every stable criterion and verify conformance to the approved plan.
-- Treat `prd.json` only as mutable backlog/pass state. Its current wording, priority, or ordering cannot weaken, replace, or expand the locked contract.
+- Treat `stories.json` only as mutable backlog/pass state. Its current wording, priority, or ordering cannot weaken, replace, or expand the locked contract.
 - Use the Story File as the review handoff record:
   - `Open Findings` shows what was previously unresolved
   - `Latest Review Summary` shows the last review rationale

@@ -6,11 +6,12 @@
 <br /><br />
 Automate multi-story implementation with locked story contracts, adversarially reviewed execution plans, harness-owned validation, and independent code review.
 <br /><br />
-Give Looper an approved PRD and convert it into dependency-aware story contracts. For each story, Looper snapshots the material contract, asks the implementation agent for a read-only codebase-grounded plan, and has the review agent challenge that plan before code is written. Only an approved `PLAN_READY` plan reaches implementation. The existing implementation/review/remediation loop then runs, and Looper makes one final commit for the story.
+Give Looper an authoritative PRD or bounded task spec. It snapshots the source, creates dependency-aware story contracts, and has a separate adversarial agent review the decomposition before anything is implemented. For each approved story, Looper then snapshots the contract, generates and reviews a codebase-grounded plan, implements, validates, reviews the diff, and makes one final commit.
 <br /><br />
 
 ```
-PRD → approved story contracts → lock one story
+PRD or bounded spec → proposed stories → adversarial decomposition review
+    → approved story contracts → lock one story
     → [ read-only plan → adversarial plan review → revise? ]
     → [ implementation → harness checks → code review → remediate? ]
     → one final commit → next story
@@ -18,10 +19,11 @@ PRD → approved story contracts → lock one story
 
 ## How It Works
 
-1. Create a PRD with explicitly approved story blocks, stable acceptance-criterion IDs, dependency edges, scope/non-goals, and proof expectations.
-2. Convert it to canonical `.looper/<branch-name>/prd.json` using `/looper`.
-3. Run `looper`. A new story starts only from a clean worktree outside Looper state.
-4. For each runnable story:
+1. Create an authoritative PRD or bounded task spec.
+2. Run `looper prepare --prd PATH` or `looper prepare --spec PATH`. Looper snapshots it as immutable `source.md`, proposes stories, and adversarially reviews their source coverage and boundaries.
+3. On approval, Looper atomically publishes schema-v3 `.looper/<branch-name>/stories.json`. Contradictions or material ambiguity stop in `NEEDS_HUMAN`; review exhaustion stops in `REVIEW_LIMIT`.
+4. Run `looper`. A new story starts only from a clean worktree outside Looper state. (`looper start` combines preparation and execution.)
+5. For each runnable story:
    - Looper creates an immutable contract snapshot and active-story lock.
    - The implementation agent plans in read-only mode; the review agent adversarially reviews the plan for up to `LOOPER_PLAN_REVIEW_MAX_ROUNDS` (default 3).
    - An approved `SPLIT_REQUIRED` or `BLOCKED` disposition stops before code. Approved replacement stories can recover a terminal story through their `replaces` lineage.
@@ -29,7 +31,7 @@ PRD → approved story contracts → lock one story
    - Looper runs configured proof commands itself, then the review agent reviews the uncommitted diff.
    - If review requests changes, Looper runs remediation and re-review (up to `LOOPER_REVIEW_MAX_ROUNDS`, default 5)
    - On approval, Looper commits once and marks the story passed atomically. A failed commit remains retryable and never marks the story passed.
-5. Stops when all stories pass or max iterations is reached
+6. Stops when all stories pass or max iterations is reached
 
 > **What happens if they can't agree?** After exhausting review rounds for a story, Looper stops with a non-zero exit and leaves the story unresolved. The next manual rerun resumes remediation for that same story.
 
@@ -62,62 +64,28 @@ export PATH="$HOME/bin:$PATH"
 
 You only need the CLI(s) for the agents you actually use. To run Claude on implementation and Codex on review (the default), you need both of those. To drive any other model, install `opencode` (`npm i -g opencode-ai`) and use the `opencode` agent — see [Using any model](#using-any-model).
 
-> **Cost note:** Each story adds plan generation/review before implementation/review. Use the three-round planning default and `LOOPER_REVIEW_MAX_ROUNDS` to constrain spend. Every phase is persisted so a rerun resumes the exact outstanding boundary rather than silently restarting completed planning work.
+> **Cost note:** Source preparation adds a bounded decomposition/review loop, and each story adds plan generation/review before implementation/review. The defaults are three decomposition rounds, three planning rounds, and five code-review rounds. Every phase is persisted for exact-boundary resume.
 
 ## Usage
 
-### 1. Create a PRD
+### 1. Prepare a source
 
-In Claude Code, use the `/prd` slash command:
+Use `/prd` to author a whole-feature product document, or bring any bounded end-to-end Markdown spec. Then choose exactly one source kind:
 
-```
-/prd add dark mode to the dashboard
-```
-
-### 2. Convert to Looper format
-
-Still in Claude Code, convert the PRD to the structured JSON format Looper expects:
-
-```
-/looper convert this prd
+```bash
+looper prepare --prd plans/dark-mode.md
+looper prepare --spec tasks/theme-toggle.md
 ```
 
-This creates schema-version 2 `.looper/<branch-name>/prd.json`. `/looper` preserves approved wording and stable IDs; it does not invent implementation steps. Example story:
+The source is copied byte-for-byte to `source.md` and bound to its kind and SHA-256 hash. The implementation agent proposes stories in read-only mode, the review agent adversarially reviews them, and only an approved proposal becomes `stories.json`. `NEEDS_HUMAN` and `REVIEW_LIMIT` preserve all artifacts without publishing partial work.
 
-```json
-{
-  "schemaVersion": 2,
-  "project": "Dashboard",
-  "branchName": "looper/dark-mode",
-  "description": "Add dark mode support to the dashboard UI.",
-  "userStories": [
-    {
-      "id": "UI-001",
-      "status": "APPROVED",
-      "title": "Let users select a theme",
-      "description": "As a dashboard user, I want a theme toggle so that I can switch between light and dark mode.",
-      "sourceRefs": ["Goal-1", "FR-2"],
-      "scope": ["Theme selection and persistence"],
-      "nonGoals": ["Redesigning unrelated dashboard layout"],
-      "acceptanceCriteria": [
-        {"id": "UI-001-AC-001", "text": "Header shows a theme toggle control."},
-        {"id": "UI-001-AC-002", "text": "Theme preference persists across reloads."}
-      ],
-      "proofExpectations": [
-        {"id": "UI-001-PROOF-001", "text": "Automated theme behavior tests pass.", "command": "npm test -- theme"}
-      ],
-      "disappointmentCheck": "The selected theme remains visually usable across core dashboard surfaces.",
-      "dependsOn": [],
-      "replaces": [],
-      "priority": 1,
-      "passes": false,
-      "notes": ""
-    }
-  ]
-}
+Use `start` to prepare and immediately enter the same execution engine:
+
+```bash
+looper start --spec tasks/theme-toggle.md
 ```
 
-### 3. (Optional) Add project prompt addenda
+### 2. (Optional) Add project prompt addenda
 
 Looper always starts from its built-in implementation and review templates. You can extend them with up to three project-level addenda under `.looper/<branch-name>/`:
 
@@ -153,25 +121,12 @@ Prompt assembly order is:
 4. project role addendum: `.looper/<branch>/prompt.implementer.md` or `.looper/<branch>/prompt.reviewer.md`
 5. runtime context appended by Looper
 
-### Manual bootstrap (without `/prd` or `/looper`)
-
-If you prefer to start manually:
-
-1. Create `.looper/<branch-name>/` (usually from your current git branch)
-2. Add your PRD markdown as `.looper/<branch-name>/prd.md`
-3. Add `.looper/<branch-name>/prd.json` in Looper story format
-4. Optionally add `.looper/<branch-name>/prompt.shared.md`
-5. Optionally add `.looper/<branch-name>/prompt.implementer.md`
-6. Optionally add `.looper/<branch-name>/prompt.reviewer.md`
-7. Run `looper`
-
-`prd.md` is optional for Looper runtime, but recommended as source context you can keep alongside `prd.json`.
-
-### 4. Run Looper
+### 3. Run or resume Looper
 
 ```bash
-looper      # default: 10 iterations
-looper 20   # custom iteration limit
+looper          # alias for: looper run (10 iterations)
+looper 20       # alias for: looper run 20
+looper run 20   # explicit resume
 ```
 
 To follow an active run in another terminal:
@@ -187,8 +142,13 @@ looper watch --raw       # raw underlying log stream
 ```
 .looper/
   └── <branch-name>/
-      ├── prd.md               # Optional: source PRD markdown
-      ├── prd.json             # Required: stories and task state
+      ├── source.md            # Immutable authoritative PRD or bounded spec
+      ├── stories.json         # Reviewed story contracts and execution state
+      ├── decomposition/       # Persisted proposal/review rounds and approval
+      │   ├── state.json
+      │   ├── proposal-N.json
+      │   ├── review-N.json
+      │   └── approved.json
       ├── prompt.shared.md     # Optional: prompt guidance shared by both agents
       ├── prompt.implementer.md # Optional: implementation-only addendum
       ├── prompt.reviewer.md   # Optional: review-only addendum
@@ -208,9 +168,9 @@ looper watch --raw       # raw underlying log stream
 
 Older `prompt.local.md` and `review-prompt.md` files are no longer read. Move any reusable content into the new addenda files.
 
-Looper only commits after the review agent returns `APPROVED`. On approval, it appends a review-closure summary to the progress log, updates the active story file under `stories/`, and writes a short outcome note to the story's entry in `prd.json`.
+Looper only commits after the code-review agent returns `APPROVED`. On approval, it appends a review-closure summary to the progress log, updates the active story file under `stories/`, and writes a short outcome note to the story's entry in `stories.json`.
 
-Legacy PRDs with string acceptance criteria remain unchanged on disk. Looper canonicalizes the selected story only inside its frozen lock/contract, assigning deterministic `<STORY-ID>-AC-NNN` IDs there. Once a story ID has a locked contract, Looper never overwrites it: materially revised work needs a new approved story ID (and `replaces` lineage when appropriate).
+Schema v3 is intentionally breaking and has no legacy schema compatibility. Once a story ID has a locked contract, Looper never overwrites it; materially revised work needs a new story ID and `replaces` lineage when appropriate.
 
 Active run metadata and watch logs are kept under your temp directory, not under `.looper/`. `looper watch` defaults to a compact transcript and supports `--verbose` and `--raw` (`--full-logs` alias) when you want more detail.
 
@@ -226,6 +186,7 @@ Active run metadata and watch logs are kept under your temp directory, not under
 | `LOOPER_REVIEW_MODEL` | _(opencode default)_ | Model for the `opencode` review agent, as `provider/model` (e.g. `anthropic/claude-sonnet-4-20250514`). Ignored by `claude`/`codex`. |
 | `LOOPER_REVIEW_MAX_ROUNDS` | `5` | Max review/remediation cycles per story before Looper exits non-zero |
 | `LOOPER_PLAN_REVIEW_MAX_ROUNDS` | `3` | Max persisted plan/review cycles before implementation is blocked |
+| `LOOPER_DECOMPOSITION_REVIEW_MAX_ROUNDS` | `3` | Max persisted source decomposition/review cycles before `REVIEW_LIMIT` |
 | `LOOPER_VALIDATION_COMMANDS` | _(empty)_ | Optional newline-separated harness commands; story proof-expectation commands are also run |
 | `LOOPER_KEEP_LOGS` | `0` | Preserve temp run logs on failure when set to `1` |
 | `LOOPER_IMPLEMENTATION_PROMPT_FILE` | `templates/prompt.implementer.md` | Override the base implementation prompt template |
@@ -233,6 +194,8 @@ Active run metadata and watch logs are kept under your temp directory, not under
 | `LOOPER_REVIEW_SCHEMA_FILE` | `templates/codex-review-schema.json` | Override review schema path |
 | `LOOPER_PLANNER_PROMPT_FILE` | `templates/prompt.planner.md` | Override the read-only planner prompt |
 | `LOOPER_PLAN_REVIEW_PROMPT_FILE` | `templates/prompt.plan-reviewer.md` | Override the adversarial plan-review prompt |
+| `LOOPER_DECOMPOSER_PROMPT_FILE` | `templates/prompt.decomposer.md` | Override the read-only source-decomposer prompt |
+| `LOOPER_DECOMPOSITION_REVIEW_PROMPT_FILE` | `templates/prompt.decomposition-reviewer.md` | Override the adversarial decomposition-review prompt |
 
 ## Using any model
 
@@ -306,8 +269,11 @@ The review agent must return JSON matching `templates/codex-review-schema.json`.
 | `templates/prompt.shared.md` | Base shared prompt context for both agents |
 | `templates/prompt.implementer.md` | Base implementation prompt |
 | `templates/prompt.reviewer.md` | Base review prompt |
+| `templates/prompt.decomposer.md` | Source decomposition prompt |
+| `templates/prompt.decomposition-reviewer.md` | Adversarial source-decomposition review prompt |
 | `templates/codex-review-schema.json` | Structured output schema for the review agent (Codex native; injected into the prompt for opencode) |
-| `skills/looper/SKILL.md` | `/looper` slash command (PRD-to-JSON conversion) |
+| `templates/stories.schema.json` | Published schema-v3 story-list contract |
+| `skills/looper/SKILL.md` | `/looper` source preparation and execution workflow |
 | `skills/prd/SKILL.md` | `/prd` slash command (PRD generation) |
 
 ## Based On

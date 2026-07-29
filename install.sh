@@ -67,6 +67,6 @@ if ! echo "$PATH" | tr ':' '\n' | grep -q "$HOME/bin"; then
 fi
 
 echo "Usage:"
-echo "  1. In any project, create .looper/<branch-name>/prd.json (use /looper skill)"
-echo "  2. Optionally add prompt.shared.md, prompt.implementer.md, and prompt.reviewer.md beside prd.json"
-echo "  3. Run: looper [max_iterations]"
+echo "  1. Run: looper prepare --prd PATH (or --spec PATH)"
+echo "  2. Inspect source.md, stories.json, and decomposition approval artifacts"
+echo "  3. Run: looper [max_iterations] (or use looper start to prepare and run)"

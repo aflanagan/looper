@@ -1,15 +1,18 @@
 #!/bin/bash
 # Looper - Autonomous implementation + review loop
-# Runs implementation and review agents repeatedly until all PRD tasks complete.
+# Decomposes an authoritative source and runs implementation/review story loops.
 #
 # Usage:
 #   looper [max_iterations]
+#   looper run [max_iterations]
+#   looper prepare --prd|--spec PATH
+#   looper start --prd|--spec PATH [max_iterations]
 #   looper watch [--verbose|--raw|--full-logs]
 #
 # Default max iterations: 10
 #
 # Requires:
-#   - .looper/<branch-name>/prd.json in current directory
+#   - .looper/<branch-name>/stories.json in current directory for run mode
 #   - claude and/or codex, plus jq and git
 #
 # Optional:
@@ -37,6 +40,9 @@ MAX_ITERATIONS=10
 WATCH_OUTPUT_MODE="compact"
 CLI_ERROR=""
 SHOW_USAGE_ON_ERROR=0
+SOURCE_KIND=""
+SOURCE_INPUT=""
+
 if [ "${1:-}" = "watch" ]; then
     MODE="watch"
     shift
@@ -59,6 +65,45 @@ if [ "${1:-}" = "watch" ]; then
         esac
         shift
     done
+elif [ "${1:-}" = "prepare" ] || [ "${1:-}" = "start" ]; then
+    MODE="$1"
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --prd|--spec)
+                if [ -n "$SOURCE_KIND" ] || [ $# -lt 2 ]; then
+                    CLI_ERROR="prepare/start requires exactly one --prd PATH or --spec PATH"
+                    SHOW_USAGE_ON_ERROR=1
+                    break
+                fi
+                SOURCE_KIND="${1#--}"
+                SOURCE_INPUT="$2"
+                shift 2
+                ;;
+            --help|-h)
+                MODE="help"
+                shift
+                ;;
+            *)
+                if [ "$MODE" = "start" ] && [[ "$1" =~ ^[0-9]+$ ]] && [ "$MAX_ITERATIONS" = 10 ]; then
+                    MAX_ITERATIONS="$1"
+                    shift
+                else
+                    CLI_ERROR="unknown or duplicate $MODE argument: $1"
+                    SHOW_USAGE_ON_ERROR=1
+                    break
+                fi
+                ;;
+        esac
+    done
+    if [ "$MODE" != "help" ] && { [ -z "$SOURCE_KIND" ] || [ -z "$SOURCE_INPUT" ]; }; then
+        CLI_ERROR="$MODE requires exactly one --prd PATH or --spec PATH"
+        SHOW_USAGE_ON_ERROR=1
+    fi
+elif [ "${1:-}" = "run" ]; then
+    shift
+    if [ $# -gt 0 ]; then MAX_ITERATIONS="$1"; shift; fi
+    if [ $# -gt 0 ]; then CLI_ERROR="run accepts at most one max_iterations value"; SHOW_USAGE_ON_ERROR=1; fi
 elif [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
     MODE="help"
     shift
@@ -137,8 +182,10 @@ PROMPT_IMPLEMENTER_FILE="$STATE_DIR/prompt.implementer.md"
 PROMPT_REVIEWER_FILE="$STATE_DIR/prompt.reviewer.md"
 LEGACY_LOCAL_PROMPT_FILE="$STATE_DIR/prompt.local.md"
 LEGACY_REVIEW_PROMPT_FILE="$STATE_DIR/review-prompt.md"
-PRD_MARKDOWN_FILE="$STATE_DIR/prd.md"
-PRD_FILE="$STATE_DIR/prd.json"
+SOURCE_FILE="$STATE_DIR/source.md"
+STORIES_FILE="$STATE_DIR/stories.json"
+DECOMPOSITION_ROOT="$STATE_DIR/decomposition"
+DECOMPOSITION_STATE_FILE="$DECOMPOSITION_ROOT/state.json"
 PROGRESS_FILE="$STATE_DIR/progress.txt"
 STORIES_ROOT="$STATE_DIR/stories"
 LEGACY_REVIEWS_ROOT="$STATE_DIR/reviews"
@@ -146,7 +193,11 @@ SHARED_PROMPT_FILE="$LOOPER_DIR/templates/prompt.shared.md"
 IMPLEMENTATION_PROMPT_FILE="${LOOPER_IMPLEMENTATION_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.implementer.md}"
 REVIEW_PROMPT_FILE="${LOOPER_REVIEW_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.reviewer.md}"
 REVIEW_SCHEMA_FILE="${LOOPER_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-review-schema.json}"
-PRD_SCHEMA_FILE="${LOOPER_PRD_SCHEMA_FILE:-$LOOPER_DIR/templates/prd.schema.json}"
+STORIES_SCHEMA_FILE="${LOOPER_STORIES_SCHEMA_FILE:-$LOOPER_DIR/templates/stories.schema.json}"
+DECOMPOSER_PROMPT_FILE="${LOOPER_DECOMPOSER_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.decomposer.md}"
+DECOMPOSITION_REVIEW_PROMPT_FILE="${LOOPER_DECOMPOSITION_REVIEW_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.decomposition-reviewer.md}"
+DECOMPOSITION_SCHEMA_FILE="${LOOPER_DECOMPOSITION_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-decomposition-schema.json}"
+DECOMPOSITION_REVIEW_SCHEMA_FILE="${LOOPER_DECOMPOSITION_REVIEW_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-decomposition-review-schema.json}"
 PLANNER_PROMPT_FILE="${LOOPER_PLANNER_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.planner.md}"
 PLAN_REVIEW_PROMPT_FILE="${LOOPER_PLAN_REVIEW_PROMPT_FILE:-$LOOPER_DIR/templates/prompt.plan-reviewer.md}"
 PLAN_SCHEMA_FILE="${LOOPER_PLAN_SCHEMA_FILE:-$LOOPER_DIR/templates/codex-plan-schema.json}"
@@ -158,6 +209,7 @@ REVIEW_MODEL="${LOOPER_REVIEW_MODEL:-}"
 CODEX_BIN="${LOOPER_CODEX_BIN:-codex}"
 REVIEW_MAX_ROUNDS="${LOOPER_REVIEW_MAX_ROUNDS:-5}"
 PLAN_REVIEW_MAX_ROUNDS="${LOOPER_PLAN_REVIEW_MAX_ROUNDS:-3}"
+DECOMPOSITION_REVIEW_MAX_ROUNDS="${LOOPER_DECOMPOSITION_REVIEW_MAX_ROUNDS:-3}"
 VALIDATION_COMMANDS="${LOOPER_VALIDATION_COMMANDS:-}"
 KEEP_LOGS="${LOOPER_KEEP_LOGS:-0}"
 TMP_ROOT="${TMPDIR:-/tmp}"
@@ -172,7 +224,6 @@ ACTIVE_HANDOFF_TOKEN=""
 ACTIVE_CONTRACT_FILE=""
 ACTIVE_PLAN_FILE=""
 ACTIVE_LOCK_FILE="$STATE_DIR/active-story.json"
-ALLOW_DIRTY_LEGACY_START="${LOOPER_ALLOW_DIRTY_LEGACY_START:-0}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -184,6 +235,11 @@ print_usage() {
     cat <<EOF
 Usage:
   looper [max_iterations]
+  looper run [max_iterations]
+  looper prepare --prd PATH
+  looper prepare --spec PATH
+  looper start --prd PATH [max_iterations]
+  looper start --spec PATH [max_iterations]
   looper watch [--verbose|--raw|--full-logs]
 
 Watch output:
@@ -203,6 +259,8 @@ Environment:
   LOOPER_REVIEW_MAX_ROUNDS    Number of review rounds per story (default: 5)
   LOOPER_PLAN_REVIEW_MAX_ROUNDS
                              Number of adversarial plan rounds per story (default: 3)
+  LOOPER_DECOMPOSITION_REVIEW_MAX_ROUNDS
+                             Number of adversarial source decomposition rounds (default: 3)
   LOOPER_VALIDATION_COMMANDS Optional newline-separated commands run by the harness before code review
   LOOPER_KEEP_LOGS            Keep temp run logs on failure (default: 0)
   LOOPER_IMPLEMENTATION_PROMPT_FILE
@@ -470,7 +528,7 @@ render_story_details_section() {
               + ["", "### Proof Expectations", ""]
               + (($story.proofExpectations // []) | map("- " + (.id // "proof") + ": " + (.text // "")))
               + ["", "### Disappointment Check", "", ($story.disappointmentCheck // "")]
-              + ["", "### Contract Provenance", "", "- Frozen immutable contract; live PRD fields are not product authority for this run."]
+              + ["", "### Contract Provenance", "", "- Frozen immutable contract; live story-list fields are not product authority for this run."]
             ) | join("\n")
           end
     ' "$ACTIVE_CONTRACT_FILE"
@@ -920,12 +978,12 @@ EOF
     note_line="$reviewer_name review: CHANGES_REQUESTED after $failed_round round(s) at $timestamp; summary: $summary; story state: $(display_path "$story_file")"
     note_line="$(truncate_text "$(normalize_single_line "$note_line")" 500)"
 
-    tmp="$(mktemp "$STATE_DIR/prd-notes.XXXXXX")"
+    tmp="$(mktemp "$STATE_DIR/story-notes.XXXXXX")"
     jq --arg id "$story_id" --arg line "$note_line" '
-        (.userStories[] | select(.id == $id) | .notes) |=
+        (.stories[] | select(.id == $id) | .notes) |=
             (if . == null or . == "" then $line else . + "\n" + $line end)
-    ' "$PRD_FILE" > "$tmp"
-    mv "$tmp" "$PRD_FILE"
+    ' "$STORIES_FILE" > "$tmp"
+    mv "$tmp" "$STORIES_FILE"
 }
 
 write_run_state() {
@@ -1484,81 +1542,345 @@ atomic_jq_replace() {
     mv "$tmp" "$file"
 }
 
-prd_is_legacy() {
-    [ "$(jq -r '.schemaVersion // 1' "$PRD_FILE")" != "2" ]
+write_decomposition_state() {
+    local status="$1" round="$2" proposal_file="${3:-}" review_file="${4:-}" reason="${5:-}" tmp proposal_hash="" review_hash=""
+    mkdir -p "$DECOMPOSITION_ROOT"
+    [ -n "$proposal_file" ] && [ -f "$proposal_file" ] && proposal_hash="$(sha256_file "$proposal_file")"
+    [ -n "$review_file" ] && [ -f "$review_file" ] && review_hash="$(sha256_file "$review_file")"
+    tmp="$(mktemp "$DECOMPOSITION_ROOT/state.XXXXXX")"
+    jq -n --arg status "$status" --argjson round "$round" --arg sourceKind "$SOURCE_KIND" \
+      --arg sourceHash "$(sha256_file "$SOURCE_FILE")" --arg originalPath "$SOURCE_INPUT" \
+      --arg proposalFile "$proposal_file" --arg reviewFile "$review_file" --arg terminalReason "$reason" \
+      --arg proposalHash "$proposal_hash" --arg reviewHash "$review_hash" \
+      --arg authorAgent "$IMPLEMENTATION_AGENT" --arg authorModel "$IMPLEMENTATION_MODEL" \
+      --arg reviewerAgent "$REVIEW_AGENT" --arg reviewerModel "$REVIEW_MODEL" \
+      --arg updatedAt "$(utc_timestamp)" \
+      '{status:$status,round:$round,sourceKind:$sourceKind,sourceHash:$sourceHash,originalPath:$originalPath,
+        proposalFile:$proposalFile,reviewFile:$reviewFile,proposalHash:$proposalHash,reviewHash:$reviewHash,
+        author:{agent:$authorAgent,model:$authorModel},reviewer:{agent:$reviewerAgent,model:$reviewerModel},
+        terminalReason:$terminalReason,updatedAt:$updatedAt}' > "$tmp"
+    mv "$tmp" "$DECOMPOSITION_STATE_FILE"
+}
+
+capture_authoritative_source() {
+    local input_abs input_hash existing_hash existing_kind tmp
+    [ -f "$SOURCE_INPUT" ] || { echo -e "${RED}Error: source file not found: $SOURCE_INPUT${NC}"; exit 1; }
+    input_abs="$(cd "$(dirname "$SOURCE_INPUT")" && pwd)/$(basename "$SOURCE_INPUT")"
+    SOURCE_INPUT="$input_abs"
+    input_hash="$(sha256_file "$SOURCE_INPUT")"
+    mkdir -p "$STATE_DIR" "$DECOMPOSITION_ROOT"
+
+    if [ -f "$DECOMPOSITION_STATE_FILE" ]; then
+        existing_kind="$(jq -r '.sourceKind // empty' "$DECOMPOSITION_STATE_FILE")"
+        existing_hash="$(jq -r '.sourceHash // empty' "$DECOMPOSITION_STATE_FILE")"
+        if [ "$existing_kind" != "$SOURCE_KIND" ] || [ "$existing_hash" != "$input_hash" ]; then
+            echo -e "${RED}Error: this state directory is already bound to a different source kind or content.${NC}"
+            exit 1
+        fi
+    fi
+
+    if [ -f "$SOURCE_FILE" ]; then
+        existing_hash="$(sha256_file "$SOURCE_FILE")"
+        [ "$existing_hash" = "$input_hash" ] || { echo -e "${RED}Error: immutable source.md does not match the requested source.${NC}"; exit 1; }
+    elif [ "$SOURCE_INPUT" -ef "$SOURCE_FILE" ] 2>/dev/null; then
+        :
+    else
+        tmp="$(mktemp "$STATE_DIR/source.XXXXXX")"
+        cp "$SOURCE_INPUT" "$tmp"
+        [ "$(sha256_file "$tmp")" = "$input_hash" ] || { rm -f "$tmp"; echo -e "${RED}Error: source copy verification failed.${NC}"; exit 1; }
+        mv "$tmp" "$SOURCE_FILE"
+    fi
+
+    if [ ! -f "$DECOMPOSITION_STATE_FILE" ]; then
+        write_decomposition_state "DECOMPOSING" 1
+    fi
+}
+
+verify_authoritative_source() {
+    local expected actual stories_expected
+    [ -f "$SOURCE_FILE" ] || { echo -e "${RED}Error: immutable source missing: $SOURCE_FILE${NC}"; exit 1; }
+    actual="$(sha256_file "$SOURCE_FILE")"
+    if [ -f "$DECOMPOSITION_STATE_FILE" ]; then
+        expected="$(jq -r '.sourceHash // empty' "$DECOMPOSITION_STATE_FILE")"
+    else
+        expected="$(jq -r '.source.hash // empty' "$STORIES_FILE" 2>/dev/null || true)"
+    fi
+    stories_expected="$(jq -r '.source.hash // empty' "$STORIES_FILE" 2>/dev/null || true)"
+    [ -n "$expected" ] && [ "$actual" = "$expected" ] || { echo -e "${RED}Error: source.md hash does not match its recorded immutable source hash.${NC}"; exit 1; }
+    if [ -n "$stories_expected" ] && [ "$actual" != "$stories_expected" ]; then
+        echo -e "${RED}Error: source.md was changed after stories were approved.${NC}"
+        exit 1
+    fi
+}
+
+verify_approved_decomposition_chain() {
+    local proposal review approved proposal_hash review_hash source_hash
+    [ -f "$DECOMPOSITION_STATE_FILE" ] && [ -f "$STORIES_FILE" ] || { echo -e "${RED}Error: approved decomposition artifacts are incomplete.${NC}"; exit 1; }
+    [ "$(jq -r '.status // empty' "$DECOMPOSITION_STATE_FILE")" = "APPROVED" ] || { echo -e "${RED}Error: decomposition state is not APPROVED.${NC}"; exit 1; }
+    proposal="$(jq -r '.proposalFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    review="$(jq -r '.reviewFile // empty' "$DECOMPOSITION_STATE_FILE")"
+    approved="$DECOMPOSITION_ROOT/approved.json"
+    [ -f "$proposal" ] && [ -f "$review" ] && [ -f "$approved" ] || { echo -e "${RED}Error: approved decomposition proposal, review, or approval artifact is missing.${NC}"; exit 1; }
+    proposal_hash="$(sha256_file "$proposal")"; review_hash="$(sha256_file "$review")"; source_hash="$(sha256_file "$SOURCE_FILE")"
+    if ! jq -e --arg sh "$source_hash" --arg ph "$proposal_hash" --arg rh "$review_hash" \
+      --slurpfile state "$DECOMPOSITION_STATE_FILE" --slurpfile stories "$STORIES_FILE" --slurpfile approved "$approved" '
+      .sourceHash==$sh and .disposition=="PROPOSED"
+      and ($state[0].sourceHash==$sh and $state[0].proposalHash==$ph and $state[0].reviewHash==$rh)
+      and ($stories[0].source.hash==$sh and $stories[0].decomposition.sourceHash==$sh
+        and $stories[0].decomposition.proposalHash==$ph and $stories[0].decomposition.reviewHash==$rh)
+      and ($approved[0].kind=="adversarial_decomposition_review" and $approved[0].status=="APPROVED"
+        and $approved[0].sourceHash==$sh and $approved[0].proposalHash==$ph and $approved[0].reviewHash==$rh)
+      and ($state[0].round==$stories[0].decomposition.round and $state[0].round==$approved[0].round)
+      and ($state[0].author==$stories[0].decomposition.author and $state[0].author==$approved[0].author)
+      and ($state[0].reviewer==$stories[0].decomposition.reviewer and $state[0].reviewer==$approved[0].reviewer)
+    ' "$proposal" >/dev/null; then
+        echo -e "${RED}Error: approved decomposition artifact hashes or provenance do not form a valid chain.${NC}"
+        exit 1
+    fi
+    if ! jq -e --arg sh "$source_hash" --arg ph "$proposal_hash" '.sourceHash==$sh and .proposalHash==$ph and .verdict=="APPROVED"' "$review" >/dev/null; then
+        echo -e "${RED}Error: approved decomposition review identity does not match its source and proposal.${NC}"
+        exit 1
+    fi
+}
+
+build_decomposer_input() {
+    local round="$1" previous_proposal="${2:-}" previous_review="${3:-}"
+    cat "$DECOMPOSER_PROMPT_FILE"
+    printf '\n## Runtime Context\n- Source kind: %s\n- Source hash: %s\n- Decomposition round: %s of %s\n- Repository root: %s\n\n## Authoritative Source\n```markdown\n' \
+      "$SOURCE_KIND" "$(sha256_file "$SOURCE_FILE")" "$round" "$DECOMPOSITION_REVIEW_MAX_ROUNDS" "$PROJECT_DIR"
+    cat "$SOURCE_FILE"
+    printf '\n```\n'
+    if [ -n "$previous_proposal" ] && [ -f "$previous_proposal" ]; then
+        printf '\n## Previous Proposal\n```json\n'; cat "$previous_proposal"; printf '\n```\n'
+    fi
+    if [ -n "$previous_review" ] && [ -f "$previous_review" ]; then
+        printf '\n## Previous Adversarial Review\n```json\n'; cat "$previous_review"; printf '\n```\nResolve every material finding without expanding the source.\n'
+    fi
+}
+
+validate_decomposition_proposal() {
+    local proposal="$1" expected_hash inventory_ids coverage_ids story_ids coverage_story_ids ac_ids coverage_ac_ids
+    expected_hash="$(sha256_file "$SOURCE_FILE")"
+    if ! jq -e --arg kind "$SOURCE_KIND" --arg hash "$expected_hash" '
+      .sourceKind==$kind and .sourceHash==$hash
+      and (.disposition|IN("PROPOSED","NEEDS_HUMAN"))
+      and (.project|type=="string") and (.description|type=="string")
+      and (.sourceInventory|type=="array") and (.coverage|type=="array") and (.stories|type=="array")
+      and (.unresolvedQuestions|type=="array") and (.terminalReason|type=="string")
+      and all(.sourceInventory[]; (.id|length)>0 and (.kind|IN("requirement","constraint","non_goal")) and (.text|length)>0 and (.location|length)>0)
+      and all(.stories[]; (.id|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")) and (.sourceRefs|length)>0 and (.acceptanceCriteria|length)>0
+          and all(.proofExpectations[]; (.id|length)>0 and (.text|length)>0 and ((has("command")|not) or (.command|length)>0)))
+      and (if .disposition=="PROPOSED" then (.sourceInventory|length)>0 and (.stories|length)>0 and (.unresolvedQuestions|length)==0 and .terminalReason==""
+           else (.terminalReason|length)>0 and (.unresolvedQuestions|length)>0 end)
+    ' "$proposal" >/dev/null; then
+        echo -e "${RED}Error: decomposer output violates the source identity or output contract.${NC}"
+        exit 1
+    fi
+    [ "$(jq -r '.disposition' "$proposal")" = "PROPOSED" ] || return 0
+    inventory_ids="$(jq -c '[.sourceInventory[].id]|sort' "$proposal")"
+    coverage_ids="$(jq -c '[.coverage[].sourceId]|sort' "$proposal")"
+    story_ids="$(jq -c '[.stories[].id]|sort' "$proposal")"
+    coverage_story_ids="$(jq -c '[.coverage[].storyIds[]]|unique|sort' "$proposal")"
+    ac_ids="$(jq -c '[.stories[].acceptanceCriteria[].id]|sort' "$proposal")"
+    coverage_ac_ids="$(jq -c '[.coverage[].acceptanceCriteriaIds[]]|unique|sort' "$proposal")"
+    [ "$(jq '[.sourceInventory[].id]|length' "$proposal")" = "$(jq '[.sourceInventory[].id]|unique|length' "$proposal")" ] || { echo -e "${RED}Error: source inventory IDs must be unique.${NC}"; exit 1; }
+    [ "$(jq '[.stories[].id]|length' "$proposal")" = "$(jq '[.stories[].id]|unique|length' "$proposal")" ] || { echo -e "${RED}Error: story IDs must be unique.${NC}"; exit 1; }
+    [ "$(jq '[.stories[].acceptanceCriteria[].id]|length' "$proposal")" = "$(jq '[.stories[].acceptanceCriteria[].id]|unique|length' "$proposal")" ] || { echo -e "${RED}Error: acceptance criterion IDs must be unique.${NC}"; exit 1; }
+    [ "$inventory_ids" = "$coverage_ids" ] || { echo -e "${RED}Error: coverage must map every source inventory item exactly once.${NC}"; exit 1; }
+    if ! jq -e '
+      . as $root | [.sourceInventory[].id] as $inventory | [.stories[].id] as $storyIds | [.stories[].acceptanceCriteria[].id] as $acIds
+      | all(.stories[]; . as $s | all(.sourceRefs[]; . as $r | $inventory|index($r)!=null)
+          and (($s.sourceRefs|sort) == ([$root.coverage[]|select(.storyIds|index($s.id))|.sourceId]|sort)))
+      and all(.coverage[]; . as $c | (.storyIds|length)>0
+          and all(.storyIds[]; . as $r | $storyIds|index($r)!=null)
+          and all(.acceptanceCriteriaIds[]; . as $ac | $acIds|index($ac)!=null
+              and any($root.stories[]; (.id as $sid | $c.storyIds|index($sid)) and any(.acceptanceCriteria[];.id==$ac)))
+          and (($root.sourceInventory[]|select(.id==$c.sourceId)|.kind) as $kind
+              | if $kind=="non_goal" then all($c.storyIds[]; . as $sid | ($root.stories[]|select(.id==$sid)|.nonGoals|length)>0)
+                else (.acceptanceCriteriaIds|length)>0 end))
+      and ([.stories[].id] as $ids | all(.stories|to_entries[]; .key as $i | all((.value.dependsOn//[])[]; . as $d | ($ids|index($d)) < $i)))
+    ' "$proposal" >/dev/null; then
+        echo -e "${RED}Error: decomposition references or dependency order are invalid.${NC}"
+        exit 1
+    fi
+    [ "$coverage_story_ids" = "$story_ids" ] || { echo -e "${RED}Error: every story must participate in source coverage.${NC}"; exit 1; }
+    [ "$coverage_ac_ids" = "$ac_ids" ] || { echo -e "${RED}Error: every acceptance criterion must participate in source coverage.${NC}"; exit 1; }
+}
+
+build_decomposition_review_input() {
+    local round="$1" proposal="$2" proposal_hash
+    proposal_hash="$(sha256_file "$proposal")"
+    cat "$DECOMPOSITION_REVIEW_PROMPT_FILE"
+    printf '\n## Runtime Context\n- Source kind: %s\n- Source hash: %s\n- Proposal hash: %s\n- Review round: %s of %s\n\n## Authoritative Source\n```markdown\n' \
+      "$SOURCE_KIND" "$(sha256_file "$SOURCE_FILE")" "$proposal_hash" "$round" "$DECOMPOSITION_REVIEW_MAX_ROUNDS"
+    cat "$SOURCE_FILE"
+    printf '\n```\n\n## Proposed Decomposition\n```json\n'; cat "$proposal"; printf '\n```\n'
+}
+
+validate_decomposition_review() {
+    local proposal="$1" review="$2" expected_source expected_proposal expected_inventory actual_inventory expected_stories actual_stories
+    expected_source="$(sha256_file "$SOURCE_FILE")"; expected_proposal="$(sha256_file "$proposal")"
+    if ! jq -e --arg sh "$expected_source" --arg ph "$expected_proposal" '
+      .sourceHash==$sh and .proposalHash==$ph and (.verdict|IN("APPROVED","CHANGES_REQUESTED","NEEDS_HUMAN"))
+      and (.summary|type=="string" and length>0) and (.findings|type=="array")
+      and (.sourceCoverage|type=="array") and (.storyEvaluation|type=="array") and (.terminalReason|type=="string")
+      and (if .verdict=="APPROVED" then (.findings|length)==0 and .terminalReason==""
+           and all(.sourceCoverage[];.status=="pass") and all(.storyEvaluation[];.status=="pass")
+           elif .verdict=="NEEDS_HUMAN" then (.terminalReason|length)>0 else (.findings|length)>0 end)
+    ' "$review" >/dev/null; then
+        echo -e "${RED}Error: decomposition review violates identity or approval invariants.${NC}"
+        exit 1
+    fi
+    expected_inventory="$(jq -c '[.sourceInventory[].id]|sort' "$proposal")"; actual_inventory="$(jq -c '[.sourceCoverage[].sourceId]|sort' "$review")"
+    expected_stories="$(jq -c '[.stories[].id]|sort' "$proposal")"; actual_stories="$(jq -c '[.storyEvaluation[].storyId]|sort' "$review")"
+    [ "$expected_inventory" = "$actual_inventory" ] && [ "$expected_stories" = "$actual_stories" ] || { echo -e "${RED}Error: decomposition review must evaluate every source item and story exactly once.${NC}"; exit 1; }
+}
+
+publish_approved_decomposition() {
+    local round="$1" proposal="$2" review="$3" tmp approved_tmp proposal_hash review_hash
+    proposal_hash="$(sha256_file "$proposal")"; review_hash="$(sha256_file "$review")"
+    tmp="$(mktemp "$STATE_DIR/stories.XXXXXX")"
+    jq --arg branchName "$CURRENT_GIT_BRANCH_RAW" --arg originalPath "$SOURCE_INPUT" \
+      --arg proposalHash "$proposal_hash" --arg reviewHash "$review_hash" --arg approvedAt "$(utc_timestamp)" --argjson round "$round" \
+      --arg authorAgent "$IMPLEMENTATION_AGENT" --arg authorModel "$IMPLEMENTATION_MODEL" \
+      --arg reviewerAgent "$REVIEW_AGENT" --arg reviewerModel "$REVIEW_MODEL" '
+      {schemaVersion:3,project,branchName:$branchName,description,
+       source:{kind:.sourceKind,hash:.sourceHash,originalPath:$originalPath},sourceInventory,coverage,
+       decomposition:{kind:"adversarial_decomposition_review",status:"APPROVED",round:$round,sourceHash:.sourceHash,
+         proposalHash:$proposalHash,reviewHash:$reviewHash,
+         author:{agent:$authorAgent,model:$authorModel},reviewer:{agent:$reviewerAgent,model:$reviewerModel},approvedAt:$approvedAt},
+       stories:(.stories|map(. + {status:"APPROVED",passes:false,notes:"",execution:{status:"PENDING"}}))}
+    ' "$proposal" > "$tmp"
+    if ! validate_stories_candidate "$tmp"; then
+        rm -f "$tmp"
+        echo -e "${RED}Error: approved decomposition does not produce a valid schema-v3 stories file; nothing was published.${NC}"
+        exit 1
+    fi
+    approved_tmp="$(mktemp "$DECOMPOSITION_ROOT/approved.XXXXXX")"
+    jq -n --arg sourceHash "$(sha256_file "$SOURCE_FILE")" --arg proposalHash "$proposal_hash" --arg reviewHash "$review_hash" \
+      --argjson round "$round" --arg approvedAt "$(utc_timestamp)" \
+      --arg authorAgent "$IMPLEMENTATION_AGENT" --arg authorModel "$IMPLEMENTATION_MODEL" \
+      --arg reviewerAgent "$REVIEW_AGENT" --arg reviewerModel "$REVIEW_MODEL" \
+      '{kind:"adversarial_decomposition_review",status:"APPROVED",sourceHash:$sourceHash,proposalHash:$proposalHash,reviewHash:$reviewHash,
+        round:$round,author:{agent:$authorAgent,model:$authorModel},reviewer:{agent:$reviewerAgent,model:$reviewerModel},approvedAt:$approvedAt}' > "$approved_tmp"
+    mv "$approved_tmp" "$DECOMPOSITION_ROOT/approved.json"
+    mv "$tmp" "$STORIES_FILE"
+    validate_story_contracts
+}
+
+ensure_approved_decomposition() {
+    local status round proposal review prompt previous_proposal previous_review verdict disposition
+    while :; do
+        status="$(jq -r '.status' "$DECOMPOSITION_STATE_FILE")"; round="$(jq -r '.round' "$DECOMPOSITION_STATE_FILE")"
+        proposal="$DECOMPOSITION_ROOT/proposal-${round}.json"; review="$DECOMPOSITION_ROOT/review-${round}.json"
+        case "$status" in
+          APPROVED)
+            [ -f "$STORIES_FILE" ] || { echo -e "${RED}Error: approved decomposition is missing stories.json.${NC}"; exit 1; }
+            verify_authoritative_source; validate_story_contracts; verify_approved_decomposition_chain; return 0 ;;
+          NEEDS_HUMAN|REVIEW_LIMIT)
+            echo -e "${YELLOW}Decomposition stopped in $status: $(jq -r '.terminalReason' "$DECOMPOSITION_STATE_FILE")${NC}"; return 2 ;;
+          DECOMPOSING|CHANGES_REQUESTED)
+            previous_proposal=""; previous_review=""
+            if [ "$round" -gt 1 ]; then previous_proposal="$DECOMPOSITION_ROOT/proposal-$((round-1)).json"; previous_review="$DECOMPOSITION_ROOT/review-$((round-1)).json"; fi
+            prompt="$RUN_DIR/decomposition-${round}.prompt.txt"; build_decomposer_input "$round" "$previous_proposal" "$previous_review" > "$prompt"
+            run_structured_readonly_agent "$IMPLEMENTATION_AGENT" "$IMPLEMENTATION_MODEL" "$DECOMPOSITION_SCHEMA_FILE" "$prompt" "$proposal" "SOURCE" "decomposition-$round"
+            validate_decomposition_proposal "$proposal"; disposition="$(jq -r '.disposition' "$proposal")"
+            if [ "$disposition" = "NEEDS_HUMAN" ]; then write_decomposition_state "NEEDS_HUMAN" "$round" "$proposal" "" "$(jq -r '.terminalReason' "$proposal")"; return 2; fi
+            write_decomposition_state "REVIEW_REQUIRED" "$round" "$proposal"
+            ;;
+          REVIEW_REQUIRED)
+            [ -f "$proposal" ] || { echo -e "${RED}Error: REVIEW_REQUIRED is missing proposal $round.${NC}"; exit 1; }
+            validate_decomposition_proposal "$proposal"
+            prompt="$RUN_DIR/decomposition-review-${round}.prompt.txt"; build_decomposition_review_input "$round" "$proposal" > "$prompt"
+            run_structured_readonly_agent "$REVIEW_AGENT" "$REVIEW_MODEL" "$DECOMPOSITION_REVIEW_SCHEMA_FILE" "$prompt" "$review" "SOURCE" "decomposition-review-$round"
+            validate_decomposition_review "$proposal" "$review"; verdict="$(jq -r '.verdict' "$review")"
+            if [ "$verdict" = "APPROVED" ]; then
+                publish_approved_decomposition "$round" "$proposal" "$review"
+                write_decomposition_state "APPROVED" "$round" "$proposal" "$review"
+                verify_approved_decomposition_chain
+                echo -e "${GREEN}Source decomposition approved and published to $STORIES_FILE.${NC}"; return 0
+            elif [ "$verdict" = "NEEDS_HUMAN" ]; then
+                write_decomposition_state "NEEDS_HUMAN" "$round" "$proposal" "$review" "$(jq -r '.terminalReason' "$review")"; return 2
+            elif [ "$round" -ge "$DECOMPOSITION_REVIEW_MAX_ROUNDS" ]; then
+                write_decomposition_state "REVIEW_LIMIT" "$round" "$proposal" "$review" "Decomposition review limit reached without approval."; return 2
+            else
+                write_decomposition_state "CHANGES_REQUESTED" "$((round+1))" "$proposal" "$review"
+            fi
+            ;;
+          *) echo -e "${RED}Error: unknown decomposition state: $status.${NC}"; exit 1 ;;
+        esac
+    done
 }
 
 canonical_story_snapshot() {
     local story_id="$1"
     jq -S --arg id "$story_id" '
-      first(.userStories[] | select(.id == $id)) as $story
+      first(.stories[] | select(.id == $id)) as $story
       | if $story == null then error("story not found") else
-          ($story.acceptanceCriteria // []) as $acs
-          | ($acs | map(type) | unique) as $types
-          | if ($types | length) > 1 then error("mixed acceptance criterion formats")
-            elif ($types == ["string"]) then
-              $story
-              | .status = (.status // "APPROVED")
-              | .sourceRefs = (.sourceRefs // []) | .scope = (.scope // []) | .nonGoals = (.nonGoals // [])
-              | .proofExpectations = [] | .disappointmentCheck = (.disappointmentCheck // "")
-              | .dependsOn = (.dependsOn // []) | .replaces = (.replaces // [])
-              | .acceptanceCriteria = ($acs | to_entries | map({
-                  id: ($story.id + "-AC-" + (if (.key+1)<10 then "00" elif (.key+1)<100 then "0" else "" end) + ((.key+1)|tostring)),
-                  text: .value}))
-              | .legacyApprovalAssumed = true
-            else
-              $story | .legacyApprovalAssumed = false
-            end
+          $story
           | {id,status,title,description,sourceRefs,scope,nonGoals,acceptanceCriteria,
-             proofExpectations,disappointmentCheck,dependsOn,replaces,priority,legacyApprovalAssumed}
+             proofExpectations,disappointmentCheck,dependsOn,replaces,priority}
         end
-    ' "$PRD_FILE"
+    ' "$STORIES_FILE"
 }
 
-validate_prd_contracts() {
-    if ! jq -e . "$PRD_FILE" >/dev/null 2>&1; then
-        echo -e "${RED}Error: $PRD_FILE is not valid JSON.${NC}"
-        exit 1
-    fi
+validate_stories_candidate() {
+    local file="$1"
+    jq -e '
+      def str: type=="string"; def nonempty: str and length>0;
+      def safe_id: nonempty and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$");
+      . as $root | [.sourceInventory[].id] as $inventory | [.stories[].id] as $storyIds
+      | [.stories[].acceptanceCriteria[].id] as $acIds
+      | .schemaVersion==3 and (.project|nonempty) and (.branchName|nonempty) and (.description|str)
+      and (.source.kind|IN("prd","spec")) and (.source.hash|test("^[a-f0-9]{64}$")) and (.source.originalPath|nonempty)
+      and (.decomposition.kind=="adversarial_decomposition_review") and (.decomposition.status=="APPROVED")
+      and (.decomposition.round|type=="number" and floor==. and .>=1) and (.decomposition.sourceHash==.source.hash)
+      and (.decomposition.proposalHash|test("^[a-f0-9]{64}$")) and (.decomposition.reviewHash|test("^[a-f0-9]{64}$"))
+      and (.decomposition.author.agent|nonempty) and (.decomposition.author.model|str)
+      and (.decomposition.reviewer.agent|nonempty) and (.decomposition.reviewer.model|str)
+      and (.decomposition.approvedAt|nonempty)
+      and (.sourceInventory|type=="array" and length>0) and (([.sourceInventory[].id]|length)==([.sourceInventory[].id]|unique|length))
+      and all(.sourceInventory[]; (.id|nonempty) and (.kind|IN("requirement","constraint","non_goal")) and (.text|nonempty) and (.location|nonempty))
+      and (.coverage|type=="array") and (([.coverage[].sourceId]|sort) == ([.sourceInventory[].id]|sort))
+      and (.stories|type=="array" and length>0) and (([.stories[].id]|length)==([.stories[].id]|unique|length))
+      and (([.stories[].acceptanceCriteria[].id]|length)==([.stories[].acceptanceCriteria[].id]|unique|length))
+      and all(.stories|to_entries[]; .key as $i | .value as $s
+            | ($s.id|safe_id) and $s.status=="APPROVED" and ($s.title|nonempty) and ($s.description|nonempty)
+            and ($s.sourceRefs|type=="array" and length>0 and (length as $n | $n==(unique|length)))
+            and ($s.scope|type=="array") and ($s.nonGoals|type=="array")
+            and ($s.acceptanceCriteria|type=="array" and length>0)
+            and all($s.acceptanceCriteria[]; (.id|nonempty) and (.text|nonempty))
+            and ($s.proofExpectations|type=="array")
+            and all($s.proofExpectations[]; (.id|nonempty) and (.text|nonempty) and ((has("command")|not) or (.command|nonempty)))
+            and ($s.disappointmentCheck|str) and ($s.dependsOn|type=="array") and ($s.replaces|type=="array")
+            and all(($s.dependsOn+$s.replaces)[]; . as $r | $storyIds|index($r)!=null)
+            and all($s.dependsOn[]; . as $d | ($storyIds|index($d)) < $i)
+            and ($s.priority|type=="number" and floor==. and .>=1) and ($s.passes|type=="boolean") and ($s.notes|str) and ($s.execution|type=="object")
+            and (($s.sourceRefs|sort) == ([$root.coverage[]|select(.storyIds|index($s.id))|.sourceId]|sort)))
+        and (([.coverage[].acceptanceCriteriaIds[]]|unique|sort) == ($acIds|sort))
+        and all(.coverage[]; . as $c
+            | ($c.sourceId as $r | $inventory|index($r)!=null)
+            and ($c.storyIds|type=="array" and length>0 and ((length)==(unique|length)))
+            and ($c.acceptanceCriteriaIds|type=="array" and ((length)==(unique|length)))
+            and all($c.storyIds[]; . as $r | $storyIds|index($r)!=null)
+            and all($c.acceptanceCriteriaIds[]; . as $ac
+                | any($root.stories[]; (.id as $sid | $c.storyIds|index($sid)) and any(.acceptanceCriteria[];.id==$ac)))
+            and (($root.sourceInventory[]|select(.id==$c.sourceId)|.kind) as $kind
+                | if $kind=="non_goal" then
+                    all($c.storyIds[]; . as $sid | ($root.stories[]|select(.id==$sid)|.nonGoals|length)>0)
+                  else ($c.acceptanceCriteriaIds|length)>0 end))
+    ' "$file" >/dev/null 2>&1
+}
 
-    local error legacy
-    legacy=0
-    prd_is_legacy && legacy=1
-    error="$(jq -r '
-      def safe_id: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$");
-      if ($legacy == 0 and .schemaVersion != 2) then "schemaVersion must be 2"
-      elif (.userStories | type) != "array" or (.userStories | length) == 0 then "userStories must be a non-empty array"
-      elif ([.userStories[].id] | unique | length) != (.userStories | length) then "story IDs must be unique"
-      elif any(.userStories[]; (.id | safe_id) | not) then "story IDs may contain only letters, numbers, dot, underscore, and hyphen"
-      elif any(.userStories[]; ((.acceptanceCriteria // []) | map(type) | unique | length) > 1) then "mixed string/object acceptance criteria are forbidden"
-      elif ($legacy == 0 and any(.userStories[]; (.status | IN("DRAFT", "APPROVED") | not))) then "story status must be DRAFT or APPROVED"
-      elif any(.userStories[]; (.acceptanceCriteria | type) != "array" or (.acceptanceCriteria | length) == 0) then "every story needs acceptance criteria"
-      elif ($legacy == 0 and any(.userStories[]; any(.acceptanceCriteria[]; (.id | type) != "string" or (.id | length) == 0 or (.text | type) != "string" or (.text | length) == 0))) then "acceptance criteria require stable id and text"
-      elif ($legacy == 0 and ([.userStories[].acceptanceCriteria[].id] | unique | length) != ([.userStories[].acceptanceCriteria[].id] | length)) then "acceptance criterion IDs must be globally unique"
-      elif ($legacy == 0 and any(.userStories[]; has("sourceRefs") and has("scope") and has("nonGoals") and has("proofExpectations") and has("disappointmentCheck") and has("dependsOn") and has("replaces") | not)) then "schema v2 stories are missing required contract fields"
-      elif .userStories as $stories | [$stories[].id] as $ids
-           | any($stories[]; any(((.dependsOn // []) + (.replaces // []))[]?; . as $ref | ($ids | index($ref)) == null)) then "dependency or replacement references a missing story"
-      else "" end
-    ' --argjson legacy "$legacy" "$PRD_FILE" 2>/dev/null || true)"
-    if [ -n "$error" ]; then
-        echo -e "${RED}Error: invalid PRD contract: $error.${NC}"
-        exit 1
-    fi
-
-    # Requiring dependencies to appear earlier makes cycles impossible and keeps
-    # the JSON readable without making priority carry dependency semantics.
-    if ! jq -e --argjson legacy "$legacy" '
-      [.userStories[].id] as $ids
-      | all(.userStories | to_entries[];
-          .key as $index | all((.value.dependsOn // [])[]?; . as $dep | ($ids | index($dep)) < $index))
-    ' "$PRD_FILE" >/dev/null; then
-        echo -e "${RED}Error: dependsOn entries must reference an earlier story; forward/circular dependencies are not runnable.${NC}"
+validate_story_contracts() {
+    if ! validate_stories_candidate "$STORIES_FILE"; then
+        echo -e "${RED}Error: invalid schema-v3 story contract list: $STORIES_FILE.${NC}"
         exit 1
     fi
 }
 
 recover_terminal_replacements() {
-    local locked_id planning_file planning_status expected current_source resolution_tmp archived_lock replacements
+    local locked_id planning_file planning_status expected current_source current_stories resolution_tmp archived_lock replacements
     [ -f "$ACTIVE_LOCK_FILE" ] || return 0
     locked_id="$(jq -r '.storyId // empty' "$ACTIVE_LOCK_FILE")"
     planning_file="$(planning_state_file "$locked_id")"
@@ -1571,23 +1893,29 @@ recover_terminal_replacements() {
     # Resolution is an exact backlog replacement: the terminal ID disappears,
     # every replacement is approved and names it, and any IDs proposed by the
     # reviewed terminal plan are present exactly.
-    if jq -e --arg id "$locked_id" 'any(.userStories[]; .id==$id)' "$PRD_FILE" >/dev/null; then
+    if jq -e --arg id "$locked_id" 'any(.stories[]; .id==$id)' "$STORIES_FILE" >/dev/null; then
         return 0
     fi
-    replacements="$(jq -c --arg id "$locked_id" '[.userStories[] | select((.replaces // []) | index($id)) | select((.status // "APPROVED")=="APPROVED") | .id] | sort' "$PRD_FILE")"
+    replacements="$(jq -c --arg id "$locked_id" '[.stories[] | select((.replaces // []) | index($id)) | select(.status=="APPROVED") | .id] | sort' "$STORIES_FILE")"
     [ "$replacements" != "[]" ] || return 0
     expected="$(jq -c '.replacementStories // [] | sort' "$STORIES_ROOT/${locked_id}.approved-plan.json")"
     if [ "$expected" != "[]" ] && [ "$expected" != "$replacements" ]; then
         echo -e "${RED}Error: terminal replacement IDs do not exactly match the reviewed plan ($expected).${NC}"
         exit 1
     fi
-    current_source="$(sha256_file "$PRD_FILE")"
+    current_source="$(sha256_file "$SOURCE_FILE")"
+    current_stories="$(sha256_file "$STORIES_FILE")"
     resolution_tmp="$(mktemp "$STATE_DIR/terminal-resolution.XXXXXX")"
     jq -n --arg oldStoryId "$locked_id" --arg disposition "$planning_status" \
       --arg contractHash "$(jq -r '.contractHash' "$ACTIVE_LOCK_FILE")" \
       --arg originalSourceHash "$(jq -r '.sourceHash' "$ACTIVE_LOCK_FILE")" \
-      --arg currentSourceHash "$current_source" --argjson replacements "$replacements" --arg resolvedAt "$(utc_timestamp)" \
-      '{oldStoryId:$oldStoryId,disposition:$disposition,contractHash:$contractHash,originalSourceHash:$originalSourceHash,currentSourceHash:$currentSourceHash,replacements:$replacements,resolvedAt:$resolvedAt}' > "$resolution_tmp"
+      --arg originalStoriesHash "$(jq -r '.storiesHash' "$ACTIVE_LOCK_FILE")" \
+      --arg currentSourceHash "$current_source" --arg currentStoriesHash "$current_stories" \
+      --argjson replacements "$replacements" --arg resolvedAt "$(utc_timestamp)" \
+      '{oldStoryId:$oldStoryId,disposition:$disposition,contractHash:$contractHash,
+        originalSourceHash:$originalSourceHash,currentSourceHash:$currentSourceHash,
+        originalStoriesHash:$originalStoriesHash,currentStoriesHash:$currentStoriesHash,
+        replacements:$replacements,resolvedAt:$resolvedAt}' > "$resolution_tmp"
     mv "$resolution_tmp" "$STORIES_ROOT/${locked_id}.terminal-resolution.json"
     archived_lock="$STORIES_ROOT/${locked_id}.terminal-lock.json"
     [ ! -e "$archived_lock" ] || { echo -e "${RED}Error: terminal lock archive already exists for $locked_id.${NC}"; exit 1; }
@@ -1618,13 +1946,14 @@ require_clean_story_start() {
 }
 
 write_new_active_lock() {
-    local story_id="$1" snapshot_file="$2" source_hash="$3" tmp contract_hash
+    local story_id="$1" snapshot_file="$2" source_hash="$3" tmp contract_hash stories_hash
     contract_hash="$(sha256_file "$snapshot_file")"
+    stories_hash="$(sha256_file "$STORIES_FILE")"
     tmp="$(mktemp "$STATE_DIR/active-story.XXXXXX")"
-    jq -n --arg storyId "$story_id" --arg contractHash "$contract_hash" --arg sourceHash "$source_hash" \
+    jq -n --arg storyId "$story_id" --arg contractHash "$contract_hash" --arg sourceHash "$source_hash" --arg storiesHash "$stories_hash" \
       --arg baseCommit "$(git -C "$PROJECT_DIR" rev-parse HEAD)" --arg phase "LOCKED" \
       --arg updatedAt "$(utc_timestamp)" --slurpfile storySnapshot "$snapshot_file" \
-      '{storyId:$storyId,contractHash:$contractHash,sourceHash:$sourceHash,baseCommit:$baseCommit,phase:$phase,updatedAt:$updatedAt,storySnapshot:$storySnapshot[0]}' > "$tmp"
+      '{storyId:$storyId,contractHash:$contractHash,sourceHash:$sourceHash,storiesHash:$storiesHash,baseCommit:$baseCommit,phase:$phase,updatedAt:$updatedAt,storySnapshot:$storySnapshot[0]}' > "$tmp"
     mv "$tmp" "$ACTIVE_LOCK_FILE"
 }
 
@@ -1861,8 +2190,9 @@ ensure_approved_story_plan() {
                 set_active_phase "PLAN_APPROVED"
                 return 0
             fi
-            atomic_jq_replace "$PRD_FILE" --arg id "$story_id" --arg status "$disposition" --arg reason "$(jq -r '.terminalReason' "$plan_file")" --arg at "$(utc_timestamp)" \
-              '(.userStories[] | select(.id==$id)).execution={status:$status,reason:$reason,at:$at}'
+            cp "$plan_file" "$STORIES_ROOT/${story_id}.approved-plan.json"
+            atomic_jq_replace "$STORIES_FILE" --arg id "$story_id" --arg status "$disposition" --arg reason "$(jq -r '.terminalReason' "$plan_file")" --arg at "$(utc_timestamp)" \
+              '(.stories[] | select(.id==$id)).execution={status:$status,reason:$reason,at:$at}'
             write_planning_state "$story_id" "$disposition" "$round" "$plan_file" "$review_file" "$disposition"
             set_active_phase "$disposition"
             echo -e "${YELLOW}Adversarial planning approved terminal disposition $disposition for $story_id.${NC}"
@@ -1878,12 +2208,12 @@ ensure_approved_story_plan() {
 
 get_active_story_id() {
     jq -r '
-      .userStories as $stories
-      | [.userStories[]
+      .stories as $stories
+      | [.stories[]
          | select((.passes // false) == false and ((.status // "APPROVED") == "APPROVED"))
          | select(all((.dependsOn // [])[]?; . as $dep | any($stories[]; .id == $dep and (.passes // false) == true)))]
       | sort_by(.priority, .id) | .[0].id // empty
-    ' "$PRD_FILE"
+    ' "$STORIES_FILE"
 }
 
 select_or_load_active_story() {
@@ -1891,7 +2221,7 @@ select_or_load_active_story() {
     if [ -f "$ACTIVE_LOCK_FILE" ]; then
         if ! jq -e '
           (.storyId | type=="string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"))
-          and (.sourceHash|type=="string" and length>0) and (.contractHash|type=="string" and length>0)
+          and (.sourceHash|type=="string" and length>0) and (.storiesHash|type=="string" and length>0) and (.contractHash|type=="string" and length>0)
           and (.storySnapshot|type=="object") and .storySnapshot.id==.storyId
         ' "$ACTIVE_LOCK_FILE" >/dev/null; then
             echo -e "${RED}Error: active-story lock is malformed.${NC}"
@@ -1905,26 +2235,20 @@ select_or_load_active_story() {
         rm -f "$snapshot_tmp"
         locked_hash="$(jq -r '.contractHash' "$ACTIVE_LOCK_FILE")"
         [ "$snapshot_hash" = "$locked_hash" ] || { echo -e "${RED}Error: active-story lock snapshot hash mismatch.${NC}"; exit 1; }
+        [ "$(jq -r '.sourceHash' "$ACTIVE_LOCK_FILE")" = "$(sha256_file "$SOURCE_FILE")" ] || { echo -e "${RED}Error: active-story lock source hash mismatch.${NC}"; exit 1; }
         return 0
     fi
 
     ACTIVE_STORY_ID="$(get_active_story_id)"
     [ -n "$ACTIVE_STORY_ID" ] || { echo -e "${RED}Error: no runnable approved story. Resolve drafts or dependencies.${NC}"; exit 1; }
-    if prd_is_legacy && [ -n "$(worktree_snapshot_outside_state)" ]; then
-        if [ "$ALLOW_DIRTY_LEGACY_START" != "1" ]; then
-            echo -e "${RED}Error: interrupted legacy remediation requires LOOPER_ALLOW_DIRTY_LEGACY_START=1 to adopt existing changes.${NC}"
-            exit 1
-        fi
-    else
-        require_clean_story_start
-    fi
+    require_clean_story_start
     snapshot_tmp="$(mktemp "$STATE_DIR/story-snapshot.XXXXXX")"
     if ! canonical_story_snapshot "$ACTIVE_STORY_ID" > "$snapshot_tmp"; then
         rm -f "$snapshot_tmp"
-        echo -e "${RED}Error: could not canonicalize selected story without mutating the PRD.${NC}"
+        echo -e "${RED}Error: could not canonicalize selected story without mutating stories.json.${NC}"
         exit 1
     fi
-    source_hash="$(sha256_file "$PRD_FILE")"
+    source_hash="$(sha256_file "$SOURCE_FILE")"
     write_new_active_lock "$ACTIVE_STORY_ID" "$snapshot_tmp" "$source_hash"
     ACTIVE_STORY_TITLE="$(jq -r '.title' "$snapshot_tmp")"
     rm -f "$snapshot_tmp"
@@ -1932,58 +2256,7 @@ select_or_load_active_story() {
 
 get_story_title() {
     local story_id="$1"
-    jq -r --arg id "$story_id" '.userStories[] | select(.id == $id) | .title // empty' "$PRD_FILE"
-}
-
-migrate_legacy_state_layout() {
-    # Default mode migration only; explicit LOOPER_STATE_DIR is user-managed.
-    if [ -n "${LOOPER_STATE_DIR:-}" ]; then
-        return 0
-    fi
-
-    local legacy_root="$PROJECT_DIR/.looper"
-    local legacy_prd="$legacy_root/prd.json"
-    local legacy_progress_branch="$legacy_root/progress/$STATE_BRANCH_SLUG.txt"
-    local legacy_branch_slug_compat legacy_progress_branch_compat
-    local legacy_progress="$legacy_root/progress.txt"
-    local legacy_reviews_branch="$legacy_root/reviews/$STATE_BRANCH_SLUG"
-    local legacy_reviews_branch_compat
-    local state_file
-
-    legacy_branch_slug_compat="$(printf "%s" "$CURRENT_GIT_BRANCH_RAW" | sed 's#[^A-Za-z0-9._-]#-#g')"
-    legacy_progress_branch_compat="$legacy_root/progress/$legacy_branch_slug_compat.txt"
-    legacy_reviews_branch_compat="$legacy_root/reviews/$legacy_branch_slug_compat"
-
-    if [ -f "$PRD_FILE" ]; then
-        return 0
-    fi
-    if [ ! -f "$legacy_prd" ]; then
-        return 0
-    fi
-
-    mkdir -p "$STATE_DIR"
-    echo -e "${YELLOW}Migrating legacy .looper state to $STATE_DIR${NC}"
-
-    cp "$legacy_prd" "$PRD_FILE"
-    for state_file in prd.md; do
-        if [ -f "$legacy_root/$state_file" ] && [ ! -f "$STATE_DIR/$state_file" ]; then
-            cp "$legacy_root/$state_file" "$STATE_DIR/$state_file"
-        fi
-    done
-
-    if [ -f "$legacy_progress_branch" ] && [ ! -f "$PROGRESS_FILE" ]; then
-        cp "$legacy_progress_branch" "$PROGRESS_FILE"
-    elif [ -f "$legacy_progress_branch_compat" ] && [ ! -f "$PROGRESS_FILE" ]; then
-        cp "$legacy_progress_branch_compat" "$PROGRESS_FILE"
-    elif [ -f "$legacy_progress" ] && [ ! -f "$PROGRESS_FILE" ]; then
-        cp "$legacy_progress" "$PROGRESS_FILE"
-    fi
-
-    if [ -d "$legacy_reviews_branch" ] && [ ! -d "$LEGACY_REVIEWS_ROOT" ]; then
-        cp -R "$legacy_reviews_branch" "$LEGACY_REVIEWS_ROOT"
-    elif [ -d "$legacy_reviews_branch_compat" ] && [ ! -d "$LEGACY_REVIEWS_ROOT" ]; then
-        cp -R "$legacy_reviews_branch_compat" "$LEGACY_REVIEWS_ROOT"
-    fi
+    jq -r --arg id "$story_id" '.stories[] | select(.id == $id) | .title // empty' "$STORIES_FILE"
 }
 
 has_uncommitted_changes() {
@@ -1993,18 +2266,18 @@ has_uncommitted_changes() {
 mark_story_passed() {
     local story_id="$1"
     local tmp
-    tmp="$(mktemp "$STATE_DIR/prd.XXXXXX")"
-    jq --arg id "$story_id" '(.userStories[] | select(.id == $id) | .passes) = true' "$PRD_FILE" > "$tmp"
-    mv "$tmp" "$PRD_FILE"
+    tmp="$(mktemp "$STATE_DIR/stories.XXXXXX")"
+    jq --arg id "$story_id" '(.stories[] | select(.id == $id) | .passes) = true' "$STORIES_FILE" > "$tmp"
+    mv "$tmp" "$STORIES_FILE"
 }
 
 stage_and_commit_story() {
     local story_id="$1"
     local story_title="$2"
-    local rel_state_dir prd_backup
+    local rel_state_dir stories_backup
 
-    prd_backup="$(mktemp "$RUN_DIR/prd-before-commit.XXXXXX")"
-    cp "$PRD_FILE" "$prd_backup"
+    stories_backup="$(mktemp "$RUN_DIR/stories-before-commit.XXXXXX")"
+    cp "$STORIES_FILE" "$stories_backup"
     mark_story_passed "$story_id"
     set_active_phase "COMMITTING"
 
@@ -2016,6 +2289,7 @@ stage_and_commit_story() {
         git -C "$PROJECT_DIR" reset -q -- \
             "$rel_state_dir/reviews" \
             "$rel_state_dir/stories" \
+            "$rel_state_dir/decomposition" \
             "$rel_state_dir/active-story.json" \
             "$rel_state_dir/progress.txt" \
             "$rel_state_dir/archive" 2>/dev/null || true
@@ -2023,7 +2297,7 @@ stage_and_commit_story() {
 
     if git -C "$PROJECT_DIR" diff --cached --quiet; then
         echo -e "${YELLOW}No staged changes to commit for $story_id.${NC}"
-        cp "$prd_backup" "$PRD_FILE"
+        cp "$stories_backup" "$STORIES_FILE"
         return 1
     fi
 
@@ -2031,9 +2305,9 @@ stage_and_commit_story() {
         story_title="Story"
     fi
     if ! git -C "$PROJECT_DIR" commit -m "$story_id: $story_title"; then
-        cp "$prd_backup" "$PRD_FILE"
-        if [[ "$PRD_FILE" == "$PROJECT_DIR/"* ]]; then
-            git -C "$PROJECT_DIR" reset -q -- "${PRD_FILE#$PROJECT_DIR/}" 2>/dev/null || true
+        cp "$stories_backup" "$STORIES_FILE"
+        if [[ "$STORIES_FILE" == "$PROJECT_DIR/"* ]]; then
+            git -C "$PROJECT_DIR" reset -q -- "${STORIES_FILE#$PROJECT_DIR/}" 2>/dev/null || true
         fi
         set_active_phase "COMMIT_FAILED"
         echo -e "${RED}Error: commit failed; $story_id remains unresolved and its approved plan is preserved for retry.${NC}"
@@ -2113,12 +2387,12 @@ record_approval_summary() {
     note_line="$reviewer_name review: APPROVED in $approved_round round(s) at $timestamp; summary: $summary; story state: $rel_review_file"
     note_line="$(truncate_text "$(normalize_single_line "$note_line")" 500)"
 
-    tmp="$(mktemp "$STATE_DIR/prd-notes.XXXXXX")"
+    tmp="$(mktemp "$STATE_DIR/story-notes.XXXXXX")"
     jq --arg id "$story_id" --arg line "$note_line" '
-        (.userStories[] | select(.id == $id) | .notes) |=
+        (.stories[] | select(.id == $id) | .notes) |=
             (if . == null or . == "" then $line else . + "\n" + $line end)
-    ' "$PRD_FILE" > "$tmp"
-    mv "$tmp" "$PRD_FILE"
+    ' "$STORIES_FILE" > "$tmp"
+    mv "$tmp" "$STORIES_FILE"
 }
 
 build_phase_input() {
@@ -2127,7 +2401,7 @@ build_phase_input() {
     local story_title="$3"
     local story_file="$4"
     local review_round="${5:-}"
-    local progress_display prd_display story_display phase_heading
+    local progress_display stories_display story_display phase_heading
 
     if [ "$phase" = "remediation" ] && [ -n "$review_round" ]; then
         phase_heading="# $story_id - $story_title (Remediation after round $review_round)"
@@ -2165,13 +2439,13 @@ build_phase_input() {
     echo "## Runtime Context"
     echo "- Active story id: $story_id"
     echo "- Commit changes: NO (Looper commits after review approval)."
-    echo "- Set \`passes\` to true: NO (Looper updates \`prd.json\` after review approval)."
+    echo "- Set \`passes\` to true: NO (Looper updates \`stories.json\` after review approval)."
     echo "- State directory: $(display_path "$STATE_DIR")"
-    prd_display="$PRD_FILE"
-    if [[ "$prd_display" == "$PROJECT_DIR/"* ]]; then
-        prd_display="${prd_display#$PROJECT_DIR/}"
+    stories_display="$STORIES_FILE"
+    if [[ "$stories_display" == "$PROJECT_DIR/"* ]]; then
+        stories_display="${stories_display#$PROJECT_DIR/}"
     fi
-    echo "- PRD file: $prd_display"
+    echo "- Stories file: $stories_display"
     story_display="$(display_path "$story_file")"
     echo "- Story file: $story_display"
     echo "- Immutable contract file: $(display_path "$ACTIVE_CONTRACT_FILE")"
@@ -2197,7 +2471,7 @@ build_review_input() {
     local story_title="$2"
     local round="$3"
     local story_file="$4"
-    local progress_display prd_display story_display
+    local progress_display stories_display story_display
 
     echo "# $story_id - $story_title (Review round $round)"
     echo ""
@@ -2229,11 +2503,11 @@ build_review_input() {
     echo "- Active story title: $story_title"
     echo "- Review round: $round"
     echo "- State directory: $(display_path "$STATE_DIR")"
-    prd_display="$PRD_FILE"
-    if [[ "$prd_display" == "$PROJECT_DIR/"* ]]; then
-        prd_display="${prd_display#$PROJECT_DIR/}"
+    stories_display="$STORIES_FILE"
+    if [[ "$stories_display" == "$PROJECT_DIR/"* ]]; then
+        stories_display="${stories_display#$PROJECT_DIR/}"
     fi
-    echo "- PRD file: $prd_display"
+    echo "- Stories file: $stories_display"
     progress_display="$PROGRESS_FILE"
     if [[ "$progress_display" == "$PROJECT_DIR/"* ]]; then
         progress_display="${progress_display#$PROJECT_DIR/}"
@@ -2676,6 +2950,10 @@ if ! [[ "$PLAN_REVIEW_MAX_ROUNDS" =~ ^[0-9]+$ ]] || [ "$PLAN_REVIEW_MAX_ROUNDS" 
     echo -e "${RED}Error: LOOPER_PLAN_REVIEW_MAX_ROUNDS must be a positive integer.${NC}"
     exit 1
 fi
+if ! [[ "$DECOMPOSITION_REVIEW_MAX_ROUNDS" =~ ^[0-9]+$ ]] || [ "$DECOMPOSITION_REVIEW_MAX_ROUNDS" -lt 1 ]; then
+    echo -e "${RED}Error: LOOPER_DECOMPOSITION_REVIEW_MAX_ROUNDS must be a positive integer.${NC}"
+    exit 1
+fi
 if ! [[ "$KEEP_LOGS" =~ ^[01]$ ]]; then
     echo -e "${RED}Error: LOOPER_KEEP_LOGS must be 0 or 1.${NC}"
     exit 1
@@ -2703,17 +2981,20 @@ if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     exit 1
 fi
 
-migrate_legacy_state_layout
-
-if [ ! -d "$STATE_DIR" ]; then
+if [ "$MODE" = "run" ] && [ ! -d "$STATE_DIR" ]; then
     echo -e "${RED}Error: state directory not found: $STATE_DIR${NC}"
-    echo "Create $STATE_DIR/prd.json first (use /looper skill to convert a PRD)."
+    echo "Run looper prepare --prd PATH or looper prepare --spec PATH first."
     exit 1
 fi
 
-if [ ! -f "$PRD_FILE" ]; then
-    echo -e "${RED}Error: $PRD_FILE not found.${NC}"
-    echo "Create a PRD first (use /prd skill), then convert it (use /looper skill)."
+if [ "$MODE" = "run" ] && [ ! -f "$STORIES_FILE" ]; then
+    echo -e "${RED}Error: $STORIES_FILE not found.${NC}"
+    echo "Prepare and approve a source decomposition first."
+    exit 1
+fi
+if [ "$MODE" = "run" ] && { [ ! -f "$DECOMPOSITION_STATE_FILE" ] || [ "$(jq -r '.status // empty' "$DECOMPOSITION_STATE_FILE" 2>/dev/null)" != "APPROVED" ]; }; then
+    echo -e "${RED}Error: run requires an APPROVED decomposition state.${NC}"
+    echo "Use looper prepare --prd PATH or looper prepare --spec PATH first."
     exit 1
 fi
 
@@ -2738,7 +3019,8 @@ if [ ! -f "$REVIEW_SCHEMA_FILE" ]; then
     echo -e "${RED}Error: review schema not found at $REVIEW_SCHEMA_FILE${NC}"
     exit 1
 fi
-for required_file in "$PRD_SCHEMA_FILE" "$PLANNER_PROMPT_FILE" "$PLAN_REVIEW_PROMPT_FILE" "$PLAN_SCHEMA_FILE" "$PLAN_REVIEW_SCHEMA_FILE"; do
+for required_file in "$STORIES_SCHEMA_FILE" "$PLANNER_PROMPT_FILE" "$PLAN_REVIEW_PROMPT_FILE" "$PLAN_SCHEMA_FILE" "$PLAN_REVIEW_SCHEMA_FILE" \
+  "$DECOMPOSER_PROMPT_FILE" "$DECOMPOSITION_REVIEW_PROMPT_FILE" "$DECOMPOSITION_SCHEMA_FILE" "$DECOMPOSITION_REVIEW_SCHEMA_FILE"; do
     if [ ! -f "$required_file" ]; then
         echo -e "${RED}Error: required Looper planning asset not found at $required_file${NC}"
         exit 1
@@ -2761,14 +3043,38 @@ if [ -f "$LEGACY_REVIEW_PROMPT_FILE" ]; then
     echo -e "${YELLOW}Ignoring deprecated prompt file: $LEGACY_REVIEW_PROMPT_FILE (use prompt.reviewer.md).${NC}"
 fi
 
-if [ -f "$ACTIVE_LOCK_FILE" ]; then
-    jq -e . "$PRD_FILE" >/dev/null 2>&1 || { echo -e "${RED}Error: live PRD backlog is not valid JSON.${NC}"; exit 1; }
-    recover_terminal_replacements
-else
-    validate_prd_contracts
+CURRENT_BRANCH="$CURRENT_GIT_BRANCH_RAW"
+if [ "$MODE" = "prepare" ] || [ "$MODE" = "start" ]; then
+    capture_authoritative_source
+    init_run_dir
+    trap on_exit EXIT
+    trap on_signal INT TERM
+    ACTIVE_STORY_TITLE="Source decomposition"
+    if ! ensure_approved_decomposition; then
+        echo -e "${YELLOW}Source decomposition did not reach approval; inspect $DECOMPOSITION_STATE_FILE.${NC}"
+        exit 1
+    fi
+    if [ "$MODE" = "prepare" ]; then
+        exit 0
+    fi
+    MODE="run"
 fi
 
-CURRENT_BRANCH="$(jq -r '.branchName // empty' "$PRD_FILE")"
+if [ "$MODE" = "watch" ]; then
+    watch_active_run
+    exit 0
+fi
+
+verify_authoritative_source
+verify_approved_decomposition_chain
+if [ -f "$ACTIVE_LOCK_FILE" ]; then
+    jq -e . "$STORIES_FILE" >/dev/null 2>&1 || { echo -e "${RED}Error: live story list is not valid JSON.${NC}"; exit 1; }
+    recover_terminal_replacements
+else
+    validate_story_contracts
+fi
+
+CURRENT_BRANCH="$(jq -r '.branchName // empty' "$STORIES_FILE")"
 if [ -z "$CURRENT_BRANCH" ] || [ "$CURRENT_BRANCH" = "null" ]; then
     CURRENT_BRANCH="$CURRENT_GIT_BRANCH_RAW"
 fi
@@ -2777,7 +3083,7 @@ mkdir -p "$STATE_DIR"
 EXPECTED_BRANCH_SLUG="$CURRENT_BRANCH"
 case "$EXPECTED_BRANCH_SLUG" in codex/*|looper/*) EXPECTED_BRANCH_SLUG="${EXPECTED_BRANCH_SLUG#*/}" ;; esac
 if [ "$EXPECTED_BRANCH_SLUG" != "$STATE_BRANCH_NAME" ] && [ "$CURRENT_BRANCH" != "$CURRENT_GIT_BRANCH_RAW" ]; then
-    echo -e "${RED}Error: PRD branch '$CURRENT_BRANCH' does not match current branch '$CURRENT_GIT_BRANCH_RAW'.${NC}"
+    echo -e "${RED}Error: stories branch '$CURRENT_BRANCH' does not match current branch '$CURRENT_GIT_BRANCH_RAW'.${NC}"
     exit 1
 fi
 
@@ -2797,14 +3103,11 @@ if [ ! -f "$PROGRESS_FILE" ]; then
     echo "" >> "$PROGRESS_FILE"
 fi
 
-if [ "$MODE" = "watch" ]; then
-    watch_active_run
-    exit 0
+if [ -z "$RUN_DIR" ]; then
+    init_run_dir
+    trap on_exit EXIT
+    trap on_signal INT TERM
 fi
-
-init_run_dir
-trap on_exit EXIT
-trap on_signal INT TERM
 
 for i in $(seq 1 "$MAX_ITERATIONS"); do
     echo ""
@@ -2813,7 +3116,7 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
     echo -e "${GREEN}=======================================================${NC}"
     echo ""
 
-    INCOMPLETE="$(jq '[.userStories[] | select((.passes // false) == false)] | length' "$PRD_FILE")"
+    INCOMPLETE="$(jq '[.stories[] | select((.passes // false) == false)] | length' "$STORIES_FILE")"
     if [ "$INCOMPLETE" -eq 0 ] && [ ! -f "$ACTIVE_LOCK_FILE" ]; then
         echo -e "${GREEN}All stories complete! Looper is done.${NC}"
         exit 0
@@ -2837,7 +3140,7 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
         fi
         ensure_story_state_file "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE"
         append_story_history_entry "$ACTIVE_STORY_FILE" "Story committed and marked passed after commit resume."
-        if [ "$(jq '[.userStories[] | select(.passes == false and ((.execution.status // "PENDING") != "REPLACED"))] | length' "$PRD_FILE")" -eq 0 ]; then
+        if [ "$(jq '[.stories[] | select(.passes == false and ((.execution.status // "PENDING") != "REPLACED"))] | length' "$STORIES_FILE")" -eq 0 ]; then
             echo -e "${GREEN}All stories complete! Looper is done.${NC}"
             exit 0
         fi
@@ -2914,7 +3217,7 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
     ensure_story_state_file "$ACTIVE_STORY_ID" "$ACTIVE_STORY_TITLE"
     append_story_history_entry "$ACTIVE_STORY_FILE" "Story approved, committed, and marked passed."
 
-    if [ "$(jq '[.userStories[] | select(.passes == false and ((.execution.status // "PENDING") != "REPLACED"))] | length' "$PRD_FILE")" -eq 0 ]; then
+    if [ "$(jq '[.stories[] | select(.passes == false and ((.execution.status // "PENDING") != "REPLACED"))] | length' "$STORIES_FILE")" -eq 0 ]; then
         echo -e "${GREEN}All stories complete! Looper is done.${NC}"
         exit 0
     fi
@@ -2924,5 +3227,5 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
 done
 
 echo -e "${RED}Max iterations ($MAX_ITERATIONS) reached without completion.${NC}"
-echo "Check $PROGRESS_FILE and $PRD_FILE for status."
+echo "Check $PROGRESS_FILE and $STORIES_FILE for status."
 exit 1

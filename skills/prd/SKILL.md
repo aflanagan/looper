@@ -1,87 +1,57 @@
-# PRD Generator Skill
+---
+name: prd
+description: Create or refine an authoritative product requirements document that Looper can decompose into reviewed story contracts.
+---
 
-## Trigger
-Use this skill when the user asks to create, write, plan, or spec a product requirement.
+# PRD Authoring
 
-## Contract model
+Use this skill when the user asks to create, write, plan, or refine a product requirements document for Looper.
 
-A PRD is the approved product contract. Its stories are not implementation plans. Each story says what outcome is independently valuable and how it will be proved; Looper later creates and adversarially reviews a codebase-grounded execution plan for the selected story.
+## Purpose
 
-Stories have two authoring states:
-
-- `DRAFT`: questions, boundaries, or proof are still being refined. Looper must not execute it.
-- `APPROVED`: the user has approved the story block and its material contract fields. Only approved stories may be converted for execution.
-
-Approval applies to the complete story block. A material change to its outcome, acceptance criteria, scope, non-goals, dependencies, proof expectations, or disappointment check returns it to `DRAFT` and requires explicit re-approval. Typographical edits that do not alter meaning are non-material.
+A PRD is product authority, not an implementation plan or execution queue. Make intended outcomes, boundaries, requirements, non-goals, and proof clear enough that independent agents can decompose it without inventing product decisions. Looper separately proposes stories, adversarially reviews their coverage and boundaries, and publishes `stories.json` only after approval.
 
 ## Process
 
-### 1. Gather requirements
+1. Ask only the questions needed to resolve material product choices, contradictions, boundaries, and success proof.
+2. Draft the PRD with stable IDs for goals and requirements.
+3. Check completeness, conflicts, non-goals, and product-verifiable success.
+4. Save the authoritative Markdown byte-for-byte as `.looper/<branch-name>/source.md`, or save elsewhere and pass that path to `looper prepare --prd`.
 
-Ask only the clarifying questions needed to establish the user, problem, boundary, success proof, dependencies, and important non-goals. Use lettered choices when they make the decision easier.
-
-### 2. Draft the PRD
-
-Use this structure:
+Use this structure when it fits:
 
 ```markdown
 # PRD: [Feature Name]
 
 ## Introduction / Overview
 ## Goals
+- Goal-1: ...
 ## Non-Goals
 ## Functional Requirements
+- FR-1: ...
 ## Design Considerations (optional)
-## Technical Considerations (optional)
+## Technical Constraints (optional)
 ## Success Metrics
 ## Open Questions
-
-## Stories
-
-### [ABC-001] Short outcome title
-- Status: DRAFT | APPROVED
-- User outcome: As a ..., I want ..., so that ...
-- Source refs: FR-1, Goal-1
-- Depends on: none | ABC-000
-- Replaces: none | ABC-000
-- In scope:
-  - ...
-- Non-goals:
-  - ...
-- Acceptance criteria:
-  - ABC-001-AC-001: Observable, verifiable outcome.
-  - ABC-001-AC-002: Observable, verifiable outcome.
-- Proof expectations:
-  - ABC-001-PROOF-001: Test, command, or product-level inspection that proves an AC.
-- Disappointment check: What reasonable user expectation would make this technically-correct story still feel unfinished?
+## Candidate Story Boundaries (optional)
 ```
 
-Give Goals and Functional Requirements stable IDs so `Source refs` can preserve traceability. Choose one semantic 2–3 letter uppercase story prefix and use sequential IDs. Acceptance-criterion IDs are permanent: never renumber or reuse one after approval; add a new ID when the contract grows.
+Candidate boundaries are useful product groupings, not pre-approved runtime contracts. Do not add file-by-file steps or prescribe an implementation unless the product requirement truly depends on it.
 
-### 3. Review decomposition before approval
+## Source readiness check
 
-For every story, verify:
+Before handing the source to Looper, verify:
 
-- It produces one independently reviewable outcome and can be implemented in one coding context.
-- Its acceptance criteria describe observable behavior, not implementation steps.
-- `Source refs` account for the PRD requirements it implements; every in-scope requirement is owned by at least one story.
-- Dependencies are explicit, acyclic, and refer only to earlier or externally satisfied work.
-- Scope and non-goals prevent neighboring stories from bleeding together.
-- Proof expectations cover tests plus any user/developer/operator experience that code-only tests could miss.
-- The disappointment check catches a hollow implementation that passes literal criteria but misses the intended experience.
+- Every in-scope outcome or behavior has a stable source ID.
+- Non-goals prevent adjacent work from leaking into scope.
+- Acceptance or success statements are observable rather than “works correctly.”
+- Explicit dependencies and rollout constraints are recorded.
+- No material contradiction or unresolved product choice is hidden.
+- Existing useful story boundaries are clear, while oversized boundaries may be split by decomposition.
+- A literal implementation that would still disappoint is called out.
 
-If implementation likely spans unrelated subsystems, requires more than one independently useful migration/cutover, or cannot be proved as one unit, split it before approval. Do not invent implementation steps; runtime planning owns that layer.
+Invoking `looper prepare --prd PATH` or `looper start --prd PATH` declares that file authoritative. Routine per-story human approval is not required: Looper uses a separate read-only decomposer and adversarial reviewer. If they encounter a material ambiguity they cannot safely resolve, the workflow stops in `NEEDS_HUMAN` with persisted evidence.
 
-### 4. Obtain approval and save
+## Branch state directory
 
-Present material unresolved choices. Change story status to `APPROVED` only after the user approves the complete block. Save the PRD to `.looper/<branch-name>/prd.md`.
-
-Derive `<branch-name>` from the current Git branch: drop an initial `codex/` or `looper/`, replace characters outside `[A-Za-z0-9._-]` with `-`, and use `unknown-branch` if empty.
-
-## Output rules
-
-- Write explicitly enough for a junior developer and an AI agent.
-- Do not convert draft stories into executable work.
-- Preserve approved wording and stable IDs during conversion.
-- Order stories by dependency, but never use order as a substitute for `Depends on`.
-- Prefer product-verifiable criteria over vague quality claims such as “works correctly.”
+Looper derives `<branch-name>` from the current Git branch: it drops an initial `codex/` or `looper/`, replaces characters outside `[A-Za-z0-9._-]` with `-`, and uses `unknown-branch` if empty. `source.md` and generated state live under `.looper/<branch-name>/` unless `LOOPER_STATE_DIR` overrides it.

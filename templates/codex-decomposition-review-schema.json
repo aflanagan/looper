@@ -1,0 +1,16 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sourceHash", "proposalHash", "verdict", "summary", "findings", "sourceCoverage", "storyEvaluation", "terminalReason"],
+  "properties": {
+    "sourceHash": {"type":"string"},
+    "proposalHash": {"type":"string"},
+    "verdict": {"enum":["APPROVED","CHANGES_REQUESTED","NEEDS_HUMAN"]},
+    "summary": {"type":"string"},
+    "findings": {"type":"array", "items":{"type":"object", "additionalProperties":false, "required":["id","priority","details","evidence"], "properties":{"id":{"type":"string"},"priority":{"enum":["P0","P1","P2"]},"details":{"type":"string"},"evidence":{"type":"string"}}}},
+    "sourceCoverage": {"type":"array", "items":{"type":"object", "additionalProperties":false, "required":["sourceId","status","details"], "properties":{"sourceId":{"type":"string"},"status":{"enum":["pass","fail"]},"details":{"type":"string"}}}},
+    "storyEvaluation": {"type":"array", "items":{"type":"object", "additionalProperties":false, "required":["storyId","status","details"], "properties":{"storyId":{"type":"string"},"status":{"enum":["pass","fail"]},"details":{"type":"string"}}}},
+    "terminalReason": {"type":"string"}
+  }
+}
