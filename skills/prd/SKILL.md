@@ -1,57 +1,27 @@
 ---
 name: prd
-description: Create or refine an authoritative product requirements document that Looper can decompose into reviewed story contracts.
+description: Create or refine an authoritative product requirements document for Looper's complete-source planning workflow.
 ---
 
-# PRD Authoring
+# PRD authoring
 
-Use this skill when the user asks to create, write, plan, or refine a product requirements document for Looper.
+A Looper PRD is product authority, not an execution queue. Make outcomes, boundaries, requirements, constraints, non-goals, and observable success clear enough that one repository-grounded planning agent can produce the complete story plan without inventing product decisions.
 
-## Purpose
-
-A PRD is product authority, not an implementation plan or execution queue. Make intended outcomes, boundaries, requirements, non-goals, and proof clear enough that independent agents can decompose it without inventing product decisions. Looper separately proposes stories, adversarially reviews their coverage and boundaries, and publishes `stories.json` only after approval.
-
-## Process
-
-1. Ask only the questions needed to resolve material product choices, contradictions, boundaries, and success proof.
-2. Draft the PRD with stable IDs for goals and requirements.
-3. Check completeness, conflicts, non-goals, and product-verifiable success.
-4. Save the authoritative Markdown byte-for-byte as `.looper/<branch-name>/source.md`, or save elsewhere and pass that path to `looper prepare --prd`.
-
-Use this structure when it fits:
+Prefer stable requirement IDs and this lightweight structure when useful:
 
 ```markdown
-# PRD: [Feature Name]
-
-## Introduction / Overview
+# PRD: Feature
+## Overview
 ## Goals
-- Goal-1: ...
 ## Non-Goals
-## Functional Requirements
-- FR-1: ...
-## Design Considerations (optional)
-## Technical Constraints (optional)
-## Success Metrics
-## Open Questions
-## Candidate Story Boundaries (optional)
+## Requirements
+## Constraints
+## Success and proof
+## Open questions
 ```
 
-Candidate boundaries are useful product groupings, not pre-approved runtime contracts. Do not add file-by-file steps or prescribe an implementation unless the product requirement truly depends on it.
+Before preparation, resolve material contradictions and product choices, identify adjacent work that must remain out of scope, make success observable, and call out a literal implementation that could technically pass yet disappoint.
 
-## Source readiness check
+Save the PRD anywhere in the repository and invoke `looper prepare --prd PATH` or `looper start --prd PATH`. That original file remains authoritative; Looper stores its absolute path and hash but does not copy it. Changing or removing it makes the approved plan stale and requires fresh preparation.
 
-Before handing the source to Looper, verify:
-
-- Every in-scope outcome or behavior has a stable source ID.
-- Non-goals prevent adjacent work from leaking into scope.
-- Acceptance or success statements are observable rather than “works correctly.”
-- Explicit dependencies and rollout constraints are recorded.
-- No material contradiction or unresolved product choice is hidden.
-- Existing useful story boundaries are clear, while oversized boundaries may be split by decomposition.
-- A literal implementation that would still disappoint is called out.
-
-Invoking `looper prepare --prd PATH` or `looper start --prd PATH` declares that file authoritative. Routine per-story human approval is not required: Looper uses a separate read-only decomposer and adversarial reviewer. If they encounter a material ambiguity they cannot safely resolve, the workflow stops in `NEEDS_HUMAN` with persisted evidence.
-
-## Branch state directory
-
-Looper derives `<branch-name>` from the current Git branch: it drops an initial `codex/` or `looper/`, replaces characters outside `[A-Za-z0-9._-]` with `-`, and uses `unknown-branch` if empty. `source.md` and generated state live under `.looper/<branch-name>/` unless `LOOPER_STATE_DIR` overrides it.
+Candidate story boundaries are welcome, but do not write a second queue or file-by-file implementation plan into the PRD unless the product contract truly requires it. Looper plans and adversarially reviews all stories together before implementation.

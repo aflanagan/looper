@@ -68,5 +68,5 @@ fi
 
 echo "Usage:"
 echo "  1. Run: looper prepare --prd PATH (or --spec PATH)"
-echo "  2. Inspect source.md, stories.json, and decomposition approval artifacts"
+echo "  2. Inspect the approved stories.json execution queue"
 echo "  3. Run: looper [max_iterations] (or use looper start to prepare and run)"

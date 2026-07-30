@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "findingResolutions", "regressions"],
+  "properties": {
+    "verdict": {"enum": ["APPROVED", "REJECTED"]},
+    "summary": {"type": "string", "minLength": 1},
+    "findingResolutions": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["findingId", "status", "evidence"],
+        "properties": {
+          "findingId": {"type": "string", "minLength": 1},
+          "status": {"enum": ["resolved", "unresolved"]},
+          "evidence": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "regressions": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "causedByFindingId", "details", "evidence"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "causedByFindingId": {"type": "string", "minLength": 1},
+          "details": {"type": "string", "minLength": 1},
+          "evidence": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}
